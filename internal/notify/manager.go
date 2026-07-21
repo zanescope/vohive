@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/zanescope/vohive/internal/config"
+	"github.com/zanescope/vohive/internal/db"
 	"github.com/zanescope/vohive/internal/device"
 	"github.com/zanescope/vohive/pkg/logger"
 )
@@ -24,6 +25,10 @@ type NotificationContext struct {
 	DeviceName string
 	Timestamp  time.Time
 }
+
+const unknownNotificationLocalPhone = "--"
+
+type notificationPhoneLookup func(imsi, iccid string) (string, error)
 
 func (c NotificationContext) DeviceLabel() string {
 	id := strings.TrimSpace(c.DeviceID)
@@ -209,8 +214,14 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 	if source == "" {
 		source = "蜂窝"
 	}
-	msg := fmt.Sprintf("收到新短信 / %s\n设备  %s\n号码  %s\n时间  %s\n内容  %s",
-		source, deviceID, sender, timestamp.Format("2006-01-02 15:04:05"), content)
+	msg := formatSMSNotification(
+		deviceID,
+		m.resolveDeviceLocalPhone(deviceID),
+		sender,
+		content,
+		source,
+		timestamp,
+	)
 
 	logger.Info("开始发送短信通知",
 		"event", "sms_received",
@@ -225,6 +236,56 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 		DeviceName: m.resolveDeviceName(deviceID),
 		Timestamp:  timestamp,
 	})
+}
+
+func formatSMSNotification(deviceID, localPhone, sender, content, source string, timestamp time.Time) string {
+	localPhone = strings.TrimSpace(localPhone)
+	if localPhone == "" {
+		localPhone = unknownNotificationLocalPhone
+	}
+	return fmt.Sprintf("收到新短信 / %s\n设备  %s\n本机  %s\n号码  %s\n时间  %s\n内容  %s",
+		source, deviceID, localPhone, sender, timestamp.Format("2006-01-02 15:04:05"), content)
+}
+
+func resolveNotificationLocalPhone(imsi, iccid string, identityUsable bool, lookup notificationPhoneLookup) (string, error) {
+	if !identityUsable || lookup == nil {
+		return unknownNotificationLocalPhone, nil
+	}
+	imsi = strings.TrimSpace(imsi)
+	iccid = strings.TrimSpace(iccid)
+	if imsi == "" && iccid == "" {
+		return unknownNotificationLocalPhone, nil
+	}
+	phone, err := lookup(imsi, iccid)
+	if err != nil {
+		return unknownNotificationLocalPhone, err
+	}
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return unknownNotificationLocalPhone, nil
+	}
+	return phone, nil
+}
+
+func (m *Manager) resolveDeviceLocalPhone(deviceID string) string {
+	if m == nil || m.pool == nil {
+		return unknownNotificationLocalPhone
+	}
+	worker := m.pool.GetWorker(strings.TrimSpace(deviceID))
+	if worker == nil {
+		return unknownNotificationLocalPhone
+	}
+	imsi, iccid, identityUsable := worker.SIMIdentityForPhoneLookup()
+	phone, err := resolveNotificationLocalPhone(
+		imsi,
+		iccid,
+		identityUsable,
+		db.GetPhoneNumberByIMSIOrICCID,
+	)
+	if err != nil {
+		logger.Warn("读取通知本机号码失败", "device", deviceID, "err", err)
+	}
+	return phone
 }
 
 // NotifyRaw 发送原始文本通知到所有渠道

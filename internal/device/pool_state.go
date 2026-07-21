@@ -240,6 +240,23 @@ func (w *Worker) SIMIdentitySuppressesOverviewIMSI() bool {
 		w.state.Identity.Phase == simIdentityPhaseDegraded
 }
 
+// SIMIdentityForPhoneLookup returns one atomic, cached identity snapshot for SIM-scoped
+// database lookups. Transitional and degraded identities are withheld to avoid
+// resolving a number from identity data that is not currently confirmed.
+func (w *Worker) SIMIdentityForPhoneLookup() (imsi, iccid string, ok bool) {
+	if w == nil {
+		return "", "", false
+	}
+	w.cacheMu.RLock()
+	defer w.cacheMu.RUnlock()
+	if !w.state.Identity.Ready || w.state.Identity.Phase != simIdentityPhaseReady {
+		return "", "", false
+	}
+	imsi = strings.TrimSpace(w.state.Identity.IMSI)
+	iccid = strings.TrimSpace(w.state.Identity.ICCID)
+	return imsi, iccid, imsi != "" || iccid != ""
+}
+
 func (w *Worker) SIMIdentityConvergenceMatches(targetICCID string, generation uint64) bool {
 	if w == nil {
 		return false
