@@ -162,10 +162,10 @@ type deviceMgmtOverviewItem struct {
 	RadioRegistered        bool               `json:"radio_registered"`
 	LifecyclePhase         string             `json:"lifecycle_phase"`
 	LifecycleReason        string             `json:"lifecycle_reason,omitempty"`
-	PrivateIP              string             `json:"private_ip,omitempty"`
-	PrivateIPv6            string             `json:"private_ipv6,omitempty"`
+	PrivateIP              string             `json:"private_ip"`
+	PrivateIPv6            string             `json:"private_ipv6"`
 	PublicIP               string             `json:"public_ip"`
-	PublicIPv6             string             `json:"public_ipv6,omitempty"`
+	PublicIPv6             string             `json:"public_ipv6"`
 	Config                 *deviceConfigDTO   `json:"config,omitempty"`
 	Modem                  modem.DeviceStatus `json:"modem"`
 	Traffic                map[string]string  `json:"traffic,omitempty"`
@@ -281,16 +281,17 @@ func (s *Server) handleDeviceMgmtOverview(c *gin.Context) {
 		}
 		status := w.GetCachedDeviceStatus() // 设备管理总览列表读缓存，0 IPC
 		controlOnline := w.GetCachedHealthy()
+		network := w.NetworkAddressSnapshot()
 		item := deviceMgmtOverviewItem{
 			ID:                     w.ID,
 			Name:                   cfg.Name,
 			Running:                true,
 			Healthy:                controlOnline, // 兼容旧客户端：healthy 表示控制面在线
 			ControlOnline:          controlOnline,
-			PublicIP:               w.GetCachedIP(),
-			PublicIPv6:             w.GetCachedIPv6(),
+			PublicIP:               network.PublicIPv4,
+			PublicIPv6:             network.PublicIPv6,
 			Modem:                  modemSummaryStatus(status),
-			NetworkConnected:       w.NetworkConnected(),
+			NetworkConnected:       network.Connected,
 			RegistrationStateLabel: registrationStateLabel(status.RegStatus),
 			BackendMode: func() string {
 				if w.Backend != nil {
@@ -307,10 +308,8 @@ func (s *Server) handleDeviceMgmtOverview(c *gin.Context) {
 			dto := deviceConfigToDTO(cfg)
 			item.Config = &dto
 		}
-		if nc := w.NetworkController(); nc != nil {
-			item.PrivateIP = nc.GetPrivateIP()
-			item.PrivateIPv6 = nc.GetPrivateIPv6()
-		}
+		item.PrivateIP = network.PrivateIPv4
+		item.PrivateIPv6 = network.PrivateIPv6
 		item.Traffic, item.TrafficRaw, item.TrafficMeta = buildTrafficOverviewFields(cfg.Interface, byTag[tagByID[w.ID]], now)
 		s.applyLifecycleToOverviewItem(&item, true, cfg)
 		items = append(items, item)
@@ -356,10 +355,10 @@ type deviceMgmtOverviewLiteItem struct {
 	RadioRegistered        bool               `json:"radio_registered"`
 	LifecyclePhase         string             `json:"lifecycle_phase"`
 	LifecycleReason        string             `json:"lifecycle_reason,omitempty"`
-	PrivateIP              string             `json:"private_ip,omitempty"`
-	PrivateIPv6            string             `json:"private_ipv6,omitempty"`
+	PrivateIP              string             `json:"private_ip"`
+	PrivateIPv6            string             `json:"private_ipv6"`
 	PublicIP               string             `json:"public_ip"`
-	PublicIPv6             string             `json:"public_ipv6,omitempty"`
+	PublicIPv6             string             `json:"public_ipv6"`
 	Interface              string             `json:"interface,omitempty"`
 	ControlDevice          string             `json:"control_device,omitempty"`
 	ESIMTransport          string             `json:"esim_transport,omitempty"`
@@ -414,7 +413,7 @@ type deviceMgmtListItem struct {
 	LifecyclePhase         string              `json:"lifecycle_phase"`
 	LifecycleReason        string              `json:"lifecycle_reason,omitempty"`
 	PublicIP               string              `json:"public_ip"`
-	PublicIPv6             string              `json:"public_ipv6,omitempty"`
+	PublicIPv6             string              `json:"public_ipv6"`
 	Interface              string              `json:"interface,omitempty"`
 	ESIMTransport          string              `json:"esim_transport,omitempty"`
 	SMSEnabled             bool                `json:"sms_enabled"`
@@ -577,14 +576,15 @@ func (s *Server) buildOverviewLiteDetailItemFromWorker(w *device.Worker, cfg con
 
 func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg config.DeviceConfig, status modem.DeviceStatus, radioLiveOK *bool, modemStatus modem.DeviceStatus) deviceMgmtOverviewLiteItem {
 	controlOnline := w.GetCachedHealthy()
+	network := w.NetworkAddressSnapshot()
 	item := deviceMgmtOverviewLiteItem{
 		ID:                     w.ID,
 		Name:                   cfg.Name,
 		Running:                true,
 		Healthy:                controlOnline,
 		ControlOnline:          controlOnline,
-		PublicIP:               w.GetCachedIP(),
-		PublicIPv6:             w.GetCachedIPv6(),
+		PublicIP:               network.PublicIPv4,
+		PublicIPv6:             network.PublicIPv6,
 		Interface:              cfg.Interface,
 		ControlDevice:          cfg.ControlDevice,
 		ESIMTransport:          config.NormalizeESIMTransport(cfg.ESIMTransport),
@@ -600,7 +600,7 @@ func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg 
 		VoWiFiRuntime:          s.getVoWiFiRuntimeDTO(w.ID),
 		RadioLiveOK:            radioLiveOK,
 		Modem:                  modemStatus,
-		NetworkConnected:       w.NetworkConnected(),
+		NetworkConnected:       network.Connected,
 		RegistrationStateLabel: registrationStateLabel(status.RegStatus),
 		BackendMode: func() string {
 			if w.Backend != nil {
@@ -609,10 +609,8 @@ func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg 
 			return "at"
 		}(),
 	}
-	if nc := w.NetworkController(); nc != nil {
-		item.PrivateIP = nc.GetPrivateIP()
-		item.PrivateIPv6 = nc.GetPrivateIPv6()
-	}
+	item.PrivateIP = network.PrivateIPv4
+	item.PrivateIPv6 = network.PrivateIPv6
 	if w.EsimMgr != nil {
 		if name, err := w.EsimMgr.ActiveProfileName(); err == nil {
 			item.ActiveESIMProfileName = name
@@ -620,6 +618,24 @@ func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg 
 	}
 	s.applyLifecycleToOverviewLiteItem(&item, w, cfg)
 	return item
+}
+
+type overviewStreamNetworkVersion struct {
+	NetworkConnected bool
+	PrivateIP        string
+	PrivateIPv6      string
+	PublicIP         string
+	PublicIPv6       string
+}
+
+func newOverviewStreamNetworkVersion(item deviceMgmtOverviewLiteItem) overviewStreamNetworkVersion {
+	return overviewStreamNetworkVersion{
+		NetworkConnected: item.NetworkConnected,
+		PrivateIP:        item.PrivateIP,
+		PrivateIPv6:      item.PrivateIPv6,
+		PublicIP:         item.PublicIP,
+		PublicIPv6:       item.PublicIPv6,
+	}
 }
 
 type overviewStreamEmitVersion struct {
@@ -632,6 +648,7 @@ type overviewStreamEmitVersion struct {
 	IMSReady        bool
 	SMSReady        bool
 	LastErrorClass  string
+	Network         overviewStreamNetworkVersion
 }
 
 func newOverviewStreamEmitVersion(item deviceMgmtOverviewLiteItem) overviewStreamEmitVersion {
@@ -640,6 +657,7 @@ func newOverviewStreamEmitVersion(item deviceMgmtOverviewLiteItem) overviewStrea
 		LifecyclePhase:  item.LifecyclePhase,
 		LifecycleReason: item.LifecycleReason,
 	}
+	v.Network = newOverviewStreamNetworkVersion(item)
 	if item.VoWiFiRuntime != nil {
 		v.HasRuntime = true
 		v.Phase = item.VoWiFiRuntime.Phase
@@ -718,21 +736,22 @@ func (s *Server) handleDeviceMgmtList(c *gin.Context) {
 		}
 		status := w.GetCachedDeviceStatus()
 		controlOnline := w.GetCachedHealthy()
+		network := w.NetworkAddressSnapshot()
 		item := deviceMgmtListItem{
 			ID:                     w.ID,
 			Name:                   cfg.Name,
 			Running:                true,
 			Healthy:                controlOnline,
 			ControlOnline:          controlOnline,
-			PublicIP:               w.GetCachedIP(),
-			PublicIPv6:             w.GetCachedIPv6(),
+			PublicIP:               network.PublicIPv4,
+			PublicIPv6:             network.PublicIPv6,
 			Interface:              cfg.Interface,
 			ESIMTransport:          config.NormalizeESIMTransport(cfg.ESIMTransport),
 			SMSEnabled:             cfg.SMSEnabled,
 			NetworkEnabled:         cfg.NetworkEnabled,
 			VoWiFiEnabled:          s.pool.IsVoWiFiActive(w.ID), // 使用多设备状态查询
 			VoWiFiRuntime:          s.getVoWiFiRuntimeDTO(w.ID),
-			NetworkConnected:       w.NetworkConnected(),
+			NetworkConnected:       network.Connected,
 			RegistrationStateLabel: registrationStateLabel(status.RegStatus),
 			Modem: deviceMgmtListModem{
 				Operator:      status.Operator,

@@ -166,6 +166,10 @@ container_hygiene() {
 		printf 'Docker builds must not run go mod tidy; CI tidy gates should catch dependency drift before image build\n' >&2
 		return 1
 	fi
+	if ! git grep -nF 'COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt' -- Dockerfile.runtime >/dev/null; then
+		printf 'scratch runtime image must include the system CA bundle for HTTPS probes\n' >&2
+		return 1
+	fi
 	if git grep -nF 'ghcr.io/${{ github.repository }}/vohive' -- "$publish" "$build"; then
 		printf 'container build configuration must not duplicate the vohive image path\n' >&2
 		return 1

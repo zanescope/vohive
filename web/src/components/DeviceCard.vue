@@ -142,7 +142,10 @@ function getSignalBars(dbm: number | null | undefined) {
         <div class="space-y-2">
           <div class="flex justify-between items-center text-sm">
             <span class="text-gray-400 flex items-center gap-1.5"><el-icon><Globe24Regular /></el-icon> 公网 IP</span>
-            <span class="font-mono font-bold text-blue-600 dark:text-blue-400">{{ device.public_ip || '---' }}</span>
+            <span
+              class="min-w-0 max-w-[70%] truncate text-right font-mono font-bold text-blue-600 dark:text-blue-400"
+              :title="device.public_ip || device.public_ipv6 || '---'"
+            >{{ device.public_ip || device.public_ipv6 || '---' }}</span>
           </div>
         </div>
       </div>

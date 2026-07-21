@@ -100,6 +100,22 @@ func Connect(ctx context.Context, d *Device, sessionID, command uint32, accessSt
 	return parseConnect(resp.InfoBuffer)
 }
 
+// QueryConnect returns the modem's authoritative state for one data session.
+func QueryConnect(ctx context.Context, d *Device, sessionID uint32) (ConnectState, error) {
+	// MBIM_CONNECT_INFO is 36 bytes for both query and response. A query only
+	// supplies SessionId; every other field is reserved/ignored and stays zero.
+	info := make([]byte, 36)
+	le.PutUint32(info, sessionID)
+	resp, err := d.Command(ctx, UUIDBasicConnect, CIDBasicConnectConnect, CommandTypeQuery, info)
+	if err != nil {
+		return ConnectState{}, err
+	}
+	if resp.Status != 0 {
+		return ConnectState{}, &StatusError{Op: "CONNECT query", Status: resp.Status}
+	}
+	return parseConnect(resp.InfoBuffer)
+}
+
 func ParseConnectIndication(info []byte) (ConnectState, error) {
 	return parseConnect(info)
 }

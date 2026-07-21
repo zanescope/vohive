@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,32 +17,37 @@ import (
 	"github.com/zanescope/vohive/internal/netprobe"
 	"github.com/zanescope/vohive/pkg/logger"
 
+	"github.com/miekg/dns"
 	qmimanager "github.com/zanescope/quectel-qmi-go/pkg/manager"
 	"github.com/zanescope/quectel-qmi-go/pkg/netcfg"
 	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
-	"github.com/miekg/dns"
 )
 
-// 精选极速探测源
-var ipCheckURLs = []string{
-	"https://api.ipify.org",
-	"https://ident.me",
-	"https://ifconfig.me/ip",
-	"https://httpbin.org/ip",
-}
-
 const (
-	publicIPDialTimeout    = 5 * time.Second
-	publicIPResolveTimeout = 4 * time.Second
-	publicIPRequestTimeout = 10 * time.Second
+	publicIPDialTimeout       = 5 * time.Second
+	publicIPResolveTimeout    = 5 * time.Second
+	publicIPDNSAttemptTimeout = 400 * time.Millisecond
+	publicIPRequestTimeout    = 10 * time.Second
+	publicIPDNSCacheTTL       = time.Minute
 
 	existingDataConnectionResetTimeout = 8 * time.Second
 )
 
-var fallbackPublicIPDNSServers = []string{
+var fallbackPublicIPDNSServersV4 = []string{
+	"119.29.29.29:53",
+	"223.5.5.5:53",
+	"223.6.6.6:53",
 	"1.1.1.1:53",
 	"8.8.8.8:53",
 	"9.9.9.9:53",
+}
+var fallbackPublicIPDNSServersV6 = []string{
+	"[2402:4e00::]:53",
+	"[2402:4e00:1::]:53",
+	"[2400:3200::1]:53",
+	"[2400:3200:baba::1]:53",
+	"[2606:4700:4700::1111]:53",
+	"[2001:4860:4860::8888]:53",
 }
 
 type qmiEventLogLevel int
@@ -747,8 +753,18 @@ type Manager struct {
 	healthHandlersMu    sync.Mutex
 	onHealthEvent       []func(HealthEvent)
 	recoveryExhaustedMu sync.Mutex
+	networkHandlersMu   sync.Mutex
+	onIPChanged         []func()
+	onDataDisconnected  []func()
 	onRecoveryExhausted []func(reason string, err error)
 	publicIPLookup      func(ctx context.Context, host string) ([]string, error)
+	publicIPProbeMu     sync.RWMutex
+	publicIPIPv4URLs    []string
+	publicIPIPv6URLs    []string
+	publicIPProbeResult func(context.Context, netprobe.Family) (netprobe.Result, error)
+	publicIPLookupMu    sync.RWMutex
+	publicIPLookupCache *netprobe.LookupCache
+	hasIPv4Bearer       func() bool
 	hasIPv6Bearer       func() bool // 测试替身：是否存在已建立的 IPv6 数据承载，默认见 ipv6BearerUp
 
 	resetExistingDataConnection            func(context.Context) (bool, error)
@@ -792,6 +808,10 @@ func New(cfg config.DeviceConfig, modemDev *qmimanager.ModemDevice) *Manager {
 		chanMu:       make(map[byte]*sync.Mutex),
 		apduSessions: make(map[byte]apduSessionInfo),
 	}
+	defaults := config.DefaultPublicIPProbeConfig()
+	m.publicIPIPv4URLs = append([]string(nil), defaults.IPv4URLs...)
+	m.publicIPIPv6URLs = append([]string(nil), defaults.IPv6URLs...)
+	m.resetPublicIPLookupCache()
 
 	// 如果提供了 modemDev，使用它；否则从配置文件构建
 	var device qmimanager.ModemDevice
@@ -886,6 +906,24 @@ func (m *Manager) SetOnConnect(handler func()) {
 	m.onConnect = handler
 }
 
+func (m *Manager) OnIPChanged(handler func()) {
+	if m == nil || handler == nil {
+		return
+	}
+	m.networkHandlersMu.Lock()
+	m.onIPChanged = append(m.onIPChanged, handler)
+	m.networkHandlersMu.Unlock()
+}
+
+func (m *Manager) OnDataDisconnected(handler func()) {
+	if m == nil || handler == nil {
+		return
+	}
+	m.networkHandlersMu.Lock()
+	m.onDataDisconnected = append(m.onDataDisconnected, handler)
+	m.networkHandlersMu.Unlock()
+}
+
 func (m *Manager) OnHealthEvent(handler func(HealthEvent)) {
 	if handler == nil {
 		return
@@ -958,9 +996,32 @@ func (m *Manager) dispatchHealthEvent(event qmimanager.Event) {
 	}
 }
 
+func (m *Manager) dispatchNetworkEvent(event qmimanager.Event) {
+	switch event.Type {
+	case qmimanager.EventConnected, qmimanager.EventIPChanged, qmimanager.EventDisconnected,
+		qmimanager.EventDialFailed, qmimanager.EventReconnecting, qmimanager.EventModemReset:
+		m.resetPublicIPLookupCache()
+	}
+	m.networkHandlersMu.Lock()
+	var handlers []func()
+	switch event.Type {
+	case qmimanager.EventIPChanged:
+		handlers = append(handlers, m.onIPChanged...)
+	case qmimanager.EventDisconnected, qmimanager.EventDialFailed, qmimanager.EventReconnecting, qmimanager.EventModemReset:
+		handlers = append(handlers, m.onDataDisconnected...)
+	}
+	m.networkHandlersMu.Unlock()
+	for _, handler := range handlers {
+		if handler != nil {
+			handler()
+		}
+	}
+}
+
 func (m *Manager) handleQMIEvent(event qmimanager.Event) {
 	logQMIEvent(m.cfg.ID, event)
 	m.dispatchHealthEvent(event)
+	m.dispatchNetworkEvent(event)
 	switch event.Type {
 	case qmimanager.EventConnected,
 		qmimanager.EventDisconnected,
@@ -1037,58 +1098,152 @@ func (m *Manager) handleQMIEvent(event qmimanager.Event) {
 }
 
 func (m *Manager) lookupPublicIPHost(ctx context.Context, host string) ([]string, error) {
-	if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil {
-		return []string{ip.String()}, nil
+	return m.lookupPublicIPHostFamily(ctx, host, netprobe.FamilyAny)
+}
+
+func (m *Manager) resetPublicIPLookupCache() {
+	if m == nil {
+		return
+	}
+	cache := netprobe.NewLookupCache(m.lookupPublicIPHostFamilyUncached, publicIPDNSCacheTTL)
+	m.publicIPLookupMu.Lock()
+	m.publicIPLookupCache = cache
+	m.publicIPLookupMu.Unlock()
+}
+
+func (m *Manager) lookupPublicIPHostFamily(ctx context.Context, host string, family netprobe.Family) ([]string, error) {
+	if m == nil {
+		return nil, fmt.Errorf("public IP lookup manager is nil")
+	}
+	m.publicIPLookupMu.RLock()
+	cache := m.publicIPLookupCache
+	m.publicIPLookupMu.RUnlock()
+	if cache != nil {
+		return cache.Lookup(ctx, host, family)
+	}
+	return m.lookupPublicIPHostFamilyUncached(ctx, host, family)
+}
+
+func (m *Manager) lookupPublicIPHostFamilyUncached(ctx context.Context, host string, family netprobe.Family) ([]string, error) {
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		ips := filterResolvedIPs([]string{ip.String()}, family)
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("host %s does not match %s", host, family)
+		}
+		return ips, nil
+	}
+	if host == "" {
+		return nil, fmt.Errorf("public IP DNS host is empty")
+	}
+	if strings.TrimSpace(m.cfg.Interface) == "" {
+		return nil, netprobe.ErrInterfaceRequired
 	}
 	if m.publicIPLookup != nil {
-		return m.publicIPLookup(ctx, host)
+		ips, err := m.publicIPLookup(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		ips = filterResolvedIPs(ips, family)
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("host %s did not resolve for %s", host, family)
+		}
+		return ips, nil
 	}
 
 	lookupCtx, cancel := context.WithTimeout(ctx, publicIPResolveTimeout)
 	defer cancel()
-
-	enableV4, enableV6, err := config.ResolveIPFamily(m.cfg.IPVersion)
-	if err != nil {
-		enableV4, enableV6 = true, false
-	}
-	dnsServers := m.publicIPDNSServers()
+	servers := m.publicIPDNSServers(family)
 	dialer := m.boundDialer(publicIPDialTimeout)
+
 	var ips []string
-	var errs []error
-	if enableV6 {
-		v6, err := resolveAAAAWithTCPDNS(lookupCtx, host, dnsServers, dialer)
-		if err != nil {
-			errs = append(errs, err)
+	var err error
+	switch family {
+	case netprobe.FamilyV6:
+		ips, err = resolveAAAAWithTCPDNS(lookupCtx, host, servers, dialer)
+	case netprobe.FamilyV4:
+		ips, err = resolveIPv4WithTCPDNS(lookupCtx, host, servers, dialer)
+	default:
+		ips, err = resolveIPv4WithTCPDNS(lookupCtx, host, m.publicIPDNSServers(netprobe.FamilyV4), dialer)
+		if len(ips) == 0 {
+			ips, err = resolveAAAAWithTCPDNS(lookupCtx, host, m.publicIPDNSServers(netprobe.FamilyV6), dialer)
 		}
-		ips = append(ips, v6...)
-	}
-	if enableV4 {
-		v4, err := resolveIPv4WithTCPDNS(lookupCtx, host, dnsServers, dialer)
-		if err != nil {
-			errs = append(errs, err)
-		}
-		ips = append(ips, v4...)
 	}
 	if len(ips) > 0 {
 		return dedupeStrings(ips), nil
 	}
-	err = errors.Join(errs...)
 	if err == nil {
-		err = fmt.Errorf("host %s 未解析到可用 IP 地址", host)
+		err = fmt.Errorf("host %s did not resolve for %s", host, family)
 	}
-	logger.Debug(fmt.Sprintf("[%s] 公网 IP 探测域名解析失败", m.cfg.ID), "host", host, "err", err)
+	logger.Debug(fmt.Sprintf("[%s] 公网 IP 探测域名解析失败", m.cfg.ID),
+		"host", host, "family", family.String(), "err", err)
 	return nil, err
 }
 
-func (m *Manager) publicIPDNSServers() []string {
-	servers := make([]string, 0, 5)
-	if m != nil && m.qmiMgr != nil {
-		if settings := m.qmiMgr.Settings(); settings != nil {
-			servers = appendDNSServer(servers, settings.IPv4DNS1)
-			servers = appendDNSServer(servers, settings.IPv4DNS2)
+func filterResolvedIPs(values []string, family netprobe.Family) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		addr, err := netip.ParseAddr(strings.TrimSpace(value))
+		if err != nil {
+			continue
+		}
+		if addr.Is4In6() {
+			addr = addr.Unmap()
+		}
+		if family == netprobe.FamilyV4 && !addr.Is4() {
+			continue
+		}
+		if family == netprobe.FamilyV6 && !addr.Is6() {
+			continue
+		}
+		if !netprobe.IsPublicAddress(addr) {
+			continue
+		}
+		out = append(out, addr.String())
+	}
+	return dedupeStrings(out)
+}
+
+func (m *Manager) publicIPDNSServers(family netprobe.Family) []string {
+	carrierV4 := make([]string, 0, 2)
+	carrierV6 := make([]string, 0, 2)
+	reachableV4, reachableV6 := false, false
+	if m != nil {
+		reachableV4 = m.ipv4BearerUp()
+		reachableV6 = m.ipv6BearerUp()
+		if m.qmiMgr != nil {
+			if settings := m.qmiMgr.Settings(); settings != nil {
+				carrierV4 = appendDNSServerForInterface(carrierV4, settings.IPv4DNS1, m.cfg.Interface)
+				carrierV4 = appendDNSServerForInterface(carrierV4, settings.IPv4DNS2, m.cfg.Interface)
+				carrierV6 = appendDNSServerForInterface(carrierV6, settings.IPv6DNS1, m.cfg.Interface)
+				carrierV6 = appendDNSServerForInterface(carrierV6, settings.IPv6DNS2, m.cfg.Interface)
+			}
 		}
 	}
-	servers = append(servers, fallbackPublicIPDNSServers...)
+	return orderedPublicIPDNSServers(family, carrierV4, carrierV6, reachableV4, reachableV6)
+}
+
+func orderedPublicIPDNSServers(family netprobe.Family, carrierV4, carrierV6 []string, reachableV4, reachableV6 bool) []string {
+	servers := make([]string, 0, len(carrierV4)+len(carrierV6)+len(fallbackPublicIPDNSServersV4)+len(fallbackPublicIPDNSServersV6))
+	if family == netprobe.FamilyV6 {
+		servers = append(servers, carrierV6...)
+		servers = append(servers, carrierV4...)
+		if reachableV6 {
+			servers = append(servers, fallbackPublicIPDNSServersV6...)
+		}
+		if reachableV4 {
+			servers = append(servers, fallbackPublicIPDNSServersV4...)
+		}
+	} else {
+		servers = append(servers, carrierV4...)
+		servers = append(servers, carrierV6...)
+		if reachableV4 {
+			servers = append(servers, fallbackPublicIPDNSServersV4...)
+		}
+		if reachableV6 {
+			servers = append(servers, fallbackPublicIPDNSServersV6...)
+		}
+	}
 	return dedupeStrings(servers)
 }
 
@@ -1110,49 +1265,23 @@ func (m *Manager) boundDialer(timeout time.Duration) *net.Dialer {
 }
 
 func resolveIPv4WithTCPDNS(ctx context.Context, host string, servers []string, dialer *net.Dialer) ([]string, error) {
-	host = strings.TrimSpace(host)
-	if host == "" {
-		return nil, fmt.Errorf("dns host 不能为空")
-	}
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("dns servers 不能为空")
-	}
-
-	client := &dns.Client{
-		Net:     "tcp",
-		Timeout: publicIPResolveTimeout,
-		Dialer:  dialer,
-	}
-	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(host), dns.TypeA)
-
-	var errs []error
-	for _, server := range servers {
-		resp, _, err := client.ExchangeContext(ctx, msg, server)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", server, err))
-			continue
-		}
-		if resp == nil {
-			errs = append(errs, fmt.Errorf("%s: 空 DNS 响应", server))
-			continue
-		}
-		if resp.Rcode != dns.RcodeSuccess {
-			errs = append(errs, fmt.Errorf("%s: dns rcode=%s", server, dns.RcodeToString[resp.Rcode]))
-			continue
-		}
-
-		ips := extractARecords(resp.Answer)
-		if len(ips) > 0 {
-			return ips, nil
-		}
-		errs = append(errs, fmt.Errorf("%s: 未返回 A 记录", server))
-	}
-
-	return nil, errors.Join(errs...)
+	return resolveWithBoundDNS(ctx, host, servers, dialer, dns.TypeA)
 }
 
 func resolveAAAAWithTCPDNS(ctx context.Context, host string, servers []string, dialer *net.Dialer) ([]string, error) {
+	return resolveWithBoundDNS(ctx, host, servers, dialer, dns.TypeAAAA)
+}
+
+type publicIPDNSExchangeFunc func(context.Context, *dns.Msg, string, string, *net.Dialer) (*dns.Msg, error)
+
+func resolveWithBoundDNS(ctx context.Context, host string, servers []string, dialer *net.Dialer, queryType uint16) ([]string, error) {
+	return resolveWithBoundDNSExchange(ctx, host, servers, dialer, queryType, exchangePublicIPDNS)
+}
+
+func resolveWithBoundDNSExchange(ctx context.Context, host string, servers []string, dialer *net.Dialer, queryType uint16, exchange publicIPDNSExchangeFunc) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return nil, fmt.Errorf("dns host 不能为空")
@@ -1160,21 +1289,39 @@ func resolveAAAAWithTCPDNS(ctx context.Context, host string, servers []string, d
 	if len(servers) == 0 {
 		return nil, fmt.Errorf("dns servers 不能为空")
 	}
-
-	client := &dns.Client{
-		Net:     "tcp",
-		Timeout: publicIPResolveTimeout,
-		Dialer:  dialer,
-	}
 	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(host), dns.TypeAAAA)
+	msg.SetQuestion(dns.Fqdn(host), queryType)
 
 	var errs []error
 	for _, server := range servers {
-		resp, _, err := client.ExchangeContext(ctx, msg, server)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		resp, err := exchange(ctx, msg, server, "udp", dialer)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", server, err))
-			continue
+			if contextErr := ctx.Err(); contextErr != nil {
+				return nil, contextErr
+			}
+			errs = append(errs, fmt.Errorf("%s/udp: %w", server, err))
+		}
+		// Some carrier and restricted networks pass TCP/53 while dropping
+		// UDP/53. Preserve the standard truncated-response fallback and also
+		// try TCP after a bounded UDP transport failure or empty response.
+		if err != nil || resp == nil || resp.Truncated {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return nil, contextErr
+			}
+			if err == nil && resp == nil {
+				errs = append(errs, fmt.Errorf("%s/udp: empty DNS response", server))
+			}
+			resp, err = exchange(ctx, msg, server, "tcp", dialer)
+			if err != nil {
+				if contextErr := ctx.Err(); contextErr != nil {
+					return nil, contextErr
+				}
+				errs = append(errs, fmt.Errorf("%s/tcp: %w", server, err))
+				continue
+			}
 		}
 		if resp == nil {
 			errs = append(errs, fmt.Errorf("%s: 空 DNS 响应", server))
@@ -1184,17 +1331,19 @@ func resolveAAAAWithTCPDNS(ctx context.Context, host string, servers []string, d
 			errs = append(errs, fmt.Errorf("%s: dns rcode=%s", server, dns.RcodeToString[resp.Rcode]))
 			continue
 		}
-
-		ips := extractAAAARecords(resp.Answer)
+		var ips []string
+		if queryType == dns.TypeAAAA {
+			ips = filterResolvedIPs(extractAAAARecords(resp.Answer), netprobe.FamilyV6)
+		} else {
+			ips = filterResolvedIPs(extractARecords(resp.Answer), netprobe.FamilyV4)
+		}
 		if len(ips) > 0 {
 			return ips, nil
 		}
-		errs = append(errs, fmt.Errorf("%s: 未返回 AAAA 记录", server))
+		errs = append(errs, fmt.Errorf("%s: 未返回可用公网 %s 记录", server, dns.TypeToString[queryType]))
 	}
-
 	return nil, errors.Join(errs...)
 }
-
 func extractARecords(records []dns.RR) []string {
 	ips := make([]string, 0, len(records))
 	for _, record := range records {
@@ -1224,13 +1373,32 @@ func extractAAAARecords(records []dns.RR) []string {
 }
 
 func appendDNSServer(servers []string, ip net.IP) []string {
+	return appendDNSServerForInterface(servers, ip, "")
+}
+
+func appendDNSServerForInterface(servers []string, ip net.IP, interfaceName string) []string {
 	if ip == nil {
+		return servers
+	}
+	if ip.IsUnspecified() || ip.IsMulticast() {
 		return servers
 	}
 	if ipv4 := ip.To4(); ipv4 != nil {
 		return append(servers, net.JoinHostPort(ipv4.String(), "53"))
 	}
-	return servers
+	ipv6 := ip.To16()
+	if ipv6 == nil {
+		return servers
+	}
+	host := ipv6.String()
+	if ip.IsLinkLocalUnicast() {
+		interfaceName = strings.TrimSpace(interfaceName)
+		if interfaceName == "" {
+			return servers
+		}
+		host += "%" + interfaceName
+	}
+	return append(servers, net.JoinHostPort(host, "53"))
 }
 
 func dedupeStrings(values []string) []string {
@@ -2289,6 +2457,9 @@ func (m *Manager) OnSimStatusChanged(handler func()) {
 
 // GetPrivateIP 获取私有 IP (内网 IP)
 func (m *Manager) GetPrivateIP() string {
+	if m == nil || m.qmiMgr == nil {
+		return ""
+	}
 	settings := m.qmiMgr.Settings()
 	if settings != nil && settings.IPv4Address != nil {
 		return settings.IPv4Address.String()
@@ -2335,68 +2506,146 @@ func (m *Manager) WaitIdentityReady(ctx context.Context) error {
 	return m.qmiMgr.WaitIdentityReady(ctx)
 }
 
-// GetPublicIPNoCache 并发极速探测公网 IP (外网 IP)，不区分地址族，谁先连上用谁。
-// 双栈场景下该结果的地址族不确定，需要同时拿到 v4/v6 时请使用 GetPublicIPv4AndV6NoCache。
-func (m *Manager) GetPublicIPNoCache() string {
-	return m.publicIPProber().Probe(context.Background(), netprobe.FamilyAny)
+// SetPublicIPProbeURLs replaces the ordered family-specific probe sources.
+func (m *Manager) SetPublicIPProbeURLs(ipv4URLs, ipv6URLs []string) {
+	if m == nil {
+		return
+	}
+	defaults := config.DefaultPublicIPProbeConfig()
+	if len(ipv4URLs) == 0 {
+		ipv4URLs = defaults.IPv4URLs
+	}
+	if len(ipv6URLs) == 0 {
+		ipv6URLs = defaults.IPv6URLs
+	}
+	m.publicIPProbeMu.Lock()
+	m.publicIPIPv4URLs = append([]string(nil), ipv4URLs...)
+	m.publicIPIPv6URLs = append([]string(nil), ipv6URLs...)
+	m.publicIPProbeMu.Unlock()
 }
 
-// GetPublicIPv4AndV6NoCache 按 DeviceConfig.IPVersion 对 v4/v6 分别独立探测，
-// 避免双栈模式下两个族共用一次探测时被其中一族（通常是更快建联的 v6）持续抢跑，
-// 导致另一族的公网地址永远拿不到、缓存与数据库字段无法刷新。
-func (m *Manager) GetPublicIPv4AndV6NoCache() (publicV4 string, publicV6 string) {
-	enableV4, enableV6, err := config.ResolveIPFamily(m.cfg.IPVersion)
-	if err != nil {
-		enableV4, enableV6 = true, false
+// GetPublicIPNoCache probes every active bearer family and prefers IPv4.
+// Call GetPublicIPv4AndV6NoCache when both family-specific results are needed.
+func (m *Manager) GetPublicIPNoCache() string {
+	publicV4, publicV6 := m.GetPublicIPv4AndV6Context(context.Background())
+	if publicV4 != "" {
+		return publicV4
 	}
-	// 配置允许 v6 不代表 v6 数据承载真的建立成功（网络可能以 ESM cause #50 等拒绝 v6 PDP）。
-	// 承载未建立时 v6 探测必然失败，跳过它以避免每轮刷新都白白等满超时。
-	if enableV6 && !m.ipv6BearerUp() {
-		enableV6 = false
+	return publicV6
+}
+
+func (m *Manager) GetPublicIPv4AndV6NoCache() (publicV4 string, publicV6 string) {
+	return m.GetPublicIPv4AndV6Context(context.Background())
+}
+
+func (m *Manager) GetPublicIPv4AndV6Context(ctx context.Context) (publicV4 string, publicV6 string) {
+	if m == nil {
+		return "", ""
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	enableV4 := m.ipv4BearerUp()
+	enableV6 := m.ipv6BearerUp()
+	if !enableV4 && !enableV6 {
+		return "", ""
 	}
 
+	probe := m.publicIPProbeFunc()
 	var wg sync.WaitGroup
-	prober := m.publicIPProber()
 	if enableV4 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if ip := prober.Probe(context.Background(), netprobe.FamilyV4); ip != "" {
-				publicV4 = ip
+			result, err := probe(ctx, netprobe.FamilyV4)
+			if err != nil {
+				logger.Debug("公网 IPv4 探测失败", "device", m.cfg.ID, "err", err)
+				return
 			}
+			publicV4 = result.IP
+			logger.Debug("公网 IPv4 探测成功", "device", m.cfg.ID, "source", result.Source)
 		}()
 	}
 	if enableV6 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if ip := prober.Probe(context.Background(), netprobe.FamilyV6); ip != "" {
-				publicV6 = ip
+			result, err := probe(ctx, netprobe.FamilyV6)
+			if err != nil {
+				logger.Debug("公网 IPv6 探测失败", "device", m.cfg.ID, "err", err)
+				return
 			}
+			publicV6 = result.IP
+			logger.Debug("公网 IPv6 探测成功", "device", m.cfg.ID, "source", result.Source)
 		}()
 	}
 	wg.Wait()
 	return publicV4, publicV6
 }
 
-// ipv6BearerUp 报告 IPv6 数据承载是否已实际建立。
+func (m *Manager) ipv4BearerUp() bool {
+	if m == nil {
+		return false
+	}
+	if m.hasIPv4Bearer != nil {
+		return m.hasIPv4Bearer()
+	}
+	return bearerAddressMatchesFamily(m.GetPrivateIP(), netprobe.FamilyV4)
+}
+
 func (m *Manager) ipv6BearerUp() bool {
+	if m == nil {
+		return false
+	}
 	if m.hasIPv6Bearer != nil {
 		return m.hasIPv6Bearer()
 	}
-	return strings.TrimSpace(m.GetPrivateIPv6()) != ""
+	return bearerAddressMatchesFamily(m.GetPrivateIPv6(), netprobe.FamilyV6)
+}
+
+func bearerAddressMatchesFamily(value string, family netprobe.Family) bool {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	if family == netprobe.FamilyV4 {
+		return ip.To4() != nil
+	}
+	return family == netprobe.FamilyV6 && ip.To4() == nil
+}
+
+func (m *Manager) publicIPProbeFunc() func(context.Context, netprobe.Family) (netprobe.Result, error) {
+	m.publicIPProbeMu.RLock()
+	injected := m.publicIPProbeResult
+	m.publicIPProbeMu.RUnlock()
+	if injected != nil {
+		return injected
+	}
+	prober := m.publicIPProber()
+	return prober.ProbeResult
 }
 
 func (m *Manager) publicIPProber() *netprobe.Prober {
+	defaults := config.DefaultPublicIPProbeConfig()
+	ipv4URLs, ipv6URLs := defaults.IPv4URLs, defaults.IPv6URLs
+	if m != nil {
+		m.publicIPProbeMu.RLock()
+		if len(m.publicIPIPv4URLs) > 0 {
+			ipv4URLs = append([]string(nil), m.publicIPIPv4URLs...)
+		}
+		if len(m.publicIPIPv6URLs) > 0 {
+			ipv6URLs = append([]string(nil), m.publicIPIPv6URLs...)
+		}
+		m.publicIPProbeMu.RUnlock()
+	}
 	return netprobe.New(netprobe.Config{
-		Interface: m.cfg.Interface,
-		URLs:      ipCheckURLs,
-		Timeout:   publicIPRequestTimeout,
-		Lookup:    m.lookupPublicIPHost,
+		Interface:    m.cfg.Interface,
+		IPv4URLs:     ipv4URLs,
+		IPv6URLs:     ipv6URLs,
+		Timeout:      publicIPRequestTimeout,
+		LookupFamily: m.lookupPublicIPHostFamily,
 	})
 }
-
-// GetPrivateIPv6 获取私有 IPv6 地址（v6/双栈模式下非空）
 func (m *Manager) GetPrivateIPv6() string {
 	if m == nil || m.qmiMgr == nil {
 		return ""
@@ -2427,4 +2676,16 @@ func (m *Manager) NASIncrementalNetworkScanSnapshot() (*qmi.NASIncrementalNetwor
 		return nil, time.Time{}, false
 	}
 	return snapshot.NASIncrementalScan()
+}
+
+func exchangePublicIPDNS(ctx context.Context, msg *dns.Msg, server, network string, dialer *net.Dialer) (*dns.Msg, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, publicIPDNSAttemptTimeout)
+	defer cancel()
+	client := &dns.Client{
+		Net:     network,
+		Timeout: publicIPDNSAttemptTimeout,
+		Dialer:  dialer,
+	}
+	response, _, err := client.ExchangeContext(attemptCtx, msg, server)
+	return response, err
 }

@@ -11,7 +11,14 @@ func initIPv6TestDB(t *testing.T) {
 	if err := Init(dbPath); err != nil {
 		t.Fatalf("Init() error=%v", err)
 	}
-	t.Cleanup(func() { DB = nil })
+	t.Cleanup(func() {
+		if DB != nil {
+			if sqlDB, err := DB.DB(); err == nil {
+				_ = sqlDB.Close()
+			}
+		}
+		DB = nil
+	})
 }
 
 func TestUpdateDeviceIPsV6(t *testing.T) {
@@ -34,5 +41,31 @@ func TestUpdateDeviceIPsV6(t *testing.T) {
 	}
 	if d.PrivateIP != "10.0.0.2" || d.PrivateIPv6 != "fe80::2" {
 		t.Fatalf("private v4/v6 = %q / %q", d.PrivateIP, d.PrivateIPv6)
+	}
+}
+
+func TestReplaceDeviceIPsV6ClearsStaleAddresses(t *testing.T) {
+	initIPv6TestDB(t)
+
+	if err := DB.Create(&Device{
+		IMEI:        "imei-replace",
+		PublicIP:    "198.51.100.20",
+		PublicIPv6:  "2001:db8::20",
+		PrivateIP:   "10.0.0.20",
+		PrivateIPv6: "fe80::20",
+	}).Error; err != nil {
+		t.Fatalf("seed device error=%v", err)
+	}
+
+	if err := ReplaceDeviceIPsV6("imei-replace", "", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var d Device
+	if err := DB.Where("imei = ?", "imei-replace").First(&d).Error; err != nil {
+		t.Fatal(err)
+	}
+	if d.PublicIP != "" || d.PublicIPv6 != "" || d.PrivateIP != "" || d.PrivateIPv6 != "" {
+		t.Fatalf("stale addresses were not cleared: %#v", d)
 	}
 }

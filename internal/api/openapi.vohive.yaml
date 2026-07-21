@@ -2019,6 +2019,8 @@ components:
           type: integer
         public_ip:
           type: string
+        public_ipv6:
+          type: string
         healthy:
           type: boolean
         operator:
@@ -2112,6 +2114,8 @@ components:
         ims_status:
           type: integer
         public_ip:
+          type: string
+        public_ipv6:
           type: string
         interface:
           type: string
@@ -2548,6 +2552,8 @@ components:
           type: boolean
         public_ip:
           type: string
+        public_ipv6:
+          type: string
         interface:
           type: string
         esim_transport:
@@ -2583,7 +2589,11 @@ components:
           type: boolean
         private_ip:
           type: string
+        private_ipv6:
+          type: string
         public_ip:
+          type: string
+        public_ipv6:
           type: string
         interface:
           type: string
@@ -2781,7 +2791,11 @@ components:
           type: boolean
         private_ip:
           type: string
+        private_ipv6:
+          type: string
         public_ip:
+          type: string
+        public_ipv6:
           type: string
 
     ProxyInstanceDTO:

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	qmimanager "github.com/zanescope/quectel-qmi-go/pkg/manager"
 	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
@@ -410,6 +411,72 @@ func TestOnNewSMSCompatibilityIgnoresStorage(t *testing.T) {
 
 	if gotIndex != 7 {
 		t.Fatalf("got index=%d want=7", gotIndex)
+	}
+}
+
+func TestManagerDispatchesNetworkEventsSeparatelyFromHealth(t *testing.T) {
+	m := &Manager{}
+	connectCalls, ipChangedCalls, disconnectedCalls, healthCalls := 0, 0, 0, 0
+	m.SetOnConnect(func() { connectCalls++ })
+	m.OnIPChanged(func() { ipChangedCalls++ })
+	m.OnDataDisconnected(func() { disconnectedCalls++ })
+	m.OnHealthEvent(func(HealthEvent) { healthCalls++ })
+
+	m.handleQMIEvent(qmimanager.Event{Type: qmimanager.EventIPChanged})
+	if ipChangedCalls != 1 || disconnectedCalls != 0 || healthCalls != 0 || connectCalls != 0 {
+		t.Fatalf("IPChanged routed as connect=%d ip=%d disconnected=%d health=%d",
+			connectCalls, ipChangedCalls, disconnectedCalls, healthCalls)
+	}
+
+	disconnectEvents := []qmimanager.Event{
+		{Type: qmimanager.EventDisconnected},
+		{Type: qmimanager.EventDialFailed},
+		{Type: qmimanager.EventReconnecting},
+		{Type: qmimanager.EventModemReset},
+	}
+	for i, event := range disconnectEvents {
+		m.handleQMIEvent(event)
+		if disconnectedCalls != i+1 || ipChangedCalls != 1 {
+			t.Fatalf("disconnect event %s routed as ip=%d disconnected=%d",
+				event.Type, ipChangedCalls, disconnectedCalls)
+		}
+	}
+	if healthCalls != len(disconnectEvents) {
+		t.Fatalf("health calls=%d, want %d", healthCalls, len(disconnectEvents))
+	}
+	if connectCalls != 0 {
+		t.Fatalf("connect calls=%d, want 0", connectCalls)
+	}
+}
+
+func TestNetworkEventCallbacksCanRegisterCallbacks(t *testing.T) {
+	m := &Manager{}
+	firstCalls, secondCalls := 0, 0
+	m.OnIPChanged(func() {
+		firstCalls++
+		m.OnIPChanged(func() { secondCalls++ })
+	})
+
+	dispatch := func() {
+		done := make(chan struct{})
+		go func() {
+			m.dispatchNetworkEvent(qmimanager.Event{Type: qmimanager.EventIPChanged})
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("network callback deadlocked while registering a callback")
+		}
+	}
+
+	dispatch()
+	if firstCalls != 1 || secondCalls != 0 {
+		t.Fatalf("first dispatch calls=(%d,%d), want (1,0)", firstCalls, secondCalls)
+	}
+	dispatch()
+	if firstCalls != 2 || secondCalls != 1 {
+		t.Fatalf("second dispatch calls=(%d,%d), want (2,1)", firstCalls, secondCalls)
 	}
 }
 

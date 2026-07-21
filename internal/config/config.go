@@ -97,12 +97,13 @@ type Config struct {
 	QQ       QQConfig       `mapstructure:"qq"`
 	Webhook  WebhookConfig  `mapstructure:"webhook"`
 
-	Bark     BarkConfig     `mapstructure:"bark"`
-	Email    EmailConfig    `mapstructure:"email"`
-	Pushplus PushplusConfig `mapstructure:"pushplus"`
-	Web      WebConfig      `mapstructure:"web"`
-	Proxy    ProxyConfig    `mapstructure:"proxy"`
-	VoWiFi   VoWiFiConfig   `mapstructure:"vowifi"`
+	Bark          BarkConfig          `mapstructure:"bark"`
+	Email         EmailConfig         `mapstructure:"email"`
+	Pushplus      PushplusConfig      `mapstructure:"pushplus"`
+	Web           WebConfig           `mapstructure:"web"`
+	Proxy         ProxyConfig         `mapstructure:"proxy"`
+	VoWiFi        VoWiFiConfig        `mapstructure:"vowifi"`
+	PublicIPProbe PublicIPProbeConfig `mapstructure:"public_ip_probe"`
 }
 
 // ProxyConfig 定义代理服务配置
@@ -428,6 +429,12 @@ func Load(path string) (*Config, error) {
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
+
+	publicIPProbe, err := loadPublicIPProbeFromYAML(path)
+	if err != nil {
+		return nil, fmt.Errorf("public_ip_probe: %w", err)
+	}
+	cfg.PublicIPProbe = publicIPProbe
 
 	// 兼容旧版单值配置: feishu.chat_id
 	if len(cfg.Feishu.ChatIDs) == 0 && strings.TrimSpace(cfg.Feishu.ChatID) != "" {

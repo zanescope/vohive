@@ -31,8 +31,8 @@ import (
 	"github.com/zanescope/vowifi-go/runtimehost/messaging"
 	"github.com/zanescope/vowifi-go/runtimehost/voicehost"
 
-	"github.com/zanescope/vohive/pkg/logger"
 	"github.com/spf13/viper"
+	"github.com/zanescope/vohive/pkg/logger"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -413,7 +413,7 @@ func (s *Server) handleListDevices(c *gin.Context) {
 		Interface        string            `json:"interface"`
 		ProxyPort        int               `json:"proxy_port"`
 		PublicIP         string            `json:"public_ip"`
-		PublicIPv6       string            `json:"public_ipv6,omitempty"`
+		PublicIPv6       string            `json:"public_ipv6"`
 		Healthy          bool              `json:"healthy"`
 		Operator         string            `json:"operator"`
 		SignalDBM        int               `json:"signal_dbm"`
@@ -428,6 +428,7 @@ func (s *Server) handleListDevices(c *gin.Context) {
 	list := make([]DeviceStatus, 0, len(workers))
 	for _, w := range workers {
 		status := w.GetCachedDeviceStatus() // 仓表盘列表读缓存，0 IPC
+		network := w.NetworkAddressSnapshot()
 		cfg := w.Config
 		if v, ok := cfgByID[w.ID]; ok {
 			cfg = v
@@ -437,8 +438,8 @@ func (s *Server) handleListDevices(c *gin.Context) {
 			Name:             cfg.Name,
 			Interface:        cfg.Interface,
 			ProxyPort:        cfg.ProxyPort,
-			PublicIP:         w.GetCachedIP(),
-			PublicIPv6:       w.GetCachedIPv6(),
+			PublicIP:         network.PublicIPv4,
+			PublicIPv6:       network.PublicIPv6,
 			Healthy:          w.GetCachedHealthy(), // 健康状态读缓存
 			Operator:         status.Operator,
 			SignalDBM:        status.SignalDBM,
@@ -446,7 +447,7 @@ func (s *Server) handleListDevices(c *gin.Context) {
 			NetworkDuplex:    status.NetworkDuplex,
 			VoWiFiActive:     s.pool.IsVoWiFiActive(w.ID), // 逐个设备判断 VoWiFi 状态，支持多设备
 			VoWiFiRuntime:    s.getVoWiFiRuntimeDTO(w.ID),
-			NetworkConnected: w.NetworkConnected(),
+			NetworkConnected: network.Connected,
 		}
 		// 添加格式化流量
 		if w.Proxy != nil {
@@ -928,15 +929,16 @@ func (s *Server) handleDeviceMgmtStartNetwork(c *gin.Context) {
 		return
 	}
 	go func() { _ = worker.RefreshRuntime(nil, "start_network") }()
+	network := worker.NetworkAddressSnapshot()
 	c.JSON(http.StatusOK, gin.H{
 		"status":            "ok",
 		"message":           "数据网络已启动",
 		"device":            deviceID,
-		"network_connected": worker.NetworkConnected(),
-		"private_ip":        nc.GetPrivateIP(),
-		"private_ipv6":      nc.GetPrivateIPv6(),
-		"public_ip":         worker.GetCachedIP(),
-		"public_ipv6":       worker.GetCachedIPv6(),
+		"network_connected": network.Connected,
+		"private_ip":        network.PrivateIPv4,
+		"private_ipv6":      network.PrivateIPv6,
+		"public_ip":         network.PublicIPv4,
+		"public_ipv6":       network.PublicIPv6,
 	})
 }
 
@@ -961,7 +963,7 @@ func (s *Server) handleDeviceMgmtStopNetwork(c *gin.Context) {
 		"status":            "ok",
 		"message":           "数据网络已停止",
 		"device":            deviceID,
-		"network_connected": worker.NetworkConnected(),
+		"network_connected": false,
 		"private_ip":        "",
 		"private_ipv6":      "",
 		"public_ip":         "",
@@ -1387,7 +1389,7 @@ func (s *Server) handleStatus(c *gin.Context) {
 		SignalDBM  int    `json:"signal_dbm"`
 		RegStatus  string `json:"reg_status"`
 		PublicIP   string `json:"public_ip"`
-		PublicIPv6 string `json:"public_ipv6,omitempty"`
+		PublicIPv6 string `json:"public_ipv6"`
 		ProxyPort  int    `json:"proxy_port"`
 		Healthy    bool   `json:"healthy"`
 	}
@@ -1395,6 +1397,7 @@ func (s *Server) handleStatus(c *gin.Context) {
 	list := make([]DeviceStatusSummary, 0, len(workers))
 	for _, w := range workers {
 		status := w.GetCachedDeviceStatus() // 设备摘要列表读缓存，0 IPC
+		network := w.NetworkAddressSnapshot()
 		list = append(list, DeviceStatusSummary{
 			ID:         w.ID,
 			Name:       w.Config.Name,
@@ -1403,8 +1406,8 @@ func (s *Server) handleStatus(c *gin.Context) {
 			Operator:   status.Operator,
 			SignalDBM:  status.SignalDBM,
 			RegStatus:  status.RegStatusText,
-			PublicIP:   w.GetCachedIP(),
-			PublicIPv6: w.GetCachedIPv6(),
+			PublicIP:   network.PublicIPv4,
+			PublicIPv6: network.PublicIPv6,
 			ProxyPort:  w.Config.ProxyPort,
 			Healthy:    w.GetCachedHealthy(), // 健康状态读缓存
 		})
@@ -1425,6 +1428,7 @@ func (s *Server) handleStatusDetail(c *gin.Context) {
 	_ = worker.RefreshRuntime(c.Request.Context(), "status_detail")
 	_ = worker.RefreshIdentityLive(c.Request.Context(), "status_detail")
 	status := worker.ProjectDeviceStatus()
+	network := worker.NetworkAddressSnapshot()
 
 	response := gin.H{
 		"id":                worker.ID,
@@ -1456,12 +1460,12 @@ func (s *Server) handleStatusDetail(c *gin.Context) {
 		"cell_id":           status.CellID,
 		"apn":               status.APN,
 		"ims_status":        status.IMSStatus,
-		"public_ip":         worker.GetCachedIP(),
-		"public_ipv6":       worker.GetCachedIPv6(),
+		"public_ip":         network.PublicIPv4,
+		"public_ipv6":       network.PublicIPv6,
 		"interface":         worker.Config.Interface,
 		"proxy_port":        worker.Config.ProxyPort,
 		"healthy":           worker.IsDeviceHealthy(),
-		"network_connected": worker.NetworkConnected(),
+		"network_connected": network.Connected,
 	}
 
 	if worker.Proxy != nil {

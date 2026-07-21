@@ -2,14 +2,26 @@ package netprobe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"regexp"
 	"strings"
-	"syscall"
 	"time"
+)
+
+const (
+	defaultTimeout       = 10 * time.Second
+	defaultMaxConcurrent = 8
+	maxResponseBytes     = 128
+)
+
+var (
+	ErrNoURLs              = errors.New("no public IP probe URLs configured")
+	ErrNoUsableResult      = errors.New("no public IP probe returned a usable address")
+	ErrInterfaceRequired   = errors.New("network interface is required for a bound public IP probe")
+	ErrHostCooling         = errors.New("public IP probe host is cooling down")
+	sharedProbeCoordinator = NewCoordinator(defaultMaxConcurrent)
 )
 
 type Family int
@@ -20,176 +32,193 @@ const (
 	FamilyV6
 )
 
+func (f Family) String() string {
+	switch f {
+	case FamilyV4:
+		return "ipv4"
+	case FamilyV6:
+		return "ipv6"
+	default:
+		return "any"
+	}
+}
+
+// LookupFunc resolves only addresses usable by the requested family. Lookup is
+// retained in Config solely for callers that have not migrated to this form.
+type LookupFunc func(ctx context.Context, host string, family Family) ([]string, error)
+
 type Config struct {
 	Interface string
-	URLs      []string
-	Timeout   time.Duration
-	Lookup    func(ctx context.Context, host string) ([]string, error)
+
+	// IPv4URLs and IPv6URLs are ordered source lists. URLs is the legacy common
+	// list and is used only when the matching family-specific list is empty.
+	URLs     []string
+	IPv4URLs []string
+	IPv6URLs []string
+
+	// Timeout applies to each HTTP request. Coordinator queue time is controlled
+	// by the caller context and therefore remains independently cancellable.
+	Timeout time.Duration
+
+	LookupFamily LookupFunc
+	Lookup       func(ctx context.Context, host string) ([]string, error)
+
+	// Coordinator is normally nil, selecting the process-wide coordinator.
+	// Transport exists for deterministic TLS tests. Production callers should
+	// leave it nil so interface binding and destination checks cannot be bypassed.
+	Coordinator *Coordinator
+	Transport   http.RoundTripper
+}
+
+type Result struct {
+	IP     string
+	Source string
 }
 
 type Prober struct {
-	cfg    Config
-	client *http.Client
+	cfg         Config
+	client      *http.Client
+	coordinator *Coordinator
 }
 
 type familyKey struct{}
 
 func New(cfg Config) *Prober {
-	p := &Prober{cfg: cfg}
-	p.client = &http.Client{
-		Transport: &http.Transport{
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultTimeout
+	}
+	p := &Prober{cfg: cfg, coordinator: cfg.Coordinator}
+	if p.coordinator == nil {
+		p.coordinator = sharedProbeCoordinator
+	}
+
+	transport := cfg.Transport
+	if transport == nil {
+		transport = &http.Transport{
 			DialContext:       p.dialContext,
 			DisableKeepAlives: true,
+			Proxy:             nil,
+		}
+	}
+	p.client = &http.Client{
+		Transport: transport,
+		Timeout:   cfg.Timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
-		Timeout: cfg.Timeout,
 	}
 	return p
 }
 
-func (p *Prober) Probe(parent context.Context, fam Family) string {
-	ctx, cancel := context.WithTimeout(parent, p.cfg.Timeout)
-	defer cancel()
-	results := make(chan string, len(p.cfg.URLs))
-	for _, target := range p.cfg.URLs {
-		go func(target string) {
-			req, err := http.NewRequestWithContext(withFamily(ctx, fam), http.MethodGet, target, nil)
-			if err != nil {
-				return
-			}
-			resp, err := p.client.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			content := string(body)
-			ip := extractResponseIP(target, content)
-			if net.ParseIP(ip) != nil {
-				select {
-				case results <- ip:
-				case <-ctx.Done():
-				}
-			}
-		}(target)
-	}
-
-	select {
-	case ip := <-results:
-		return ip
-	case <-ctx.Done():
+// Probe preserves the historical empty-string-on-failure API. New code should
+// use ProbeResult so the winning source and cancellation errors remain visible.
+func (p *Prober) Probe(ctx context.Context, family Family) string {
+	result, err := p.ProbeResult(ctx, family)
+	if err != nil {
 		return ""
 	}
+	return result.IP
 }
 
-func (p *Prober) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
+// ProbeResult tries sources in configured order, avoiding an all-source burst.
+func (p *Prober) ProbeResult(ctx context.Context, family Family) (Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	ips, err := p.lookupHost(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-	ips = filterFamily(ips, familyFromContext(ctx))
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("host %s: no address for family", host)
+	urls := p.urlsForFamily(family)
+	if len(urls) == 0 {
+		return Result{}, ErrNoURLs
 	}
 
-	d := p.boundDialer()
 	var lastErr error
-	for _, ip := range ips {
-		conn, err := d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+	for _, target := range urls {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		result, err := p.probeOne(ctx, target, family)
 		if err == nil {
-			return conn, nil
+			return result, nil
 		}
 		lastErr = err
 	}
-	return nil, lastErr
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	if lastErr == nil {
+		return Result{}, ErrNoUsableResult
+	}
+	return Result{}, errors.Join(ErrNoUsableResult, lastErr)
 }
 
-func (p *Prober) lookupHost(ctx context.Context, host string) ([]string, error) {
-	if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil {
-		return []string{ip.String()}, nil
+func (p *Prober) urlsForFamily(family Family) []string {
+	switch family {
+	case FamilyV4:
+		if len(p.cfg.IPv4URLs) > 0 {
+			return p.cfg.IPv4URLs
+		}
+	case FamilyV6:
+		if len(p.cfg.IPv6URLs) > 0 {
+			return p.cfg.IPv6URLs
+		}
+	case FamilyAny:
+		if len(p.cfg.URLs) == 0 {
+			out := make([]string, 0, len(p.cfg.IPv4URLs)+len(p.cfg.IPv6URLs))
+			out = append(out, p.cfg.IPv4URLs...)
+			out = append(out, p.cfg.IPv6URLs...)
+			return out
+		}
 	}
-	if p.cfg.Lookup != nil {
-		return p.cfg.Lookup(ctx, host)
-	}
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	return p.cfg.URLs
+}
+
+func (p *Prober) probeOne(ctx context.Context, target string, family Family) (Result, error) {
+	u, _, err := parseTargetURL(target)
+	source := safeSource(target)
 	if err != nil {
-		return nil, err
+		return Result{}, fmt.Errorf("probe %s: invalid target", source)
 	}
-	out := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		out = append(out, ip.IP.String())
-	}
-	return out, nil
-}
 
-func (p *Prober) boundDialer() *net.Dialer {
-	d := &net.Dialer{Timeout: p.cfg.Timeout}
-	if strings.TrimSpace(p.cfg.Interface) == "" {
-		return d
+	release, err := p.coordinator.acquire(ctx, strings.ToLower(u.Hostname()))
+	if err != nil {
+		return Result{}, err
 	}
-	d.Control = func(_, _ string, c syscall.RawConn) error {
-		var serr error
-		if err := c.Control(func(fd uintptr) {
-			serr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, p.cfg.Interface)
-		}); err != nil {
-			return err
+	defer release()
+
+	requestCtx, cancel := context.WithTimeout(withFamily(ctx, family), p.cfg.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return Result{}, fmt.Errorf("probe %s: cannot build request", source)
+	}
+	req.Header.Set("Accept", "text/plain")
+	req.Header.Set("User-Agent", "VoHive-public-ip-probe")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		if requestCtx.Err() != nil {
+			return Result{}, requestCtx.Err()
 		}
-		return serr
+		return Result{}, fmt.Errorf("probe %s: request failed: %w", source, sanitizedURLError(err))
 	}
-	return d
-}
+	defer resp.Body.Close()
 
-func withFamily(ctx context.Context, fam Family) context.Context {
-	return context.WithValue(ctx, familyKey{}, fam)
-}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		p.coordinator.cooldown(strings.ToLower(u.Hostname()), retryAfter(resp.Header.Get("Retry-After"), time.Now()))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return Result{}, fmt.Errorf("probe %s: unexpected HTTP status %d", source, resp.StatusCode)
+	}
 
-func familyFromContext(ctx context.Context) Family {
-	if fam, ok := ctx.Value(familyKey{}).(Family); ok {
-		return fam
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return Result{}, fmt.Errorf("probe %s: response read failed", source)
 	}
-	return FamilyAny
-}
-
-func filterFamily(ips []string, fam Family) []string {
-	if fam == FamilyAny {
-		return ips
+	if len(body) > maxResponseBytes {
+		return Result{}, fmt.Errorf("probe %s: response is too large", source)
 	}
-	out := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		parsed := net.ParseIP(ip)
-		if parsed == nil {
-			continue
-		}
-		isV4 := parsed.To4() != nil
-		if (fam == FamilyV4 && isV4) || (fam == FamilyV6 && !isV4) {
-			out = append(out, ip)
-		}
+	addr, err := parseResponseAddress(string(body), family)
+	if err != nil {
+		return Result{}, fmt.Errorf("probe %s: %w", source, err)
 	}
-	return out
-}
-
-func extractResponseIP(target, content string) string {
-	if strings.Contains(target, "trace") {
-		if m := regexp.MustCompile(`(?m)^ip=([^\r\n]+)`).FindStringSubmatch(content); len(m) > 1 {
-			return extractIP(m[1])
-		}
-	}
-	return extractIP(content)
-}
-
-func extractIP(content string) string {
-	content = strings.TrimSpace(content)
-	if ip := net.ParseIP(content); ip != nil {
-		return ip.String()
-	}
-	if m := regexp.MustCompile(`[0-9a-fA-F:.]{2,45}`).FindString(content); m != "" {
-		if ip := net.ParseIP(m); ip != nil {
-			return ip.String()
-		}
-	}
-	return ""
+	return Result{IP: addr.String(), Source: source}, nil
 }
