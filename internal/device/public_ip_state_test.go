@@ -951,7 +951,7 @@ func TestPublicIPProbeSelfConvergesWhenPrivateAddressChangesMidFlight(t *testing
 }
 
 func TestRotateWithNotifyDoesNotRedialAfterObservationTimeout(t *testing.T) {
-	p, worker, controller := newPublicIPStateHarness(t)
+	_, worker, controller := newPublicIPStateHarness(t)
 	controller.setPrivate("10.0.0.2", "")
 	seedPublicIPRuntime(worker, "10.0.0.2", "", "8.8.8.8", "")
 
