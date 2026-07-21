@@ -64,6 +64,8 @@ export type DeviceLifecyclePhase =
   | 'degraded'
   | 'evicting'
 
+export type PhoneNumberSource = 'manual' | 'vowifi' | 'modem' | 'legacy' | 'none'
+
 export type DeviceOverviewItem = {
   id: string
   name: string
@@ -88,6 +90,7 @@ export type DeviceOverviewItem = {
   at_port?: string
   usb_path?: string
   local_phone?: string
+  local_phone_source?: PhoneNumberSource
   e911_setup_available?: boolean
   active_esim_profile_name?: string
   network_enabled: boolean

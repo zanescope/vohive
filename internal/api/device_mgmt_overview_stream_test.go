@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	proxytraffic "github.com/zanescope/vohive/internal/proxy/traffic"
 	"github.com/gin-gonic/gin"
+	proxytraffic "github.com/zanescope/vohive/internal/proxy/traffic"
 )
 
 func TestOverviewStreamEmitVersionIgnoresRuntimeUpdatedAt(t *testing.T) {
@@ -81,6 +81,14 @@ func TestOverviewStreamEmitVersionTracksRuntimeBusinessState(t *testing.T) {
 		{
 			name: "runtime disappeared",
 			item: deviceMgmtOverviewLiteItem{VoWiFiActive: true},
+		},
+		{
+			name: "local phone changed",
+			item: deviceMgmtOverviewLiteItem{VoWiFiActive: true, LocalPhone: "+447700904001", VoWiFiRuntime: &voWiFiRuntimeDTO{Phase: "registering", TunnelReady: true}},
+		},
+		{
+			name: "local phone source changed",
+			item: deviceMgmtOverviewLiteItem{VoWiFiActive: true, LocalPhoneSource: "manual", VoWiFiRuntime: &voWiFiRuntimeDTO{Phase: "registering", TunnelReady: true}},
 		},
 	}
 
