@@ -175,6 +175,8 @@ type Pool struct {
 	dataConnectHandlersMu     sync.RWMutex
 	dataConnectHandlers       []func(deviceID string)
 	rescanMu                  sync.Mutex
+	missingWorkerRecoveryMu   sync.Mutex
+	missingWorkerRecovery     missingWorkerRecoveryBackoff
 	rescanAndReconnectForTest func() error
 
 	// SIP 注册器 (用于 CS 域语音桥接查路由)
