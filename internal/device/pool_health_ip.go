@@ -86,86 +86,9 @@ func (p *Pool) runHealthCheckTick() bool {
 	workers := p.healthCheckWorkerSnapshot()
 	needRescan := false
 	for _, w := range workers {
-		p.refreshIPs(w, false)
-		w.cleanupFragmentCache(30 * time.Minute)
-		healthy, healthErr := w.ProbeDeviceHealth()
-		w.setCachedHealthy(healthy)
-		if healthy {
-			layer := HealthLayerAT
-			if w.Backend != nil && w.Backend.Mode() != backend.BackendAT {
-				layer = HealthLayerQMI
-			}
-			w.RecordWatchdogEvent(WatchdogEvent{
-				Layer:     layer,
-				State:     HealthStateHealthy,
-				EventType: "control_health_check_ok",
-				Reason:    "control_health_check_ok",
-			})
-			w.resetHealthFailureStreak()
-			continue
+		if p.runWorkerHealthCheckSafely(w) {
+			needRescan = true
 		}
-
-		actBackend := ""
-		if w.Backend != nil {
-			actBackend = w.Backend.Mode()
-		}
-		isQMI := actBackend == "qmi" || strings.ToLower(strings.TrimSpace(w.Config.DeviceBackend)) == "qmi"
-
-		if isQMI {
-			if suppressed, reason := p.suppressQMIUnhealthyEviction(w); suppressed {
-				logger.Debug("QMI 节点当前处于恢复窗口，跳过本轮剥离判定", "device", w.ID, "reason", reason)
-				continue
-			}
-		}
-
-		failures := 1
-		if isQMI {
-			failures = w.recordHealthFailure()
-		}
-		// 传输确认已断开（broken pipe/EOF/connection closed 等）时，重连前不可能探活成功，
-		// 没有必要再等满 3 次观察窗口——跳过等待，第一次失败就直接触发恢复。
-		transportDown := isQMI && healthErr != nil && qmiErrorIndicatesTransportDown(healthErr.Error())
-		if isQMI && strings.TrimSpace(w.Config.ControlDevice) != "" {
-			if failures < qmiHealthFailureThreshold && !transportDown {
-				logger.Warn("QMI 节点探活失败，进入连续失败观察窗口",
-					"device", w.ID,
-					"failures", failures,
-					"threshold", qmiHealthFailureThreshold)
-				continue
-			}
-			reason := "qmi_health_threshold"
-			if transportDown && failures < qmiHealthFailureThreshold {
-				reason = "qmi_transport_down"
-			}
-			w.RecordWatchdogEvent(WatchdogEvent{
-				Layer:               HealthLayerQMI,
-				State:               HealthStateInvalid,
-				EventType:           reason,
-				Reason:              reason,
-				ConsecutiveFailures: failures,
-				Threshold:           qmiHealthFailureThreshold,
-			})
-			if p.lifecycle != nil {
-				p.lifecycle.BeginRecovery(w.ID, LifecyclePhaseRecovering, reason, qmiLifecycleRecoveryTTL)
-			}
-			logger.Info("检测到免扫节点(QMI)探活超限，进入统一模组恢复流程", "device", w.ID, "reason", reason)
-			p.scheduleWorkerRecoveryWithTransportEvent(w.ID, reason, &TransportRecoveryEvent{
-				DeviceID:         w.ID,
-				WorkerGeneration: w.generation,
-				Kind:             TransportRecoveryEventHealthSuspect,
-				Source:           reason,
-				Err:              healthErr,
-			})
-			continue
-		}
-
-		logger.Info("定时检查发现设备不健康，将触发重连扫描", "device", w.ID, "backend", func() string {
-			if w.Backend != nil {
-				return w.Backend.Mode()
-			}
-			return "none"
-		}())
-		needRescan = true
 	}
 	workerCount := len(workers)
 
@@ -177,21 +100,15 @@ func (p *Pool) runHealthCheckTick() bool {
 }
 
 func (p *Pool) healthCheckLoop() {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("healthCheckLoop panic recovered", "err", r)
-		}
-	}()
-
 	for _, w := range p.healthCheckWorkerSnapshot() {
-		p.refreshIPs(w, false)
+		p.refreshWorkerIPsSafely(w)
 	}
 
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
+	healthTicker := time.NewTicker(healthCheckInterval)
+	defer healthTicker.Stop()
 
-	syncTicker := time.NewTicker(1 * time.Minute)
-	defer syncTicker.Stop()
+	syncTimer := time.NewTimer(healthSyncOffset)
+	defer syncTimer.Stop()
 
 	sem := make(chan struct{}, 6)
 
@@ -200,57 +117,16 @@ func (p *Pool) healthCheckLoop() {
 		case <-p.ctx.Done():
 			return
 
-		case <-ticker.C:
-			if p.runHealthCheckTick() {
+		case <-healthTicker.C:
+			if p.runHealthCheckTickSafely() {
 				p.scheduleRescan("health_check")
 			}
 
-		case <-syncTicker.C:
-			p.mu.RLock()
-			workers := make([]*Worker, 0, len(p.workers))
-			for _, w := range p.workers {
-				workers = append(workers, w)
+		case <-syncTimer.C:
+			for _, worker := range p.healthCheckWorkerSnapshot() {
+				p.scheduleWorkerHealthSync(worker, sem)
 			}
-			p.mu.RUnlock()
-
-			for _, w := range workers {
-				worker := w
-				if worker == nil {
-					continue
-				}
-				sem <- struct{}{}
-				go func() {
-					defer func() { <-sem }()
-
-					done := make(chan struct{})
-					go func() {
-						isATMode := worker.Backend == nil || worker.Backend.Mode() == "at"
-						if isATMode && worker.Modem != nil {
-							worker.Modem.RefreshStatus(
-								func(msg string) {
-									if notifier := p.getNotifier(); notifier != nil {
-										notifier.NotifyRaw(msg)
-									}
-								},
-								func(msg string) {
-									if notifier := p.getNotifier(); notifier != nil {
-										notifier.NotifyRaw(msg)
-									}
-								},
-							)
-						}
-						_ = worker.RefreshRuntime(nil, "health_sync")
-						p.PersistRuntimeState(worker)
-						close(done)
-					}()
-
-					select {
-					case <-done:
-					case <-time.After(20 * time.Second):
-						logger.Warn("设备状态同步超时", "device", worker.ID)
-					}
-				}()
-			}
+			syncTimer.Reset(healthSyncInterval)
 		}
 	}
 }
@@ -323,15 +199,6 @@ func (w *Worker) GetCachedIMSI() string {
 	imsi := strings.TrimSpace(w.state.Identity.IMSI)
 	w.cacheMu.RUnlock()
 	return imsi
-}
-
-func (w *Worker) setCachedHealthy(healthy bool) {
-	if w == nil {
-		return
-	}
-	w.cacheMu.Lock()
-	w.state.Meta.Healthy = healthy
-	w.cacheMu.Unlock()
 }
 
 func (w *Worker) markHealthRecoveryWindow(duration time.Duration) {
@@ -446,8 +313,11 @@ func representativeIP(publicV4, publicV6 string) string {
 }
 
 func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
+	if worker == nil {
+		return
+	}
 	nc := worker.NetworkController()
-	if worker == nil || nc == nil || !nc.IsConnected() {
+	if nc == nil || !nc.IsConnected() {
 		return
 	}
 
