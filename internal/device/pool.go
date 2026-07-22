@@ -179,6 +179,7 @@ type Pool struct {
 	cancel                    context.CancelFunc
 	dataConnectHandlersMu     sync.RWMutex
 	dataConnectHandlers       []func(deviceID string)
+	rescanMu                  sync.Mutex
 	rescanAndReconnectForTest func() error
 
 	// SIP 注册器 (用于 CS 域语音桥接查路由)
@@ -1948,6 +1949,12 @@ func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex Wor
 }
 
 func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
+	// Hardware discovery mutates Worker registrations. Serialize every caller
+	// (udev, health checks, manual rescans and recovery loops) so an older scan
+	// cannot remove a Worker that a concurrent scan has just rebuilt.
+	p.rescanMu.Lock()
+	defer p.rescanMu.Unlock()
+
 	discovered, err := discoverQMIDevicesFn()
 	if err != nil {
 		logger.Warn("QMI 硬件扫描失败，将继续使用兼容扫描", "err", err)
