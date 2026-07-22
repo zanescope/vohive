@@ -80,8 +80,8 @@ jobs:
             echo "Tag ${GITHUB_REF_NAME} is neither a stable nor beta VoHive release." >&2
             exit 1
           fi
-          release_file="${RUNNER_TEMP}/vohive-release.json"
-          release_error="${RUNNER_TEMP}/vohive-release.error"
+          release_file="${RUNNER_TEMP}/github-release-response.json"
+          release_error="${RUNNER_TEMP}/github-release-response.error"
           release_ready=false
           for ((attempt = 1; attempt <= 180; attempt++)); do
             status="$(curl --proto '=https' --tlsv1.2 -sS -o "${release_file}" -w '%{http_code}' \
