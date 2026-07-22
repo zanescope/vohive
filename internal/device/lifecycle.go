@@ -118,12 +118,27 @@ func (lc *lifecycleCoordinator) MarkOffline(deviceID string, reason string) {
 
 // GetSnapshot 安全地获取指定设备当前的生命周期快照；若设备不存在，则返回离线状态快照
 func (lc *lifecycleCoordinator) GetSnapshot(deviceID string) LifecycleSnapshot {
+	return lc.getSnapshotAt(deviceID, time.Now())
+}
+
+func (lc *lifecycleCoordinator) getSnapshotAt(deviceID string, now time.Time) LifecycleSnapshot {
 	if lc == nil || deviceID == "" {
 		return LifecycleSnapshot{Phase: LifecyclePhaseOffline}
 	}
-	lc.mu.RLock()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	lc.mu.Lock()
 	snap, ok := lc.states[deviceID]
-	lc.mu.RUnlock()
+	if ok && snap.Recovering && !snap.Deadline.IsZero() && !now.Before(snap.Deadline) {
+		snap = LifecycleSnapshot{
+			Phase:     LifecyclePhaseOffline,
+			Reason:    fmt.Sprintf("recovery_deadline_expired(%s:%s)", snap.Phase, snap.Reason),
+			StartedAt: now,
+		}
+		lc.states[deviceID] = snap
+	}
+	lc.mu.Unlock()
 	if !ok || snap.Phase == "" {
 		return LifecycleSnapshot{Phase: LifecyclePhaseOffline}
 	}
@@ -132,15 +147,12 @@ func (lc *lifecycleCoordinator) GetSnapshot(deviceID string) LifecycleSnapshot {
 
 // CanEvict 检查指定设备是否可以执行驱逐，如果处于恢复中且未超时则返回不可驱逐，并附带状态说明
 func (lc *lifecycleCoordinator) CanEvict(deviceID string, now time.Time) (bool, string) {
-	snap := lc.GetSnapshot(deviceID)
-	if !snap.Recovering {
-		return true, ""
-	}
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if snap.Deadline.IsZero() || now.Before(snap.Deadline) {
-		return false, fmt.Sprintf("lifecycle_%s(%s)", snap.Phase, snap.Reason)
+	snap := lc.getSnapshotAt(deviceID, now)
+	if !snap.Recovering {
+		return true, ""
 	}
-	return true, fmt.Sprintf("lifecycle_deadline_expired(%s)", snap.Phase)
+	return false, fmt.Sprintf("lifecycle_%s(%s)", snap.Phase, snap.Reason)
 }

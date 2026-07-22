@@ -2162,6 +2162,9 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 				p.lifecycle.BeginRecovery(md.ID, LifecyclePhaseUSBWait, "rescan_device_missing", qmiLifecycleRecoveryTTL)
 			}
 			_ = p.RemoveWorker(md.ID)
+			if p.lifecycle != nil {
+				p.lifecycle.MarkOffline(md.ID, "rescan_device_missing")
+			}
 		}
 	}
 
