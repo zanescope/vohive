@@ -3,6 +3,7 @@ module github.com/zanescope/vohive
 go 1.26.3
 
 require (
+	aead.dev/minisign v0.2.0
 	github.com/damonto/euicc-go v1.1.3-0.20260628013808-8d873a2dfc98
 	github.com/emiago/sipgo v1.4.0
 	github.com/gin-gonic/gin v1.11.0
@@ -13,7 +14,6 @@ require (
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/lestrrat-go/file-rotatelogs v2.4.0+incompatible
 	github.com/miekg/dns v1.1.67
-	github.com/minio/selfupdate v0.6.0
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
 	github.com/things-go/go-socks5 v0.1.1
@@ -33,7 +33,6 @@ require (
 )
 
 require (
-	aead.dev/minisign v0.2.0 // indirect
 	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
