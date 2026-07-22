@@ -331,12 +331,30 @@ func (p *Pool) healthCheckLoop() {
 				if worker == nil {
 					continue
 				}
-				sem <- struct{}{}
+				if !worker.tryBeginHealthSync() {
+					continue
+				}
+				select {
+				case sem <- struct{}{}:
+				case <-p.ctx.Done():
+					worker.endHealthSync()
+					return
+				}
 				go func() {
 					defer func() { <-sem }()
 
 					done := make(chan struct{})
 					go func() {
+						defer close(done)
+						defer worker.endHealthSync()
+						ctx, cancel := context.WithTimeout(p.ctx, 20*time.Second)
+						defer cancel()
+						select {
+						case <-worker.stop:
+							return
+						default:
+						}
+
 						isATMode := worker.Backend == nil || worker.Backend.Mode() == "at"
 						if isATMode && worker.Modem != nil {
 							worker.Modem.RefreshStatus(
@@ -352,13 +370,21 @@ func (p *Pool) healthCheckLoop() {
 								},
 							)
 						}
-						_ = worker.RefreshRuntime(nil, "health_sync")
-						p.PersistRuntimeState(worker)
-						close(done)
+						_ = worker.RefreshRuntime(ctx, "health_sync")
+						select {
+						case <-worker.stop:
+							return
+						default:
+						}
+						if p.GetWorker(worker.ID) == worker {
+							p.PersistRuntimeState(worker)
+						}
 					}()
 
 					select {
 					case <-done:
+					case <-p.ctx.Done():
+					case <-worker.stop:
 					case <-time.After(20 * time.Second):
 						logger.Warn("设备状态同步超时", "device", worker.ID)
 					}
