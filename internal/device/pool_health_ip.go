@@ -82,6 +82,56 @@ func (p *Pool) healthCheckWorkerSnapshot() []*Worker {
 	return workers
 }
 
+const (
+	missingWorkerRecoveryBase = time.Minute
+	missingWorkerRecoveryMax  = 5 * time.Minute
+)
+
+type missingWorkerRecoveryBackoff struct {
+	attempts int
+	next     time.Time
+}
+
+func (backoff *missingWorkerRecoveryBackoff) allow(now time.Time) (bool, time.Duration) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !backoff.next.IsZero() && now.Before(backoff.next) {
+		return false, backoff.next.Sub(now)
+	}
+	backoff.attempts++
+	shift := backoff.attempts - 1
+	if shift > 3 {
+		shift = 3
+	}
+	delay := missingWorkerRecoveryBase * time.Duration(1<<shift)
+	if delay > missingWorkerRecoveryMax {
+		delay = missingWorkerRecoveryMax
+	}
+	backoff.next = now.Add(delay)
+	return true, delay
+}
+
+func (backoff *missingWorkerRecoveryBackoff) reset() {
+	backoff.attempts = 0
+	backoff.next = time.Time{}
+}
+
+func (p *Pool) allowMissingWorkerRecovery(now time.Time) (bool, time.Duration) {
+	p.missingWorkerRecoveryMu.Lock()
+	defer p.missingWorkerRecoveryMu.Unlock()
+	return p.missingWorkerRecovery.allow(now)
+}
+
+func (p *Pool) resetMissingWorkerRecovery() {
+	if p == nil {
+		return
+	}
+	p.missingWorkerRecoveryMu.Lock()
+	p.missingWorkerRecovery.reset()
+	p.missingWorkerRecoveryMu.Unlock()
+}
+
 func (p *Pool) runHealthCheckTick() bool {
 	workers := p.healthCheckWorkerSnapshot()
 	needRescan := false
@@ -168,6 +218,7 @@ func (p *Pool) runHealthCheckTick() bool {
 		needRescan = true
 	}
 	workerCount := len(workers)
+	missingWorkerDetected := false
 
 	if !needRescan {
 		if managed := config.ListDevices(); true {
@@ -178,7 +229,14 @@ func (p *Pool) runHealthCheckTick() bool {
 				hasWorker := p.workers[md.ID] != nil
 				p.mu.RUnlock()
 
-				if md.ModemIMEI != "" && !hasWorker && !isRebuilding && !isRebootRecovering {
+				if md.ModemIMEI != "" && !hasWorker {
+					missingWorkerDetected = true
+					if isRebuilding || isRebootRecovering {
+						continue
+					}
+					if allowed, _ := p.allowMissingWorkerRecovery(time.Now()); !allowed {
+						break
+					}
 					isQMIConf := strings.ToLower(strings.TrimSpace(md.DeviceBackend)) == "qmi" ||
 						(strings.TrimSpace(md.DeviceBackend) == "" && strings.TrimSpace(md.ControlDevice) != "")
 
@@ -219,6 +277,10 @@ func (p *Pool) runHealthCheckTick() bool {
 				}
 			}
 		}
+	}
+
+	if !missingWorkerDetected {
+		p.resetMissingWorkerRecovery()
 	}
 
 	return needRescan
