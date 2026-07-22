@@ -61,10 +61,10 @@ dependency_hygiene() {
 	forbidden_refs="$(
 		{
 			git grep -nE 'github[.]com/(iniwex5|boa-z)|iniwex[/]vohive|DOCKERHUB[_]|secrets[.]DOCKERHUB|vohive[-]release|GO[.]?PRIVATE|GO[.]?NOSUMDB|GH[_]PAT' -- \
-				go.mod go.sum .github Dockerfile Dockerfile.github Dockerfile.runtime docker-compose.yml docker-compose.hub.yml DOCKERHUB.md Makefile scripts internal cmd pkg web/src \
+				go.mod go.sum .github Dockerfile Dockerfile.github Dockerfile.runtime docker-compose.yml CONTAINER.md Makefile scripts internal cmd pkg web/src \
 				':!internal/web/dist/**' ':!web/dist/**' || true
 			git grep -nE 'replace[[:space:]].*=>[[:space:]]*(\.{1,2}/|/|~)' -- \
-				go.mod go.sum .github Dockerfile Dockerfile.github Dockerfile.runtime docker-compose.yml docker-compose.hub.yml DOCKERHUB.md Makefile scripts internal cmd pkg web/src \
+				go.mod go.sum .github Dockerfile Dockerfile.github Dockerfile.runtime docker-compose.yml CONTAINER.md Makefile scripts internal cmd pkg web/src \
 				':!internal/web/dist/**' ':!web/dist/**' || true
 		} | sed '/^$/d'
 	)"
@@ -100,114 +100,168 @@ dependency_hygiene() {
 }
 
 release_hygiene() {
-	local workflow
+	local file needle workflow policy manifest_tool
 	workflow=".github/workflows/binary-release.yml"
-	if [[ ! -f "$workflow" ]]; then
-		printf 'release workflow not found: %s\n' "$workflow" >&2
-		return 1
-	fi
+	policy="packaging/release-policy.json"
+	manifest_tool="scripts/release-manifest/main.go"
+	for file in "$workflow" "$policy" "$manifest_tool"; do
+		if [[ ! -f "$file" ]]; then
+			printf 'release file not found: %s\n' "$file" >&2
+			return 1
+		fi
+	done
 	if git grep -nE 'repository:[[:space:]]*[^[:space:]]+|GH[_]PAT|vohive[-]release|github[.]com/iniwex5' -- "$workflow"; then
-		printf 'release workflow must publish only to the current repository without cross-repo PAT wiring\n' >&2
+		printf 'release workflow must not contain cross-repository publishing wiring\n' >&2
 		return 1
 	fi
-	if ! git grep -n 'softprops/action-gh-release' -- "$workflow" >/dev/null; then
-		printf 'release workflow does not publish through softprops/action-gh-release\n' >&2
+	for needle in \
+		'EXPECTED_REPOSITORY: zanescope/vohive' \
+		'name: Validate release gates' \
+		'needs: validate' \
+		'go run ./scripts/release-manifest generate' \
+		'go run ./scripts/release-manifest verify' \
+		'go run ./scripts/release-manifest alias-gate' \
+		'needs.bundle.outputs.advance_alias' \
+		'needs.bundle.outputs.source_revision' \
+		'packaging/install.sh' \
+		'packaging/uninstall.sh' \
+		'./cmd/vohivectl' \
+		'./cmd/vohive-verify' \
+		'VOHIVE_MINISIGN_PUBLIC_KEYS' \
+		'@VOHIVE_VERIFY_SHA256@' \
+		'@VOHIVE_BOOTSTRAP_VERSION@' \
+		'sha256sum vohive-* vohive_* release-manifest.json' \
+		'MINISIGN_PASSWORD}" | minisign -Sm' \
+		'minisign -Vm' \
+		'name: Refuse an existing GitHub Release' \
+		'releases?per_page=100' \
+		'release-manifest.json.minisig' \
+		'SHA256SUMS.minisig' \
+		"if: github.ref_type == 'tag'" \
+		'environment: release' \
+		'trap cleanup_key EXIT' \
+		'gh release create' \
+		'repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_VERSION}' \
+		'bundle=${SOURCE_REVISION}, remote=${remote_revision}' \
+		'--verify-tag' \
+		'--json tagName,isDraft,isImmutable' \
+		'gh release delete' \
+		'for placeholder in "${keys_placeholder}"'; do
+		if ! grep -Fq -- "$needle" "$workflow"; then
+			printf 'release workflow is missing required constraint: %s\n' "$needle" >&2
+			return 1
+		fi
+	done
+	if grep -Fq 'overwrite_files: true' "$workflow"; then
+		printf 'release workflow must not overwrite published assets\n' >&2
 		return 1
 	fi
-	if ! git grep -n 'files: dist/*' -- "$workflow" >/dev/null; then
-		printf 'release workflow must upload dist artifacts to the current release\n' >&2
+	if grep -Fq 'softprops/action-gh-release' "$workflow"; then
+		printf 'release workflow must use the GitHub CLI draft-upload-publish path\n' >&2
 		return 1
 	fi
-	if ! git grep -nF 'repos/${GITHUB_REPOSITORY}/releases/tags/' -- "$workflow" >/dev/null; then
-		printf 'release workflow must read metadata from the current GitHub repository\n' >&2
-		return 1
-	fi
-	if ! git grep -nF 'name: Validate release gates' -- "$workflow" >/dev/null; then
-		printf 'release workflow must validate repository gates before building artifacts\n' >&2
-		return 1
-	fi
-	if ! git grep -nF './scripts/ci.sh workflow-lint hygiene release-hygiene container-hygiene tidy test' -- "$workflow" >/dev/null; then
-		printf 'release workflow validate job must run local release gates\n' >&2
-		return 1
-	fi
-	if ! git grep -nF 'needs: validate' -- "$workflow" >/dev/null; then
-		printf 'release workflow artifact jobs must depend on validate\n' >&2
+	if ! grep -Fq '"repository": "zanescope/vohive"' "$policy" || \
+		! grep -Fq '"container_image": "ghcr.io/zanescope/vohive"' "$policy"; then
+		printf 'release policy must pin the repository and container publishing identities\n' >&2
 		return 1
 	fi
 	printf '\n==> release hygiene ok\n'
 }
 
 container_hygiene() {
-	local publish build compose
+	local file needle publish build compose env_example
 	publish=".github/workflows/docker-publish.yml"
 	build=".github/workflows/docker-build.yml"
-	compose="docker-compose.hub.yml"
+	compose="docker-compose.yml"
+	env_example=".env.example"
 
-	for file in "$publish" "$build" "$compose"; do
+	for file in "$publish" "$build" "$compose" "$env_example" CONTAINER.md Dockerfile Dockerfile.github Dockerfile.runtime; do
 		if [[ ! -f "$file" ]]; then
 			printf 'container build file not found: %s\n' "$file" >&2
 			return 1
 		fi
 	done
-
-	if git grep -nE 'DOCKERHUB|dockerhub|secrets[.]DOCKERHUB|iniwex[/]vohive' -- "$publish" "$build" "$compose" DOCKERHUB.md; then
+	if [[ "$(find . -maxdepth 1 -type f -name 'docker-compose*.yml' | wc -l | tr -d ' ')" -ne 1 ]]; then
+		printf 'exactly one official Compose file is allowed\n' >&2
+		return 1
+	fi
+	if grep -En 'DOCKERHUB|dockerhub|secrets[.]DOCKERHUB|iniwex[/]vohive|ghcr[.]io/[$][{][{][[:space:]]*github[.]repository' "$publish" "$build" "$compose"; then
 		printf 'container build configuration must not reference DockerHub or legacy images\n' >&2
 		return 1
 	fi
-	if git grep -nF 'golang:1.24-alpine' -- Dockerfile Dockerfile.github; then
-		printf 'Docker builder images must track the go.mod toolchain family\n' >&2
+	if grep -En 'alpine:latest|-alpine([[:space:]]|$)' Dockerfile Dockerfile.github Dockerfile.runtime; then
+		printf 'Docker base images must pin an explicit Alpine minor\n' >&2
 		return 1
 	fi
-	if [[ "$(git grep -nF 'golang:1.26-alpine' -- Dockerfile Dockerfile.github | wc -l | tr -d ' ')" -lt 2 ]]; then
-		printf 'Docker builder images must use golang:1.26-alpine for Go 1.26 modules\n' >&2
-		return 1
-	fi
-	if git grep -nE 'go mod tidy([[:space:]]|&|$)' -- Dockerfile Dockerfile.github; then
+	for file in Dockerfile Dockerfile.github Dockerfile.runtime; do
+		for needle in 'ARG ALPINE_VERSION=3.23' 'org.opencontainers.image.source' 'org.opencontainers.image.revision' 'org.opencontainers.image.version' '/healthz'; do
+			if ! grep -Fq -- "$needle" "$file"; then
+				printf '%s is missing required image constraint: %s\n' "$file" "$needle" >&2
+				return 1
+			fi
+		done
+	done
+	if grep -En 'go mod tidy([[:space:]]|&|$)' Dockerfile Dockerfile.github; then
 		printf 'Docker builds must not run go mod tidy; CI tidy gates should catch dependency drift before image build\n' >&2
 		return 1
 	fi
-	if git grep -nF 'ghcr.io/${{ github.repository }}/vohive' -- "$publish" "$build"; then
-		printf 'container build configuration must not duplicate the vohive image path\n' >&2
-		return 1
-	fi
-	if ! git grep -nF 'CONTAINER_IMAGE: ghcr.io/${{ github.repository }}' -- "$publish" >/dev/null; then
-		printf 'docker publish workflow must publish to ghcr.io/${{ github.repository }}\n' >&2
-		return 1
-	fi
-	if ! git grep -nF 'tags: ghcr.io/${{ github.repository }}:dev' -- "$build" >/dev/null; then
-		printf 'manual docker build workflow must tag the current GHCR repository\n' >&2
-		return 1
-	fi
-	if [[ "$(git grep -nF 'registry: ghcr.io' -- "$publish" "$build" | wc -l | tr -d ' ')" -lt 2 ]]; then
+	if [[ "$(grep -hF 'registry: ghcr.io' "$publish" "$build" | wc -l | tr -d ' ')" -lt 2 ]]; then
 		printf 'docker workflows must authenticate against ghcr.io when pushing\n' >&2
 		return 1
 	fi
-	if ! git grep -nF 'name: Validate container release gates' -- "$publish" >/dev/null; then
-		printf 'docker publish workflow must validate repository gates before building images\n' >&2
+	for needle in \
+		'CONTAINER_IMAGE: ghcr.io/zanescope/vohive' \
+		'go run ./scripts/release-manifest alias-gate' \
+		'needs.validate.outputs.advance_alias' \
+		'platforms: linux/amd64,linux/arm64' \
+		'org.opencontainers.image.source' \
+		'org.opencontainers.image.revision' \
+		'org.opencontainers.image.version' \
+		'VOHIVE_MINISIGN_PUBLIC_KEYS' \
+		'release-manifest.json.minisig' \
+		'go run ./cmd/vohive-verify' \
+		'go run ./scripts/release-manifest verify' \
+		"jq -r '.immutable'" \
+		'grep -Fxq "${exact_tag}"' \
+		'environment: release' \
+		'needs: validate'; do
+		if ! grep -Fq -- "$needle" "$publish"; then
+			printf 'docker publish workflow is missing constraint: %s\n' "$needle" >&2
+			return 1
+		fi
+	done
+	for needle in '${CONTAINER_IMAGE}:latest' '${CONTAINER_IMAGE}:beta' '${CONTAINER_IMAGE}:edge-${revision:0:12}'; do
+		if ! grep -Fq -- "$needle" "$publish"; then
+			printf 'docker publish workflow is missing channel tag: %s\n' "$needle" >&2
+			return 1
+		fi
+	done
+	if grep -Fq ':latest' "$build"; then
+		printf 'manual container workflow must never publish latest\n' >&2
 		return 1
 	fi
-	if ! git grep -nF './scripts/ci.sh workflow-lint hygiene release-hygiene container-hygiene tidy test' -- "$publish" >/dev/null; then
-		printf 'docker publish validate job must run local release gates\n' >&2
+	for needle in 'CONTAINER_IMAGE: ghcr.io/zanescope/vohive' ':edge-${revision:0:12}' 'platforms: linux/amd64,linux/arm64'; do
+		if ! grep -Fq -- "$needle" "$build"; then
+			printf 'manual container workflow is missing constraint: %s\n' "$needle" >&2
+			return 1
+		fi
+	done
+	for needle in 'VOHIVE_IMAGE:?' 'ghcr.io/zanescope/vohive@sha256:<digest>' 'network_mode: host' '/healthz'; do
+		if ! grep -Fq -- "$needle" "$compose"; then
+			printf 'Compose file is missing constraint: %s\n' "$needle" >&2
+			return 1
+		fi
+	done
+	if grep -Eq '^[[:space:]]*ports:|HTTPS?_PROXY=http' "$compose"; then
+		printf 'host-network Compose must not publish ports or hard-code a proxy\n' >&2
 		return 1
 	fi
-	if ! git grep -nF 'needs: validate' -- "$publish" >/dev/null; then
-		printf 'docker publish build job must depend on validate\n' >&2
+	if ! grep -Fxq 'VOHIVE_IMAGE=' "$env_example"; then
+		printf '.env.example must leave VOHIVE_IMAGE empty so Compose emits the required-digest guidance\n' >&2
 		return 1
 	fi
-	if ! git grep -nF 'name: Validate manual container gates' -- "$build" >/dev/null; then
-		printf 'manual docker build workflow must validate repository gates before building images\n' >&2
-		return 1
-	fi
-	if ! git grep -nF './scripts/ci.sh workflow-lint hygiene release-hygiene container-hygiene tidy test' -- "$build" >/dev/null; then
-		printf 'manual docker build validate job must run local release gates\n' >&2
-		return 1
-	fi
-	if ! git grep -nF 'needs: validate' -- "$build" >/dev/null; then
-		printf 'manual docker build job must depend on validate\n' >&2
-		return 1
-	fi
-	if ! git grep -nF 'image: ${VOHIVE_IMAGE:-ghcr.io/zanescope/vohive:latest}' -- "$compose" >/dev/null; then
-		printf 'prebuilt compose file must default to the current GHCR image\n' >&2
+	if grep -Eq '^VOHIVE_IMAGE=.*(latest|REPLACE)' "$env_example"; then
+		printf '.env.example must not provide a mutable tag or fake digest placeholder\n' >&2
 		return 1
 	fi
 	printf '\n==> container hygiene ok\n'
@@ -226,7 +280,7 @@ tidy_check() {
 }
 
 go_tests() {
-	read -r -a packages <<< "${CI_GO_TEST_PACKAGES:-./internal/device ./internal/mbim ./internal/qmi ./internal/backend ./internal/esim ./internal/cscall ./internal/proxy/traffic ./internal/notify ./internal/qqbot/...}"
+	read -r -a packages <<< "${CI_GO_TEST_PACKAGES:-./internal/device ./internal/mbim ./internal/qmi ./internal/backend ./internal/esim ./internal/cscall ./internal/proxy/traffic ./internal/notify ./internal/qqbot/... ./internal/api ./internal/config ./internal/db ./internal/updater/... ./cmd/vohive-verify ./cmd/vohivectl ./scripts/release-manifest}"
 	if [[ ${#packages[@]} -eq 0 ]]; then
 		printf '\n==> no Go test packages configured\n'
 		return

@@ -1,84 +1,152 @@
 package api
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
 
-// resolveUninstallTargets 必须使用运行时实际加载的配置文件路径，
-// 而不是硬编码相对路径 "config"——后者在 OpenWrt 部署下（通过 -c 传入
-// /etc/vohive/config.yaml，与进程工作目录无关）永远指向一个不存在的目录，
-// 导致真实配置文件从未被清理。
-func TestResolveUninstallTargetsUsesActualConfigPath(t *testing.T) {
-	dataDir, configFile := resolveUninstallTargets("/etc/vohive/config.yaml")
+	"github.com/gin-gonic/gin"
+	"github.com/zanescope/vohive/internal/updater"
+)
 
-	if dataDir != "data" {
-		t.Fatalf("dataDir = %q, want %q", dataDir, "data")
+type fakeUpdateCoordinator struct {
+	capabilities updater.Capabilities
+	candidate    updater.Candidate
+	startState   updater.TransactionState
+	state        updater.TransactionState
+	startRequest updater.UpdateRequest
+	capErr       error
+	checkErr     error
+	startErr     error
+	stateErr     error
+}
+
+func (f *fakeUpdateCoordinator) Capabilities(context.Context) (updater.Capabilities, error) {
+	return f.capabilities, f.capErr
+}
+
+func (f *fakeUpdateCoordinator) Check(context.Context, updater.CheckRequest) (updater.Candidate, error) {
+	return f.candidate, f.checkErr
+}
+
+func (f *fakeUpdateCoordinator) Start(_ context.Context, request updater.UpdateRequest) (updater.TransactionState, error) {
+	f.startRequest = request
+	return f.startState, f.startErr
+}
+
+func (f *fakeUpdateCoordinator) State(context.Context, string) (updater.TransactionState, error) {
+	return f.state, f.stateErr
+}
+
+func updateHandlerRouter(coordinator updater.Coordinator) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	server := &Server{updates: coordinator}
+	router := gin.New()
+	router.GET("/capabilities", server.handleUpdateCapabilities)
+	router.GET("/check", server.handleUpdateCheck)
+	router.POST("/jobs", server.handleStartUpdateJob)
+	router.GET("/jobs/:job_id", server.handleUpdateJobState)
+	return router
+}
+
+func TestUpdateCheckReturnsCapabilitiesAndSignedCandidate(t *testing.T) {
+	fake := &fakeUpdateCoordinator{
+		capabilities: updater.Capabilities{InstallType: updater.InstallSystemd, CanCheck: true, CanUpdate: true},
+		candidate: updater.Candidate{
+			HasUpdate: true, CurrentVer: "v1.5.5", LatestVer: "v1.6.0", ReleaseNote: "notes",
+		},
 	}
-	if configFile != "/etc/vohive/config.yaml" {
-		t.Fatalf("configFile = %q, want %q", configFile, "/etc/vohive/config.yaml")
+	response := httptest.NewRecorder()
+	updateHandlerRouter(fake).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/check?channel=stable", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var body updateCheckResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Candidate == nil || body.Candidate.LatestVer != "v1.6.0" {
+		t.Fatalf("candidate = %#v, want v1.6.0", body.Candidate)
+	}
+	if !body.Capabilities.CanUpdate {
+		t.Fatal("expected native update capability")
 	}
 }
 
-func TestResolveUninstallTargetsSkipsConfigWhenPathUnknown(t *testing.T) {
-	// 配置管理器尚未初始化时 config.GetConfigPath() 返回空字符串，
-	// 此时绝不能删除任何路径（避免误删进程当前工作目录）。
-	_, configFile := resolveUninstallTargets("")
+func TestUpdateCheckExplainsUnsupportedDeploymentWithoutResolving(t *testing.T) {
+	fake := &fakeUpdateCoordinator{
+		capabilities: updater.Capabilities{
+			InstallType: updater.InstallPortable,
+			CanCheck:    false,
+			CanUpdate:   false,
+			Reason:      "external restart hook required",
+		},
+		checkErr: errors.New("check must not be called"),
+	}
+	response := httptest.NewRecorder()
+	updateHandlerRouter(fake).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/check", nil))
 
-	if configFile != "" {
-		t.Fatalf("configFile = %q, want empty when config path unknown", configFile)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	var body updateCheckResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Candidate != nil || body.Capabilities.Reason == "" {
+		t.Fatalf("unexpected response: %#v", body)
 	}
 }
 
-// detectServiceStopCommands 决定自毁前应主动通知哪个服务管理器停止+禁用自启，
-// 这样即使删除可执行文件失败（例如只读文件系统），supervisor 也不会把进程重新拉起来，
-// 而不是像原来那样仅依赖"删掉自己导致 exec 失败"这种脆弱的副作用。
-func TestDetectServiceStopCommandsPrefersOpenWrtInitScript(t *testing.T) {
-	statFile := func(path string) bool { return path == "/etc/init.d/vohive" }
-	lookPath := func(name string) (string, error) { return "/usr/bin/systemctl", nil }
-
-	cmds := detectServiceStopCommands(lookPath, statFile)
-
-	if len(cmds) != 2 {
-		t.Fatalf("len(cmds) = %d, want 2 (disable + stop), got %v", len(cmds), cmds)
+func TestStartUpdateJobUsesExactVersionWithoutChangingChannel(t *testing.T) {
+	fake := &fakeUpdateCoordinator{
+		startState: updater.TransactionState{Schema: 1, ID: "job-1", Phase: updater.PhaseChecking},
 	}
-	if cmds[0][0] != "/etc/init.d/vohive" || cmds[0][1] != "disable" {
-		t.Fatalf("cmds[0] = %v, want [/etc/init.d/vohive disable]", cmds[0])
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/jobs", bytes.NewBufferString(`{"channel":"stable","version":"v1.6.0"}`))
+	request.Header.Set("Content-Type", "application/json")
+	updateHandlerRouter(fake).ServeHTTP(response, request)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusAccepted, response.Body.String())
 	}
-	if cmds[1][0] != "/etc/init.d/vohive" || cmds[1][1] != "stop" {
-		t.Fatalf("cmds[1] = %v, want [/etc/init.d/vohive stop]", cmds[1])
+	if fake.startRequest.Channel != updater.ChannelStable || fake.startRequest.Version != "v1.6.0" {
+		t.Fatalf("request = %#v", fake.startRequest)
 	}
 }
 
-func TestDetectServiceStopCommandsFallsBackToSystemd(t *testing.T) {
-	statFile := func(path string) bool { return false }
-	lookPath := func(name string) (string, error) {
-		if name == "systemctl" {
-			return "/usr/bin/systemctl", nil
+func TestStartUpdateJobReportsConcurrentTransaction(t *testing.T) {
+	fake := &fakeUpdateCoordinator{startErr: updater.ErrUpdateLocked}
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/jobs", bytes.NewBufferString(`{"channel":"stable","version":"v1.6.0"}`))
+	request.Header.Set("Content-Type", "application/json")
+	updateHandlerRouter(fake).ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusConflict)
+	}
+}
+
+func TestUpdateJobStateNotFound(t *testing.T) {
+	fake := &fakeUpdateCoordinator{stateErr: updater.ErrJobNotFound}
+	response := httptest.NewRecorder()
+	updateHandlerRouter(fake).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/jobs/job-404", nil))
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
+func TestRouterDoesNotExposeRemoteUninstall(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, route := range (&Server{}).newRouter().Routes() {
+		if route.Path == "/api/system/uninstall" {
+			t.Fatalf("dangerous remote uninstall route is still registered: %#v", route)
 		}
-		return "", errNotFound
-	}
-
-	cmds := detectServiceStopCommands(lookPath, statFile)
-
-	if len(cmds) != 1 {
-		t.Fatalf("len(cmds) = %d, want 1, got %v", len(cmds), cmds)
-	}
-	want := []string{"systemctl", "disable", "--now", "vohive"}
-	if len(cmds[0]) != len(want) {
-		t.Fatalf("cmds[0] = %v, want %v", cmds[0], want)
-	}
-	for i := range want {
-		if cmds[0][i] != want[i] {
-			t.Fatalf("cmds[0] = %v, want %v", cmds[0], want)
-		}
-	}
-}
-
-func TestDetectServiceStopCommandsEmptyWhenNoSupervisorDetected(t *testing.T) {
-	statFile := func(path string) bool { return false }
-	lookPath := func(name string) (string, error) { return "", errNotFound }
-
-	cmds := detectServiceStopCommands(lookPath, statFile)
-
-	if len(cmds) != 0 {
-		t.Fatalf("cmds = %v, want empty when neither systemd nor openwrt detected", cmds)
 	}
 }

@@ -3,7 +3,6 @@ import { computed, defineAsyncComponent, ref, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAuthStore } from './stores/auth'
 import LoadingScreen from './components/LoadingScreen.vue'
-import { ElMessage } from 'element-plus'
 
 const route = useRoute()
 const auth = useAuthStore()
@@ -56,11 +55,10 @@ function acceptDisclaimer() {
 }
 
 function rejectDisclaimer() {
-  ElMessage.warning('正在退出并清理软件...')
-  fetch('/api/system/uninstall', { method: 'POST' })
-    .finally(() => {
-      document.body.innerHTML = '<div style="display:flex;height:100vh;background:#0a0a0a;align-items:center;justify-content:center;font-size:24px;color:#ef4444;font-weight:bold;font-family:sans-serif;flex-direction:column;gap:16px;"><div><svg style="width:64px;height:64px;" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg></div><div>软件已被卸载 / 服务已终止</div></div>'
-    })
+  showDisclaimer.value = false
+  confirmText.value = ''
+  auth.logout()
+  window.location.hash = '#/login'
 }
 
 const AuthenticatedShell = defineAsyncComponent(() => import('./layouts/AuthenticatedShell.vue'))
@@ -112,7 +110,7 @@ const shell = computed(() =>
               </div>
               <div class="flex items-start">
                 <div class="flex-shrink-0 flex items-center justify-center w-6 h-6 mt-0.5 mr-3 text-xs font-bold text-indigo-700 bg-indigo-100 rounded-full dark:text-indigo-300 dark:bg-indigo-900/60 shadow-sm">4</div>
-                <p>一旦点击继续即表示无条件接受本协议。如果您拒绝，本软件将立即触发自毁与环境清理机制以确保设备安全。</p>
+                <p>一旦点击继续即表示无条件接受本协议。如果您拒绝，将退出当前登录且不启用管理功能。</p>
               </div>
             </div>
             
@@ -134,7 +132,7 @@ const shell = computed(() =>
 
               <div class="flex gap-4">
                 <button @click="rejectDisclaimer" class="flex-1 px-4 py-3 text-sm font-bold tracking-wide text-gray-500 transition-all duration-300 bg-gray-50 border border-gray-200 rounded-xl hover:bg-red-50 hover:text-red-600 hover:border-red-200 dark:bg-gray-800 dark:text-gray-400 dark:border-gray-700 dark:hover:bg-red-900/20 dark:hover:text-red-400 dark:hover:border-red-900/50">
-                  拒绝并卸载
+                  拒绝并退出
                 </button>
                 <button 
                   @click="acceptDisclaimer" 

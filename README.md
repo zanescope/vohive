@@ -8,6 +8,19 @@
 
 VoHive 把模组热插拔管理、SOCKS5/HTTP 代理编排、短信收发、VoWiFi/IMS 通话、eSIM 全生命周期管理整合到一个服务里,并提供一套现代化的响应式 Web 管理后台。
 
+## 安装与部署
+
+从 `v1.6.0` 起，正式 GitHub Release 提供内置发布公钥的签名原生安装器：
+
+```sh
+curl -fsSLO https://github.com/zanescope/vohive/releases/latest/download/vohive-install.sh
+sudo sh vohive-install.sh
+```
+
+安装器支持 `amd64`、`arm64`、`armv7`，保留用户配置，并使用事务更新、健康检查和失败回滚。`v1.5.x` 及更早版本需要先运行 `v1.6.0+` Release 中的安装器迁移，不能继续使用旧的文件热替换更新。
+
+详细规则见[《小白友好安装与更新方案》](DEPLOYMENT.zh-CN.md)。Docker 用户请按 [CONTAINER.md](CONTAINER.md) 使用 GHCR 镜像 digest；容器内自更新会 fail closed。
+
 ## 核心特性
 
 | 模块 | 说明 |

@@ -109,7 +109,6 @@ type SMSContact struct {
 
 // Init 初始化数据库连接
 func Init(dbPath string) error {
-	var err error
 	dsn := strings.TrimSpace(dbPath)
 	if dsn == "" {
 		dsn = dbPath
@@ -123,15 +122,14 @@ func Init(dbPath string) error {
 	if err != nil {
 		return err
 	}
-
-	DB, err = gorm.Open(dialector, &gorm.Config{
+	opened, err := gorm.Open(dialector, &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
 		return err
 	}
 
-	sqlDB, err := DB.DB()
+	sqlDB, err := opened.DB()
 	if err != nil || sqlDB == nil {
 		return fmt.Errorf("open db: %w", err)
 	}
@@ -139,41 +137,19 @@ func Init(dbPath string) error {
 	sqlDB.SetMaxIdleConns(1)
 	sqlDB.SetConnMaxLifetime(0)
 
-	if err := applySQLitePragmas(DB); err != nil {
+	if err := applySQLitePragmas(opened); err != nil {
+		_ = sqlDB.Close()
 		return err
 	}
-
-	// 自动迁移
-	if err := DB.AutoMigrate(
-		&Device{},
-		&CardPolicy{},
-		&SIMCard{},
-		&SIMSubscription{},
-		&PendingPhoneNumber{},
-		&ProxyInstance{},
-		&UpstreamProxy{},
-		&UpstreamProxyCountryRule{},
-		&SMS{},
-		&SMSContact{},
-		&SMSDelivery{},
-		&SMSDeliveryPart{},
-		&TrafficMinute{},
-		&TrafficHour{},
-		&TrafficDay{},
-		&TrafficWeek{},
-		&TrafficMonth{},
-	); err != nil {
+	if _, err := MigrateDatabase(opened); err != nil {
+		_ = sqlDB.Close()
 		return err
 	}
-	if err := migrateSIMCardsToSubscriptions(DB); err != nil {
+	if err := ReconcileCurrentDatabase(opened); err != nil {
+		_ = sqlDB.Close()
 		return err
 	}
-	if err := migrateSIMCardIdentityColumnsOnly(DB); err != nil {
-		return err
-	}
-	if err := RunICCIDReKeyMigration(DB); err != nil {
-		return err
-	}
+	DB = opened
 	return nil
 }
 

@@ -248,68 +248,345 @@ watch(() => emailForm.value.smtp_port, (newPort) => {
 
 
 
-import { systemService, type UpdateInfo } from '../services/system'
+import {
+  systemService,
+  type UpdateCapabilities,
+  type UpdateCandidate,
+  type UpdatePhase,
+  type UpdateTransaction
+} from '../services/system'
 
+const UPDATE_JOB_STORAGE_KEY = 'vohive_update_job_id'
 const checkingUpdate = ref(false)
 const applyingUpdate = ref(false)
-const updateInfo = ref<UpdateInfo | null>(null)
+const updateChannel = ref<'stable' | 'beta'>('stable')
+const updateChannelExplicit = ref(false)
+const updateCapabilities = ref<UpdateCapabilities | null>(null)
+const updateCandidate = ref<UpdateCandidate | null>(null)
+const updateJob = ref<UpdateTransaction | null>(null)
+const updateWaitingForRestart = ref(false)
+const updateNeedsDiagnosis = ref(false)
+const updateDiagnosticMessage = ref('')
+let updateDisposed = false
+let updateProbeController: AbortController | undefined
+let updatePollTimer: number | undefined
+let updateReloadTimer: number | undefined
+let updateOfflineSince = 0
+
+const updatePhaseLabels: Record<UpdatePhase, string> = {
+  checking: '确认目标版本',
+  downloading: '下载签名安装包',
+  verifying: '校验签名与 SHA-256',
+  waiting_for_quiesce: '等待安全切换时机',
+  backing_up: '备份配置和数据',
+  stopping: '停止当前服务',
+  switching: '原子切换版本',
+  starting: '启动新版本',
+  verifying_service: '验证新版本健康状态',
+  completed: '更新完成',
+  rolling_back: '新版本异常，正在自动回滚',
+  rolled_back: '已自动恢复旧版本',
+  failed: '更新失败',
+  manual_recovery_required: '需要主机端手工恢复'
+}
+
+const knownUpdatePhases = new Set<string>(Object.keys(updatePhaseLabels))
+
+const updatePhaseProgress: Record<UpdatePhase, number> = {
+  checking: 5,
+  downloading: 20,
+  verifying: 35,
+  waiting_for_quiesce: 45,
+  backing_up: 55,
+  stopping: 65,
+  switching: 75,
+  starting: 82,
+  verifying_service: 92,
+  completed: 100,
+  rolling_back: 80,
+  rolled_back: 100,
+  failed: 100,
+  manual_recovery_required: 100
+}
+
+const updateStatusText = computed(() => {
+  if (updateNeedsDiagnosis.value) return updateDiagnosticMessage.value
+  if (updateWaitingForRestart.value) return '服务正在重启，连接恢复后会继续显示结果'
+  if (!updateJob.value) return ''
+  return updatePhaseLabels[updateJob.value.phase] || updateJob.value.phase
+})
+
+const updateProgress = computed(() => {
+  if (!updateJob.value) return 0
+  return updatePhaseProgress[updateJob.value.phase] ?? 0
+})
+
+function updateErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) return error.message || fallback
+  if (error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message || fallback
+  }
+  return fallback
+}
+
+function clearUpdateTimers() {
+  if (updatePollTimer !== undefined) {
+    window.clearTimeout(updatePollTimer)
+    updatePollTimer = undefined
+  }
+  if (updateReloadTimer !== undefined) {
+    window.clearTimeout(updateReloadTimer)
+    updateReloadTimer = undefined
+  }
+  updateProbeController?.abort()
+  updateProbeController = undefined
+}
+
+function scheduleUpdatePoll(delay = 2000) {
+  if (updateDisposed || updateNeedsDiagnosis.value) return
+  if (updatePollTimer !== undefined) window.clearTimeout(updatePollTimer)
+  updatePollTimer = window.setTimeout(() => {
+    updatePollTimer = undefined
+    if (!updateDisposed) void pollUpdateJob()
+  }, delay)
+}
+
+async function probePublicReadiness(): Promise<boolean> {
+  updateProbeController?.abort()
+  const controller = new AbortController()
+  updateProbeController = controller
+  const timeout = window.setTimeout(() => controller.abort(), 3000)
+  try {
+    const response = await fetch('/readyz', { cache: 'no-store', signal: controller.signal })
+    return !updateDisposed && response.ok
+  } catch {
+    return false
+  } finally {
+    window.clearTimeout(timeout)
+    if (updateProbeController === controller) updateProbeController = undefined
+  }
+}
+
+function finishUpdatePolling() {
+  applyingUpdate.value = false
+  updateWaitingForRestart.value = false
+  updateNeedsDiagnosis.value = false
+  updateDiagnosticMessage.value = ''
+  updateOfflineSince = 0
+  sessionStorage.removeItem(UPDATE_JOB_STORAGE_KEY)
+  if (updatePollTimer !== undefined) {
+    window.clearTimeout(updatePollTimer)
+    updatePollTimer = undefined
+  }
+}
+
+function markUpdateNeedsDiagnosis(message: string) {
+  applyingUpdate.value = false
+  updateWaitingForRestart.value = false
+  updateNeedsDiagnosis.value = true
+  updateDiagnosticMessage.value = message
+  if (updatePollTimer !== undefined) {
+    window.clearTimeout(updatePollTimer)
+    updatePollTimer = undefined
+  }
+}
+
+function validateUpdateState(state: UpdateTransaction): string {
+  if (state.schema !== 1) return '更新任务使用了未知状态格式'
+  if (!knownUpdatePhases.has(String(state.phase))) return '更新任务返回了未知阶段'
+  const startedAt = Date.parse(state.started_at)
+  const updatedAt = Date.parse(state.updated_at)
+  if (!Number.isFinite(startedAt) || !Number.isFinite(updatedAt)) return '更新任务时间信息无效'
+
+  const now = Date.now()
+  if (now - startedAt > 45 * 60 * 1000) return '更新任务已超过 45 分钟'
+  const longPhase = state.phase === 'downloading' || state.phase === 'waiting_for_quiesce'
+  const staleLimit = longPhase ? 35 * 60 * 1000 : 8 * 60 * 1000
+  if (now - updatedAt > staleLimit) return '更新任务状态长时间没有推进'
+  return ''
+}
+
+function handleTerminalUpdate(state: UpdateTransaction): boolean {
+  if (state.phase === 'completed') {
+    finishUpdatePolling()
+    if (!updateDisposed) {
+      ElMessage.success('更新已完成，新版本运行正常')
+      updateReloadTimer = window.setTimeout(() => {
+        if (!updateDisposed) window.location.reload()
+      }, 1200)
+    }
+    return true
+  }
+  if (state.phase === 'rolled_back') {
+    finishUpdatePolling()
+    if (!updateDisposed) {
+      ElMessage.warning('新版本未通过健康检查，系统已自动恢复旧版本' + (state.error ? '：' + state.error : ''))
+    }
+    return true
+  }
+  if (state.phase === 'failed') {
+    finishUpdatePolling()
+    if (!updateDisposed) ElMessage.error(state.error || '更新失败，当前版本保持不变')
+    return true
+  }
+  if (state.phase === 'manual_recovery_required') {
+    finishUpdatePolling()
+    if (!updateDisposed) {
+      ElMessage.error('自动恢复未完成，请在主机执行 vohivectl doctor，并按部署文档恢复')
+    }
+    return true
+  }
+  return false
+}
+
+async function pollUpdateJob() {
+  if (updateDisposed) return
+  const jobID = sessionStorage.getItem(UPDATE_JOB_STORAGE_KEY) || updateJob.value?.id || ''
+  if (!jobID) {
+    applyingUpdate.value = false
+    return
+  }
+
+  const result = await systemService.getUpdateJob(jobID)
+  if (updateDisposed) return
+  if (result.ok) {
+    updateOfflineSince = 0
+    updateWaitingForRestart.value = false
+    updateJob.value = result.data
+    const stateError = validateUpdateState(result.data)
+    if (stateError) {
+      markUpdateNeedsDiagnosis(stateError + '，请在主机执行 vohivectl status 或 doctor')
+      return
+    }
+    if (!handleTerminalUpdate(result.data)) scheduleUpdatePoll()
+    return
+  }
+  if (result.error.status === 404) {
+    markUpdateNeedsDiagnosis('更新任务状态不存在，请在主机执行 vohivectl status 检查')
+    return
+  }
+
+  const ready = await probePublicReadiness()
+  if (updateDisposed) return
+  updateWaitingForRestart.value = !ready
+  if (updateOfflineSince === 0) updateOfflineSince = Date.now()
+  if (Date.now() - updateOfflineSince > 5 * 60 * 1000) {
+    markUpdateNeedsDiagnosis('服务长时间未恢复，请在主机执行 vohivectl doctor 或 vohivectl recover')
+    return
+  }
+  scheduleUpdatePoll(ready ? 1000 : 2500)
+}
+
+function retryUpdateStatus() {
+  updateNeedsDiagnosis.value = false
+  updateDiagnosticMessage.value = ''
+  applyingUpdate.value = true
+  updateOfflineSince = 0
+  scheduleUpdatePoll(0)
+}
+function onUpdateChannelChange() {
+  updateChannelExplicit.value = true
+  updateCandidate.value = null
+}
 
 async function doCheckUpdate() {
+  if (updateNeedsDiagnosis.value) {
+    ElMessage.warning('上一个更新任务状态尚未确认，请先重新查询或在主机诊断')
+    return
+  }
+  updateCandidate.value = null
   checkingUpdate.value = true
   try {
-    const res = await systemService.checkUpdate()
-    if (!res.ok) throw new Error(res.error.message || '检查更新失败')
-    updateInfo.value = res.data
-    if (!res.data.has_update) {
-      ElMessage.success('当前已是最新版本')
+    const result = await systemService.checkUpdate(updateChannelExplicit.value ? updateChannel.value : undefined)
+    if (updateDisposed) return
+    if (!result.ok) throw result.error
+    updateCapabilities.value = result.data.capabilities
+    updateCandidate.value = result.data.candidate || null
+    if (!updateChannelExplicit.value && (result.data.capabilities.channel === 'stable' || result.data.capabilities.channel === 'beta')) {
+      updateChannel.value = result.data.capabilities.channel
     }
-  } catch (e: any) {
-    ElMessage.error(e.message || '检查更新失败')
+    if (!result.data.capabilities.can_check) {
+      ElMessage.warning(result.data.capabilities.reason || '当前部署不能在线检查更新')
+    } else if (!result.data.candidate?.has_update) {
+      ElMessage.success('当前通道已是最新版本')
+    } else if (!result.data.capabilities.can_update) {
+      ElMessage.warning(result.data.capabilities.reason || '当前部署需要在主机侧更新')
+    }
+  } catch (error: unknown) {
+    updateCandidate.value = null
+    if (!updateDisposed) ElMessage.error(updateErrorMessage(error, '检查更新失败'))
   } finally {
     checkingUpdate.value = false
   }
 }
 
 async function doApplyUpdate() {
-  if (!updateInfo.value) return
+  const candidate = updateCandidate.value
+  const capabilities = updateCapabilities.value
+  if (!candidate?.has_update || !capabilities || updateNeedsDiagnosis.value) return
 
-  if (updateInfo.value.is_docker) {
-    ElMessageBox.alert(
-      '检测到当前系统运行在 Docker 环境下。<br><br>不建议在 Docker 容器内直接执行文件热替换。请直接通过拉取最新镜像（如 <code>docker pull ghcr.io/zanescope/vohive:latest</code>）并重启容器来完成升级！',
-      '环境警告',
-      { dangerouslyUseHTMLString: true, type: 'warning' }
+  if (!capabilities.can_update) {
+    await ElMessageBox.alert(
+      capabilities.reason || '当前部署不支持网页内更新。Docker 请在宿主机拉取签名镜像并按 digest 重建容器。',
+      '需要主机侧更新',
+      { type: 'warning' }
     )
     return
   }
 
+  const releaseNote = (candidate.release_note || '暂无更新说明').slice(0, 3000)
   try {
     await ElMessageBox.confirm(
-      `最新版本：${updateInfo.value.latest_version}，确定要现在更新并重启服务吗？<br><br><pre style="white-space: pre-wrap; font-size: 12px; max-height: 200px; overflow-y: auto; background: var(--el-fill-color-light); padding: 8px; border-radius: 4px; margin-top: 8px;">${updateInfo.value.release_note}</pre>`,
-      '应用更新',
-      { dangerouslyUseHTMLString: true, confirmButtonText: '立即更新', cancelButtonText: '取消', type: 'warning' }
+      [
+        '目标版本：' + candidate.latest_version,
+        '通道：' + candidate.manifest.channel,
+        '',
+        releaseNote,
+        '',
+        '更新会短暂停止服务；失败时将自动恢复二进制、配置和数据。'
+      ].join('\n'),
+      '开始安全更新',
+      { confirmButtonText: '下载并更新', cancelButtonText: '取消', type: 'warning' }
     )
+    if (updateDisposed) return
     applyingUpdate.value = true
-    const res = await systemService.applyUpdate()
-    if (!res.ok) throw new Error(res.error.message || '请求应用更新失败')
-    ElMessage.success(res.data?.message || '正在更新...')
-    setTimeout(() => {
-      window.location.reload()
-    }, 5000)
-  } catch (e: any) {
-    if (e !== 'cancel') {
-      ElMessage.error(e.message || '应用更新失败')
-    }
-  } finally {
+    const result = await systemService.startUpdate({
+      channel: candidate.manifest.channel,
+      version: candidate.latest_version
+    })
+    if (updateDisposed) return
+    if (!result.ok) throw result.error
+    updateJob.value = result.data
+    sessionStorage.setItem(UPDATE_JOB_STORAGE_KEY, result.data.id)
+    ElMessage.info('更新任务已启动，请勿关闭设备电源')
+    scheduleUpdatePoll(500)
+  } catch (error: unknown) {
+    if (error === 'cancel' || error === 'close') return
     applyingUpdate.value = false
+    if (!updateDisposed) ElMessage.error(updateErrorMessage(error, '启动更新失败'))
   }
 }
 
+function resumeUpdatePolling() {
+  const jobID = sessionStorage.getItem(UPDATE_JOB_STORAGE_KEY) || ''
+  if (!/^[A-Za-z0-9._-]{1,128}$/.test(jobID)) {
+    sessionStorage.removeItem(UPDATE_JOB_STORAGE_KEY)
+    return
+  }
+  updateNeedsDiagnosis.value = false
+  applyingUpdate.value = true
+  scheduleUpdatePoll(0)
+}
 onMounted(() => {
+  updateDisposed = false
   loadNotifications()
   loadSystemInfo()
+  resumeUpdatePolling()
 })
 
 onBeforeUnmount(() => {
+  updateDisposed = true
+  clearUpdateTimers()
 })
 </script>
 
@@ -372,25 +649,88 @@ onBeforeUnmount(() => {
          <div class="space-y-4 text-sm relative z-10">
             <div class="p-3 bg-gray-50 dark:bg-white/5 rounded-lg">
               <FieldRow label="版本" :value="systemInfo.version" monospace>
-                <div class="flex items-center justify-end gap-3">
-                  <el-button size="small" type="primary" class="!border-0" :loading="checkingUpdate" @click.stop="doCheckUpdate">
+                <div class="flex flex-wrap items-center justify-end gap-2">
+                  <el-select
+                    v-model="updateChannel"
+                    size="small"
+                    class="!w-24"
+                    :disabled="checkingUpdate || applyingUpdate || updateNeedsDiagnosis"
+                    @change="onUpdateChannelChange"
+                  >
+                    <el-option label="稳定版" value="stable" />
+                    <el-option label="测试版" value="beta" />
+                  </el-select>
+                  <el-button
+                    size="small"
+                    type="primary"
+                    class="!border-0"
+                    :loading="checkingUpdate"
+                    :disabled="applyingUpdate || updateNeedsDiagnosis"
+                    @click.stop="doCheckUpdate"
+                  >
                     检查更新
                   </el-button>
                   <span>{{ systemInfo.version || 'Unknown' }}</span>
                 </div>
               </FieldRow>
             </div>
-            
-            <div v-if="updateInfo?.has_update" class="p-4 bg-amber-50 dark:bg-amber-500/10 rounded-lg border border-amber-200 dark:border-amber-500/20">
-               <div class="flex items-center gap-2 text-amber-800 dark:text-amber-200 mb-2 font-bold text-[13px]">
-                 <el-icon><Alert24Regular /></el-icon>发现新版本: {{ updateInfo.latest_version }}
-               </div>
-               <div class="text-xs text-amber-700 dark:text-amber-300/80 mb-4 whitespace-pre-wrap max-h-32 overflow-y-auto pr-2 custom-scrollbar">
-                 {{ updateInfo.release_note || '暂无更新说明' }}
-               </div>
-               <el-button type="warning" :loading="applyingUpdate" @click="doApplyUpdate" class="w-full !border-0">
-                 立即更新并重启
-               </el-button>
+
+            <div
+              v-if="updateCandidate?.has_update"
+              class="p-4 bg-amber-50 dark:bg-amber-500/10 rounded-lg border border-amber-200 dark:border-amber-500/20"
+            >
+              <div class="flex items-center gap-2 text-amber-800 dark:text-amber-200 mb-2 font-bold text-[13px]">
+                <el-icon><Alert24Regular /></el-icon>
+                发现新版本：{{ updateCandidate.latest_version }}
+                <span class="font-normal">（{{ updateCandidate.manifest.channel }}）</span>
+              </div>
+              <div class="text-xs text-amber-700 dark:text-amber-300/80 mb-4 whitespace-pre-wrap max-h-32 overflow-y-auto pr-2 custom-scrollbar">
+                {{ updateCandidate.release_note || '暂无更新说明' }}
+              </div>
+              <div
+                v-if="updateCapabilities && !updateCapabilities.can_update"
+                class="mb-3 text-xs text-amber-800 dark:text-amber-200"
+              >
+                {{ updateCapabilities.reason || '当前部署需要在主机侧更新' }}
+              </div>
+              <el-button
+                type="warning"
+                :loading="applyingUpdate"
+                :disabled="checkingUpdate || updateNeedsDiagnosis"
+                class="w-full !border-0"
+                @click="doApplyUpdate"
+              >
+                {{ updateCapabilities?.can_update ? '下载、校验并更新' : '查看主机更新方式' }}
+              </el-button>
+            </div>
+
+            <div
+              v-if="updateJob || applyingUpdate || updateNeedsDiagnosis"
+              class="p-4 bg-blue-50 dark:bg-blue-500/10 rounded-lg border border-blue-200 dark:border-blue-500/20"
+            >
+              <div class="flex items-center justify-between gap-3 mb-2">
+                <span class="text-xs font-bold text-blue-800 dark:text-blue-200">
+                  {{ updateStatusText || '正在读取更新任务状态' }}
+                </span>
+                <span v-if="updateJob?.target_version" class="text-xs font-mono text-blue-700 dark:text-blue-300">
+                  {{ updateJob.target_version }}
+                </span>
+              </div>
+              <el-progress
+                :percentage="updateProgress"
+                :status="updateNeedsDiagnosis || updateJob?.phase === 'failed' || updateJob?.phase === 'manual_recovery_required' ? 'exception' : undefined"
+              />
+              <div v-if="updateJob?.error" class="mt-2 text-xs text-blue-700 dark:text-blue-300 whitespace-pre-wrap">
+                {{ updateJob.error }}
+              </div>
+              <el-button
+                v-if="updateNeedsDiagnosis"
+                size="small"
+                class="mt-3"
+                @click="retryUpdateStatus"
+              >
+                重新查询任务状态
+              </el-button>
             </div>
             <div class="p-3 bg-gray-50 dark:bg-white/5 rounded-lg">
               <FieldRow label="构建时间" :value="systemInfo.build_time" monospace />

@@ -91,6 +91,19 @@ func main() {
 		log.Fatalf("初始化配置管理器失败: %v", err)
 	}
 	cfg := config.GetConfig()
+	if initial := config.ConsumeInitialAdminCredentials(); initial != nil {
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "============================================================")
+		fmt.Fprintln(os.Stderr, "VoHive created a new configuration.")
+		fmt.Fprintf(os.Stderr, "Initial administrator: %s\n", initial.Username)
+		fmt.Fprintf(os.Stderr, "Initial password:      %s\n", initial.Password)
+		fmt.Fprintln(os.Stderr, "Sign in and change this password immediately.")
+		fmt.Fprintln(os.Stderr, "This one-time banner is not written to the application log.")
+		fmt.Fprintln(os.Stderr, "============================================================")
+		fmt.Fprintln(os.Stderr, "")
+		initial.Username = ""
+		initial.Password = ""
+	}
 
 	// 2. 初始化日志
 	logger.Setup(logger.LogConfig{

@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+
+START=97
+STOP=12
+
+UPDATER=/opt/vohive/control/vohivectl
+
+start_service() {
+	[ -x "$UPDATER" ] || return 0
+	"$UPDATER" recover --boot
+}

@@ -26,13 +26,14 @@ import (
 	"github.com/zanescope/vohive/internal/notify"
 	"github.com/zanescope/vohive/internal/proxy/server"
 	proxytraffic "github.com/zanescope/vohive/internal/proxy/traffic"
+	"github.com/zanescope/vohive/internal/updater"
 	vwebsheet "github.com/zanescope/vohive/internal/websheet"
 	"github.com/zanescope/vohive/pkg/smscodec"
 	"github.com/zanescope/vowifi-go/runtimehost/messaging"
 	"github.com/zanescope/vowifi-go/runtimehost/voicehost"
 
-	"github.com/zanescope/vohive/pkg/logger"
 	"github.com/spf13/viper"
+	"github.com/zanescope/vohive/pkg/logger"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -79,6 +80,7 @@ type Server struct {
 	voiceGW     *voicehost.Gateway
 	notifyMgr   *notify.Manager
 	websheets   *vwebsheet.Broker
+	updates     updater.Coordinator
 
 	httpSrvMu sync.Mutex
 	httpSrv   *http.Server
@@ -91,6 +93,20 @@ type Server struct {
 
 type realtimeTrafficSubscriber interface {
 	Subscribe(ctx context.Context, deviceID string) (<-chan proxytraffic.RealtimeSnapshot, func())
+}
+
+// handleLiveness reports whether the HTTP process can serve requests. It must
+// stay independent from modem state so an offline device does not restart the
+// application or roll back an otherwise healthy update.
+func (s *Server) handleLiveness(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// handleReadiness is mounted only after configuration, storage and the API
+// server have been initialized. Reaching this handler therefore confirms that
+// a newly started release is ready to accept traffic.
+func (s *Server) handleReadiness(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
 
 // New 创建一个新的 API 服务器实例
@@ -114,6 +130,7 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 		notifyMgr:     notifyMgr,
 		proxyRepo:     repo.NewDBRepo(),
 		websheets:     vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
+		updates:       newDefaultUpdateCoordinator(),
 		loginAttempts: make(map[string]loginAttempt),
 		shutdownCh:    make(chan struct{}),
 	}
@@ -183,6 +200,8 @@ func (s *Server) newRouter() *gin.Engine {
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "pong"})
 	})
+	r.GET("/healthz", s.handleLiveness)
+	r.GET("/readyz", s.handleReadiness)
 
 	if s.cfg.Debug {
 		r.GET("/debug/embed", s.authMiddleware(), func(c *gin.Context) {
@@ -226,7 +245,6 @@ func (s *Server) newRouter() *gin.Engine {
 	api.POST("/auth/login", s.handleLogin)
 	api.POST("/rotateip", s.handleRotate)
 	api.OPTIONS("/logs/stream", s.handleLogStreamOptions)
-	api.POST("/system/uninstall", s.handleUninstall)
 	s.registerWebsheetRoutes(api)
 
 	// 以下接口需要鉴权
@@ -257,8 +275,10 @@ func (s *Server) newRouter() *gin.Engine {
 		api.POST("/settings/notifications/email/test", s.handleTestEmailNotification)
 		api.POST("/settings/password", s.handleChangePassword) // 修改登录密码
 		api.GET("/system/info", s.handleSystemInfo)            // 获取系统运行与版本信息
-		api.GET("/system/update/check", s.handleCheckUpdate)   // 检查系统更新
-		api.POST("/system/update/apply", s.handleApplyUpdate)  // 应用系统更新
+		api.GET("/system/update/capabilities", s.handleUpdateCapabilities)
+		api.GET("/system/update/check", s.handleUpdateCheck)
+		api.POST("/system/update/jobs", s.handleStartUpdateJob)
+		api.GET("/system/update/jobs/:job_id", s.handleUpdateJobState)
 
 		api.GET("/devices", s.handleDeviceMgmtList)                                            // 获取设备列表（管理页用）
 		api.POST("/devices", s.handleDeviceMgmtAddDevice)                                      // 添加新设备

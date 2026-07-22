@@ -1,0 +1,22 @@
+[Unit]
+Description=Recover an interrupted VoHive update
+Documentation=https://github.com/zanescope/vohive
+DefaultDependencies=no
+After=local-fs.target
+Before=vohive.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/var/lib/vohive
+ExecStart=/opt/vohive/control/vohivectl recover --boot
+TimeoutStartSec=5min
+UMask=0077
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/vohive /etc/vohive /var/lib/vohive
+
+[Install]
+WantedBy=multi-user.target
