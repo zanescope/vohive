@@ -16,7 +16,7 @@ services:
       - "${VOHIVE_LOG_DIR:-./logs}:/app/logs"
       - /dev:/dev
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:7575/healthz"]
+      test: ["CMD", "/usr/local/bin/vohivectl", "probe", "--liveness", "--config", "/app/config/config.yaml"]
       interval: 30s
       timeout: 5s
       start_period: 20s

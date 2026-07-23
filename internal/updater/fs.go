@@ -53,6 +53,9 @@ func (p RuntimePaths) ControlDir() string   { return filepath.Join(p.InstallRoot
 func (p RuntimePaths) StateFile() string    { return filepath.Join(p.StateRoot, "state.json") }
 func (p RuntimePaths) RequestFile() string  { return filepath.Join(p.StateRoot, "request.json") }
 func (p RuntimePaths) LockFile() string     { return filepath.Join(p.StateRoot, "update.lock") }
+func (p RuntimePaths) ReadinessKeyFile() string {
+	return filepath.Join(p.StateRoot, "readiness.key")
+}
 func (p RuntimePaths) DownloadsDir() string { return filepath.Join(p.StateRoot, "downloads") }
 func (p RuntimePaths) BackupsDir() string   { return filepath.Join(filepath.Dir(p.StateRoot), "backups") }
 

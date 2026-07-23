@@ -106,7 +106,28 @@ func (s *Server) handleLiveness(c *gin.Context) {
 // server have been initialized. Reaching this handler therefore confirms that
 // a newly started release is ready to accept traffic.
 func (s *Server) handleReadiness(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ready"})
+	response := updater.ReadinessResponse{
+		Status:  "ready",
+		Version: global.Version,
+	}
+	challenge := strings.TrimSpace(c.GetHeader(updater.ReadinessChallengeHeader))
+	if challenge == "" {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
+	version, proof, err := updater.SignReadinessChallenge(
+		updater.ReadinessKeyPath(),
+		global.Version,
+		challenge,
+	)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
+		return
+	}
+	response.Version = version
+	response.Proof = proof
+	c.JSON(http.StatusOK, response)
 }
 
 // New 创建一个新的 API 服务器实例

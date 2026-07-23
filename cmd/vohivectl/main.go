@@ -45,6 +45,8 @@ func main() {
 		err = recover(ctx, *deploymentFile, args[1:])
 	case "guard-start":
 		err = guardStart(*deploymentFile, args[1:])
+	case "probe":
+		err = probe(ctx, *deploymentFile, args[1:])
 	default:
 		usage()
 		err = fmt.Errorf("unknown command %q", args[0])
@@ -56,7 +58,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: vohivectl [--deployment PATH] <status|check|update|rollback|backup|doctor|recover|guard-start> [options]")
+	fmt.Fprintln(os.Stderr, "usage: vohivectl [--deployment PATH] <status|check|update|rollback|backup|doctor|recover|guard-start|probe> [options]")
 }
 
 func status(deploymentFile string) error {
@@ -229,6 +231,72 @@ func guardStart(deploymentFile string, args []string) error {
 		return errors.New("guard-start takes no arguments")
 	}
 	return updater.GuardStart(deploymentFile)
+}
+
+func probe(ctx context.Context, deploymentFile string, args []string) error {
+	flags := flag.NewFlagSet("probe", flag.ContinueOnError)
+	configPath := flags.String("config", "", "config path (required for standalone liveness probes)")
+	expectedVersion := flags.String("expected-version", "", "exact managed release version")
+	liveness := flags.Bool("liveness", false, "probe process liveness without update identity")
+	printURL := flags.Bool("print-url", false, "print the resolved URL after a successful probe")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("probe takes no positional arguments")
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	if *liveness {
+		path := *configPath
+		if path == "" {
+			deployment, err := updater.DiscoverDeployment(deploymentFile)
+			if err != nil {
+				return err
+			}
+			path = deployment.ConfigPath
+		}
+		endpoint, err := updater.ResolveProbeURL(path, "/healthz")
+		if err != nil {
+			return err
+		}
+		if err := updater.ProbeHTTP(ctx, client, endpoint); err != nil {
+			return err
+		}
+		if *printURL {
+			fmt.Fprintln(os.Stdout, endpoint)
+		}
+		return nil
+	}
+
+	deployment, err := updater.DiscoverDeployment(deploymentFile)
+	if err != nil {
+		return err
+	}
+	paths := updater.PathsFor(deploymentFile, deployment)
+	if err := updater.ValidateProductionScope(paths); err != nil {
+		return err
+	}
+	endpoint, err := updater.ResolveReadyURL(deployment)
+	if err != nil {
+		return err
+	}
+	version := *expectedVersion
+	if version == "" {
+		version = deployment.CurrentVersion
+	}
+	expectation := updater.ReadyExpectation{
+		Endpoint:        endpoint,
+		ExpectedVersion: version,
+		KeyFile:         paths.ReadinessKeyFile(),
+	}
+	if err := (updater.HTTPReadyChecker{Client: client}).Ready(ctx, expectation); err != nil {
+		return err
+	}
+	if *printURL {
+		fmt.Fprintln(os.Stdout, endpoint)
+	}
+	return nil
 }
 
 func resolverFor(deploymentFile string) (updater.Deployment, updater.ReleaseResolver, error) {
