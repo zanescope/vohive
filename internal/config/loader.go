@@ -35,6 +35,15 @@ func loadCurrent(path string) (*Config, error) {
 	if cfg.ConfigSchema != CurrentConfigSchema {
 		return nil, fmt.Errorf("%w: file=%d binary=%d", ErrConfigSchemaUnsupported, cfg.ConfigSchema, CurrentConfigSchema)
 	}
+	if cfg.FreeDeviceLimit < 0 {
+		return nil, fmt.Errorf("free_device_limit cannot be negative (0 means unlimited)")
+	}
+	publicIPProbe, err := loadPublicIPProbeFromYAML(path)
+	if err != nil {
+		return nil, fmt.Errorf("public_ip_probe: %w", err)
+	}
+	cfg.PublicIPProbe = publicIPProbe
+
 	if strings.TrimSpace(cfg.Web.Username) == "" || strings.TrimSpace(cfg.Web.Password) == "" {
 		return nil, fmt.Errorf("schema %d requires initialized web credentials", CurrentConfigSchema)
 	}

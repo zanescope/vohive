@@ -69,7 +69,7 @@ type liveSIMMetadataReader interface {
 	GetSIMMetadataLive(ctx context.Context) (*backend.SIMMetadata, error)
 }
 
-const publicIPLookupWait = 6 * time.Second
+var publicIPLookupWait = 6 * time.Second
 
 const (
 	defaultESIMPostSwitchMinDelay = time.Second
@@ -119,16 +119,11 @@ type Worker struct {
 	cacheTime           time.Time
 	cacheMu             sync.RWMutex
 	state               deviceStateStore
+	publicIP            publicIPRuntime
+	transientATOnce     sync.Once
+	transientATGate     chan struct{}
 	rotateMu            sync.Mutex // 防止并发换 IP
 	consecutiveFailures int        // 连续切换失败次数
-
-	publicIPRetryMu    sync.Mutex
-	publicIPRetryCount int
-	publicIPRetryTimer *time.Timer
-
-	ipRefreshMu       sync.Mutex
-	ipRefreshInFlight bool
-	ipRefreshLast     time.Time
 
 	qmiRegistrationMu       sync.Mutex
 	qmiRegistrationInFlight bool
@@ -301,6 +296,25 @@ func (p *Pool) registerWorkerStarting(worker *Worker) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if current := p.workers[worker.ID]; current != nil && current != worker {
+		return fmt.Errorf("设备已存在")
+	}
+	p.workers[worker.ID] = worker
+	if worker.generation == 0 {
+		worker.generation = p.nextWorkerGenerationLocked(worker.ID)
+	}
+	return nil
+}
+
+func (p *Pool) registerWorkerStartingForAttempt(worker *Worker, attempt uint64) error {
+	if p == nil || worker == nil || strings.TrimSpace(worker.ID) == "" {
+		return fmt.Errorf("worker_nil")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rebuildAttempt[worker.ID] != attempt || !p.rebuilding[worker.ID] {
+		return fmt.Errorf("设备 %s 启动流程已失效", worker.ID)
+	}
 	if current := p.workers[worker.ID]; current != nil && current != worker {
 		return fmt.Errorf("设备已存在")
 	}
@@ -532,12 +546,29 @@ type liveSIMIdentityRefreshResult struct {
 	IMSI  string
 }
 
+type LiveSIMIdentity struct {
+	ICCID string
+	IMSI  string
+}
+
+func (w *Worker) RefreshIdentityLiveVerified(ctx context.Context, reason string) (LiveSIMIdentity, error) {
+	result, err := w.refreshIdentityLiveWithOptions(ctx, reason, true)
+	return LiveSIMIdentity{ICCID: result.ICCID, IMSI: result.IMSI}, err
+}
+
 func (w *Worker) RefreshIdentityLive(ctx context.Context, reason string) error {
 	_, err := w.refreshIdentityLive(ctx, reason)
 	return err
 }
 
 func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSIMIdentityRefreshResult, error) {
+	return w.refreshIdentityLiveWithOptions(ctx, reason, false)
+}
+
+// refreshIdentityLiveWithOptions replaces both cached SIM identifiers only for
+// verified callers. This prevents a partial live read from pairing a new IMSI
+// with a stale ICCID (or vice versa) in overview and persistence paths.
+func (w *Worker) refreshIdentityLiveWithOptions(ctx context.Context, reason string, replaceSIMIdentity bool) (liveSIMIdentityRefreshResult, error) {
 	if w == nil {
 		return liveSIMIdentityRefreshResult{}, fmt.Errorf("worker_nil")
 	}
@@ -607,6 +638,9 @@ func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSI
 		}
 	}
 	result := liveSIMIdentityRefreshResult{ICCID: iccid, IMSI: imsi}
+	if replaceSIMIdentity && iccid == "" && imsi == "" {
+		return result, fmt.Errorf("live_identity_empty")
+	}
 	if iccid == "" && imsi == "" && nativeSPN == "" && !hasSIMMetadata(simMetadata) {
 		return result, fmt.Errorf("live_identity_empty")
 	}
@@ -625,12 +659,18 @@ func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSI
 		w.cacheMu.Unlock()
 		return result, err
 	}
-	identityChangedForSPN := (iccid != "" && iccid != strings.TrimSpace(w.state.Identity.ICCID)) ||
-		(imsi != "" && imsi != strings.TrimSpace(w.state.Identity.IMSI))
-	if iccid != "" {
+	currentICCID := strings.TrimSpace(w.state.Identity.ICCID)
+	currentIMSI := strings.TrimSpace(w.state.Identity.IMSI)
+	identityChangedForSPN := (iccid != "" && iccid != currentICCID) ||
+		(imsi != "" && imsi != currentIMSI)
+	if replaceSIMIdentity {
+		identityChangedForSPN = iccid != currentICCID || imsi != currentIMSI
+		w.state.Identity.ICCID = iccid
+		w.state.Identity.IMSI = imsi
+	} else if iccid != "" {
 		w.state.Identity.ICCID = iccid
 	}
-	if imsi != "" {
+	if !replaceSIMIdentity && imsi != "" {
 		w.state.Identity.IMSI = imsi
 	}
 	if nativeSPN != "" {
@@ -684,6 +724,25 @@ func (p *Pool) bindMBIMStateIndications(worker *Worker) {
 		logger.Info("[事件驱动] MBIM SIM 状态变化", "device", worker.ID)
 		p.handleSIMStatusEvent(worker.ID, "mbim_sim_status", nil, "")
 		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "post_switch_mbim_sim_status")
+	})
+	worker.MBIMCore.OnDataConnected(func() {
+		if !p.isCurrentPublicIPWorker(worker) {
+			return
+		}
+		p.refreshIPs(worker, false)
+		p.notifyDataConnected(worker.ID)
+	})
+	worker.MBIMCore.OnDataDisconnected(func() {
+		if !p.isCurrentPublicIPWorker(worker) {
+			return
+		}
+		p.invalidatePublicIPState(worker, true)
+	})
+	worker.MBIMCore.OnIPConfigChanged(func() {
+		if !p.isCurrentPublicIPWorker(worker) {
+			return
+		}
+		p.refreshIPs(worker, true)
 	})
 }
 
@@ -747,6 +806,18 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 	worker.QMICore.OnRecoveryExhausted(func(reason string, err error) {
 		p.maybeScheduleTransportRebuild(worker, HealthLayerQMI, reason, err)
 	})
+	worker.QMICore.OnIPChanged(func() {
+		if !p.isCurrentPublicIPWorker(worker) {
+			return
+		}
+		p.refreshIPs(worker, true)
+	})
+	worker.QMICore.OnDataDisconnected(func() {
+		if !p.isCurrentPublicIPWorker(worker) {
+			return
+		}
+		p.invalidatePublicIPState(worker, true)
+	})
 	worker.QMICore.OnHealthEvent(func(event qmicore.HealthEvent) {
 		switch event.State {
 		case qmicore.HealthEventHealthy:
@@ -782,7 +853,6 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		}
 	})
 }
-
 func (p *Pool) handleSIMStatusEvent(deviceID, source string, insertedHint *bool, state string) {
 	deviceID = strings.TrimSpace(deviceID)
 	if p == nil || deviceID == "" {
@@ -1031,9 +1101,7 @@ func (p *Pool) RemoveWorker(deviceID string) error {
 		}
 	})
 
-	if worker.publicIPRetryTimer != nil {
-		worker.publicIPRetryTimer.Stop()
-	}
+	p.invalidateRemovedPublicIPState(worker)
 
 	if worker.Proxy != nil {
 		worker.Proxy.Shutdown()
@@ -1096,7 +1164,7 @@ func (p *Pool) endRebuildAttemptIfCurrent(deviceID string, attempt uint64) {
 
 // startBootstrapWatchdog 为单次 AddWorkerFromConfig 执行设置硬上限看门狗。
 // 如果启动流程在 deadline 内既没有成功完成、也没有被更新的尝试取代，
-// 看门狗会强制释放 rebuilding 标记，让设备重新可以被重试或删除；
+// 看门狗会作废本次 attempt 并释放 rebuilding 标记，让设备重新可以被重试或删除；
 // 调用方应在自身正常返回时 close 掉返回的 stop channel 以避免看门狗误触发日志。
 func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline time.Duration) chan struct{} {
 	stop := make(chan struct{})
@@ -1113,11 +1181,12 @@ func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline 
 		p.mu.Lock()
 		isCurrent := p.rebuildAttempt[deviceID] == attempt
 		if isCurrent {
+			p.rebuildAttempt[deviceID]++
 			delete(p.rebuilding, deviceID)
 		}
 		p.mu.Unlock()
 		if isCurrent {
-			logger.Warn("QMI worker 启动看门狗超时，强制释放 rebuilding 标记，设备可能仍在后台初始化",
+			logger.Warn("QMI worker 启动看门狗超时，作废当前 attempt 并释放 rebuilding 标记",
 				"device", deviceID,
 				"deadline", deadline.String())
 		}
@@ -1200,13 +1269,12 @@ func (p *Pool) applyNetworkPreference(worker *Worker) error {
 			return nil
 		}
 		if nc.IsConnected() {
-			p.refreshIPs(worker, true)
+			p.refreshIPs(worker, false)
 			return nil
 		}
 		if err := worker.StartNetwork(); err != nil {
 			return err
 		}
-		p.refreshIPs(worker, true)
 		return nil
 	}
 
@@ -1294,12 +1362,13 @@ func (p *Pool) StartAll() error {
 	p.startPoolBackgroundServicesOnce()
 
 	devices := append([]config.DeviceConfig(nil), p.cfg.Devices...)
+	limit := p.FreeDeviceLimit()
 	for i := range devices {
 		devCfg := devices[i]
-		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", devCfg.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 		go p.startConfiguredDeviceBootstrap(devCfg, "start_all")
@@ -1374,13 +1443,14 @@ func (p *Pool) startAllSynchronousLegacy() error {
 	}
 
 	var firstErr error
+	limit := p.FreeDeviceLimit()
 	for i := range p.cfg.Devices {
 		// 使用指针以便修改配置
 		devCfg := &p.cfg.Devices[i]
-		if !FreeDeviceLimitAllowsConfiguredDevice(p.cfg.Devices, devCfg.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(p.cfg.Devices, devCfg.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", devCfg.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 		var matchedModem *QMIDevice
@@ -1504,11 +1574,13 @@ func (p *Pool) startAllSynchronousLegacy() error {
 				managerDevice = &md
 			}
 			qmiCore = qmicore.New(*devCfg, managerDevice)
+			p.configurePublicIPProbeSources(qmiCore)
 		}
 		var mbimCore *mbimcore.Manager
 		var mbimSource backend.MBIMSource
 		if requiresMBIMCore(*devCfg) {
 			mbimCore = mbimcore.New(devCfg.ControlDevice, config.NormalizeMBIMTransport(devCfg.MBIMTransport))
+			p.configurePublicIPProbeSources(mbimCore)
 			mbimCore.SetDataConfig(mbimcore.DataConfig{APN: devCfg.APN, Interface: devCfg.Interface, IPVersion: devCfg.IPVersion})
 			if err := mbimCore.Open(p.ctx); err != nil {
 				if firstErr == nil {
@@ -1604,8 +1676,11 @@ func (p *Pool) startAllSynchronousLegacy() error {
 
 		if qmiCore != nil {
 			qmiCore.SetOnConnect(func() {
+				if !p.isCurrentPublicIPWorker(w) {
+					return
+				}
 				p.markQMIControlRecovered(w, "qmi_connected")
-				p.refreshIPs(w, true)
+				p.refreshIPs(w, false)
 				p.notifyDataConnected(w.ID)
 			})
 			p.bindQMIHealthIndications(w)
@@ -1754,7 +1829,7 @@ func (p *Pool) startAllSynchronousLegacy() error {
 			_ = worker.RefreshIdentityLive(nil, "startup_post_apply")
 			p.PersistRuntimeState(worker)
 			p.PersistIdentityState(worker)
-			p.refreshIPs(worker, true)
+			p.refreshIPs(worker, false)
 		}(w)
 
 		// 短信定时轮询（按 smsMode 分支）
@@ -1958,6 +2033,7 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	hardware := p.collectRescanHardware(discovered, liveWorkerIndex)
 	managed := config.ListDevices()
 	resolved := ResolveDeviceIdentities(hardware, managed)
+	limit := p.FreeDeviceLimit()
 
 	if len(resolved.Degraded) > 0 || len(resolved.Unmatched) > 0 {
 		logger.Debug("rescan 发现未匹配或退化设备", "degraded", len(resolved.Degraded), "unmatched", len(resolved.Unmatched))
@@ -1965,10 +2041,10 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 
 	for _, pair := range resolved.Matched {
 		md := pair.Config
-		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", md.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 
@@ -2142,7 +2218,7 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	}
 
 	for _, md := range resolved.Offline {
-		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID, limit) {
 			continue
 		}
 		worker := p.GetWorker(md.ID)
@@ -2182,8 +2258,9 @@ func (p *Pool) RebuildWorker(deviceID string) error {
 	if err != nil || cfg == nil {
 		return fmt.Errorf("读取设备 %s 配置失败: %w", deviceID, err)
 	}
-	if !FreeDeviceLimitAllowsConfiguredDevice(config.ListDevices(), cfg.ID) {
-		return fmt.Errorf("%s", FreeDeviceWorkerLimitMessage())
+	limit := p.FreeDeviceLimit()
+	if !FreeDeviceLimitAllowsConfiguredDevice(config.ListDevices(), cfg.ID, limit) {
+		return fmt.Errorf("%s", FreeDeviceWorkerLimitMessage(limit))
 	}
 
 	// 先停止 VoWiFi（如有），并让任何正在启动中的旧实例失效。
@@ -2491,8 +2568,11 @@ func (w *Worker) Rotate() (oldIP, newIP string, err error) {
 }
 
 func (w *Worker) StartNetwork() error {
+	if w == nil {
+		return fmt.Errorf("network_not_available")
+	}
 	nc := w.NetworkController()
-	if w == nil || nc == nil {
+	if nc == nil {
 		return fmt.Errorf("network_not_available")
 	}
 	if w.QMICore != nil {
@@ -2504,12 +2584,21 @@ func (w *Worker) StartNetwork() error {
 			return err
 		}
 	}
-	return nc.Connect()
+	if err := nc.Connect(); err != nil {
+		return err
+	}
+	if w.Pool != nil {
+		w.Pool.refreshIPs(w, false)
+	}
+	return nil
 }
 
 func (w *Worker) StopNetwork() error {
+	if w == nil {
+		return fmt.Errorf("network_not_available")
+	}
 	nc := w.NetworkController()
-	if w == nil || nc == nil {
+	if nc == nil {
 		return fmt.Errorf("network_not_available")
 	}
 	if err := nc.Disconnect(); err != nil {
@@ -2520,10 +2609,16 @@ func (w *Worker) StopNetwork() error {
 }
 
 func (w *Worker) RotateWithNotify() (oldIP, newIP string, err error) {
-	// 防止并发 IP 切换
+	if w == nil {
+		return "", "", fmt.Errorf("worker_not_available")
+	}
 	w.rotateMu.Lock()
 	defer w.rotateMu.Unlock()
 
+	p := w.Pool
+	if p == nil {
+		return "", "", fmt.Errorf("pool_not_available")
+	}
 	nc := w.NetworkController()
 	if nc == nil {
 		return "", "", fmt.Errorf("network_not_available")
@@ -2533,133 +2628,110 @@ func (w *Worker) RotateWithNotify() (oldIP, newIP string, err error) {
 	}
 
 	const maxHardRetries = 2
-	const publicProbeRetries = 2
-	start := time.Now()
-
-	// 1. 并行获取旧 IP (不阻塞主流程)
-	oldIPChan := make(chan string, 1)
-	go func() {
-		// 优先从数据库获取旧 IP (减少一次外网请求)
-		var imeiForIP string
-		if w.Backend != nil {
-			if v, err := w.Backend.GetIMEI(context.Background()); err == nil {
-				imeiForIP = v
-			}
-		}
-		if imeiForIP == "" && w.Modem != nil {
-			imeiForIP = w.Modem.GetIMEI()
-		}
-		if imeiForIP != "" {
-			if ip, err := db.GetDevicePublicIP(imeiForIP); err == nil && ip != "" {
-				oldIPChan <- ip
-				return
-			}
-		}
-		oldV4, oldV6 := nc.GetPublicIPv4AndV6NoCache()
-		oldIPChan <- representativeIP(oldV4, oldV6)
-	}()
+	startedAt := time.Now()
+	var (
+		originalBaseline publicIPRotationBaseline
+		baselineSet      bool
+		lastRotateErr    error
+	)
 
 	for attempt := 1; attempt <= maxHardRetries; attempt++ {
-		// 等待旧 IP 获取完成 (仅第一次)
-		if attempt == 1 {
-			select {
-			case oldIP = <-oldIPChan:
-			case <-time.After(publicIPLookupWait):
-				if cached := strings.TrimSpace(w.GetCachedIP()); cached != "" {
-					oldIP = cached
-				} else {
-					oldIP = "Unknown"
-				}
+		if cancelErr := publicIPRotationCancellation(p, w); cancelErr != nil {
+			return oldIP, "Unknown", cancelErr
+		}
+		attemptBaseline, ok := p.beginPublicIPRotation(w, nc)
+		if !ok {
+			return "", "", fmt.Errorf("stale_worker")
+		}
+		if !baselineSet {
+			originalBaseline = attemptBaseline
+			baselineSet = true
+			oldIP = representativeIP(originalBaseline.publicV4, originalBaseline.publicV6)
+			if oldIP == "" {
+				oldIP = "Unknown"
 			}
 			logger.Info(fmt.Sprintf("[%s] 请求切换 IP", w.ID), "old_ip", oldIP)
 		}
 
-		oldPrivateIP := strings.TrimSpace(nc.GetPrivateIP())
-
-		if err := nc.RotateIP(); err != nil {
-			logger.Error(fmt.Sprintf("[%s] IP 切换失败", w.ID), "err", err)
-
+		if rotateErr := nc.RotateIP(); rotateErr != nil {
+			lastRotateErr = rotateErr
+			logger.Error(fmt.Sprintf("[%s] IP 切换失败", w.ID), "attempt", attempt, "err", rotateErr)
 			w.consecutiveFailures++
 			if w.consecutiveFailures >= 5 {
-				logger.Error(fmt.Sprintf("[%s] 连续切换 IP 失败 5 次，尝试重启模组", w.ID))
-				if err := w.Backend.Reboot(context.Background()); err != nil {
-					logger.Error(fmt.Sprintf("[%s] 重启模组失败", w.ID), "err", err)
+				if w.Backend != nil {
+					parent := p.ctx
+					if parent == nil {
+						parent = context.Background()
+					}
+					rebootCtx, cancel := context.WithTimeout(parent, 30*time.Second)
+					rebootErr := w.Backend.Reboot(rebootCtx)
+					cancel()
+					if rebootErr != nil {
+						logger.Error(fmt.Sprintf("[%s] 重启模块失败", w.ID), "err", rebootErr)
+					}
 				}
 				w.consecutiveFailures = 0
 			}
+			p.refreshIPs(w, false)
 			continue
 		}
-		w.consecutiveFailures = 0 // 重置失败计数
-		newPrivateIP := strings.TrimSpace(nc.GetPrivateIP())
 
-		// 4. 快速探测新外网 IP（最多探测两次，避免 rotate API 长时间阻塞）
-		for j := 0; j < publicProbeRetries; j++ {
-			publicV4, publicV6 := nc.GetPublicIPv4AndV6NoCache()
-			newIP = representativeIP(publicV4, publicV6)
-			if newIP != "" && newIP != "Unknown" && newIP != oldIP {
-				duration := time.Since(start)
-				logger.Info(fmt.Sprintf("[%s] 切换 IP 成功", w.ID), "new_ip", newIP, "duration", duration.String())
-				w.Pool.NotifyIPChanged(w.ID, oldIP, newIP, duration)
-				// 更新内存缓存
-				w.cacheMu.Lock()
-				if publicV4 != "" {
-					w.cachedIP = publicV4
-				}
-				if publicV6 != "" {
-					w.cachedPublicIPv6 = publicV6
-				}
-				w.cacheTime = time.Now()
-				w.cacheMu.Unlock()
+		w.consecutiveFailures = 0
+		p.refreshIPs(w, false)
 
-				// 更新数据库中的 IP
-				if imei := w.getIMEI(); imei != "" {
-					internalIP := nc.GetPrivateIP()
-					internalIPv6 := nc.GetPrivateIPv6()
-					_ = db.UpdateDeviceIPsV6(imei, publicV4, publicV6, internalIP, internalIPv6)
-				}
-
-				if app := w.Pool.voWiFiHost().Instance(w.ID); app != nil {
-					logger.Info(fmt.Sprintf("[%s] 指令级 IP 轮换完毕，正平滑触发底层 MOBIKE 漫游", w.ID), "new_ip", newIP)
-					if err := app.TriggerMOBIKE(oldIP, newIP); err != nil {
-						logger.Warn(fmt.Sprintf("[%s] MOBIKE 漫游触发失败", w.ID), "err", err)
-					}
-				}
-
-				return oldIP, newIP, nil
-			}
-			logger.Debug(fmt.Sprintf("[%s] 探测外网 IP 中...", w.ID), "try", j+1)
-			time.Sleep(200 * time.Millisecond)
+		parent := p.ctx
+		if parent == nil {
+			parent = context.Background()
 		}
-
-		// 5. 兜底：公网探测可能被限流/拦截，但若私网 IP 已切换则视作成功。
-		// 公网 IP 交给后台 refresh 重试机制异步补齐，避免 rotate 误报失败。
-		if newPrivateIP != "" && oldPrivateIP != "" && newPrivateIP != oldPrivateIP {
-			duration := time.Since(start)
-			logger.Info(fmt.Sprintf("[%s] 公网 IP 暂不可得，但私网 IP 已切换，按成功处理", w.ID),
-				"old_private_ip", oldPrivateIP,
-				"new_private_ip", newPrivateIP,
-				"duration", duration.String(),
+		waitCtx, cancel := context.WithTimeout(parent, publicIPLookupWait)
+		observation, publicChanged, waitErr := p.waitForPublicIPRotation(waitCtx, w, nc, originalBaseline)
+		cancel()
+		if cancelErr := publicIPRotationCancellation(p, w); cancelErr != nil {
+			return oldIP, "Unknown", cancelErr
+		}
+		if publicChanged {
+			notifyOld, notifyNew, _ := publicIPRotationChangePair(originalBaseline, observation)
+			if notifyOld != "" && notifyNew != "" && notifyOld != notifyNew {
+				p.NotifyIPChanged(w.ID, notifyOld, notifyNew, time.Since(startedAt))
+			}
+			logger.Info(fmt.Sprintf("[%s] 切换 IP 成功", w.ID), "new_ip", notifyNew, "duration", time.Since(startedAt))
+			return notifyOld, notifyNew, nil
+		}
+		if waitErr == nil && observation.privateChanged {
+			newIP = representativeIP(observation.publicV4, observation.publicV6)
+			if newIP == "" {
+				newIP = "Unknown"
+			}
+			logger.Info(fmt.Sprintf("[%s] 公网 IP 暂不可得，但私网地址已切换", w.ID),
+				"old_private_ipv4", originalBaseline.privateV4,
+				"new_private_ipv4", observation.privateV4,
+				"old_private_ipv6", originalBaseline.privateV6,
+				"new_private_ipv6", observation.privateV6,
+				"duration", time.Since(startedAt),
 			)
-
-			// 立即刷新数据库中的私网 IP；公网 IP 先沿用缓存值。
-			cachedPublic := w.GetCachedIP()
-			if imei := w.getIMEI(); imei != "" {
-				_ = db.UpdateDeviceIPsV6(imei, cachedPublic, w.GetCachedIPv6(), newPrivateIP, nc.GetPrivateIPv6())
-			}
-
-			// 异步继续探测公网 IP，避免阻塞 rotate 接口。
-			w.Pool.refreshIPs(w, true)
-
-			if cachedPublic != "" {
-				return oldIP, cachedPublic, nil
-			}
-			return oldIP, "Unknown", nil
+			return oldIP, newIP, nil
 		}
+		if waitErr != nil && waitErr != context.DeadlineExceeded {
+			return oldIP, "Unknown", fmt.Errorf("ip_rotate_observation_failed: %w", waitErr)
+		}
+
+		p.refreshIPs(w, false)
+		logger.Info(fmt.Sprintf("[%s] IP 切换指令已成功，公网结果由后台继续确认", w.ID),
+			"duration", time.Since(startedAt))
+		return oldIP, "Unknown", nil
 	}
 
-	return oldIP, "Unknown", fmt.Errorf("切换超时")
+	if !nc.IsConnected() {
+		p.abortPublicIPRotation(w)
+		p.invalidatePublicIPState(w, true)
+	} else {
+		p.refreshIPs(w, false)
+	}
+	if lastRotateErr == nil {
+		lastRotateErr = fmt.Errorf("unknown_rotate_failure")
+	}
+	return oldIP, "Unknown", fmt.Errorf("ip_rotate_failed: %w", lastRotateErr)
 }
-
 func (p *Pool) NotifyIPChanged(id, oldIP, newIP string, duration time.Duration) {
 	notifier := p.getNotifier()
 	if notifier == nil {
@@ -2684,6 +2756,7 @@ func (p *Pool) Shutdown() error {
 	var wg sync.WaitGroup
 	p.mu.RLock()
 	for _, w := range p.workers {
+		p.stopPublicIPState(w)
 		wg.Add(1)
 		go func(worker *Worker) {
 			defer wg.Done()
@@ -2760,38 +2833,27 @@ func (p *Pool) PersistIdentityState(worker *Worker) {
 	if worker == nil {
 		return
 	}
-
+	p.PersistIdentityOnly(worker)
 	status := worker.ProjectDeviceStatus()
-	iccid := strings.TrimSpace(status.ICCID)
-	imsi := strings.TrimSpace(status.IMSI)
-	if iccid == "" {
-		return
-	}
 	imei := strings.TrimSpace(status.IMEI)
-	operator := strings.TrimSpace(status.Operator)
-
-	if imei == "" {
-		logger.Warn(fmt.Sprintf("[%s] 无法同步设备 SIM 身份：IMEI 为空", worker.ID))
+	imsi := strings.TrimSpace(status.IMSI)
+	iccid := strings.TrimSpace(status.ICCID)
+	if imsi == "" && iccid == "" {
 		return
 	}
-
-	if err := db.UpsertSIMCard(iccid, imsi, "", operator, &imei); err != nil {
-		logger.Warn(fmt.Sprintf("[%s] 更新 SIM 卡信息失败", worker.ID), "err", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := p.PersistPhoneNumber(ctx, worker, imsi, iccid, false)
+	if result.Err != nil {
+		logger.Debug("phone number sync failed", "device", worker.ID, "channel", result.Channel, "err", result.Err)
 	}
-	if err := db.UpdateDeviceCurrentSIM(imei, &iccid); err != nil {
-		logger.Warn(fmt.Sprintf("[%s] 更新设备 SIM 关联失败", worker.ID), "err", err)
+	if imei != "" && iccid != "" {
+		logger.Info(fmt.Sprintf("[%s] \u8bbe\u5907 SIM \u8eab\u4efd\u5df2\u540c\u6b65\u5230\u6570\u636e\u5e93", worker.ID),
+			"imei", imei, "iccid", iccid, "backend", func() string {
+				if worker.Backend != nil {
+					return worker.Backend.Mode()
+				}
+				return "none"
+			}())
 	}
-	if phone := strings.TrimSpace(worker.getPhoneNumberWithContext(context.Background())); phone != "" {
-		if err := db.RecordModemPhoneNumber(imsi, iccid, phone); err != nil {
-			logger.Warn(fmt.Sprintf("[%s] 更新调制解调器本机号码失败", worker.ID), "err", err)
-		}
-	}
-
-	logger.Info(fmt.Sprintf("[%s] 设备 SIM 身份已同步到数据库", worker.ID),
-		"imei", imei, "iccid", iccid, "backend", func() string {
-			if worker.Backend != nil {
-				return worker.Backend.Mode()
-			}
-			return "none"
-		}())
 }

@@ -120,5 +120,11 @@ func (r vowifiSMSHistoryRecorder) RecordLocalNumberLearned(e eventhost.LocalNumb
 	if imsi == "" && iccid == "" {
 		return nil
 	}
-	return db.RecordVoWiFiPhoneNumber(imsi, iccid, number)
+	if err := db.RecordVoWiFiPhoneNumber(imsi, iccid, number); err != nil {
+		return err
+	}
+	if deviceID := strings.TrimSpace(e.DevID); r.pool != nil && deviceID != "" {
+		r.pool.BroadcastOverviewStateChange(deviceID)
+	}
+	return nil
 }

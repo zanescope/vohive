@@ -2,6 +2,7 @@ package mbim
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -55,7 +56,38 @@ func Subscribe(ctx context.Context, d *Device, entries []EventEntry) error {
 
 // SubscribeDefaultEvents subscribes to Basic Connect and SMS indications used by Monitor.
 func SubscribeDefaultEvents(ctx context.Context, d *Device) error {
-	return Subscribe(ctx, d, []EventEntry{
+	legacy := legacyDefaultEventEntries()
+	connectOnly := legacyDefaultEventEntries()
+	connectOnly[0].CIDs = append(connectOnly[0].CIDs, CIDBasicConnectConnect)
+	extended := legacyDefaultEventEntries()
+	extended[0].CIDs = append(extended[0].CIDs,
+		CIDBasicConnectConnect,
+		CIDBasicConnectIPConfiguration,
+	)
+	// These fallbacks reliably cover an explicit unsupported/status rejection.
+	// A transport timeout can consume the caller's context budget, in which case
+	// later attempts intentionally fail fast on that same context.
+	extendedErr := Subscribe(ctx, d, extended)
+	if extendedErr == nil {
+		return nil
+	}
+	connectErr := Subscribe(ctx, d, connectOnly)
+	if connectErr == nil {
+		return nil
+	}
+	legacyErr := Subscribe(ctx, d, legacy)
+	if legacyErr == nil {
+		return nil
+	}
+	return errors.Join(
+		fmt.Errorf("mbim: extended default event subscription: %w", extendedErr),
+		fmt.Errorf("mbim: CONNECT-only event subscription fallback: %w", connectErr),
+		fmt.Errorf("mbim: legacy default event subscription fallback: %w", legacyErr),
+	)
+}
+
+func legacyDefaultEventEntries() []EventEntry {
+	return []EventEntry{
 		{Service: UUIDBasicConnect, CIDs: []uint32{
 			CIDBasicConnectSignalState,
 			CIDBasicConnectRegisterState,
@@ -63,5 +95,5 @@ func SubscribeDefaultEvents(ctx context.Context, d *Device) error {
 			CIDBasicConnectSubscriberReadyStatus,
 		}},
 		{Service: UUIDSMS, CIDs: []uint32{CIDSMSRead}},
-	})
+	}
 }

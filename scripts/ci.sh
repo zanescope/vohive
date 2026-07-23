@@ -280,7 +280,7 @@ tidy_check() {
 }
 
 go_tests() {
-	read -r -a packages <<< "${CI_GO_TEST_PACKAGES:-./internal/device ./internal/mbim ./internal/qmi ./internal/backend ./internal/esim ./internal/cscall ./internal/proxy/traffic ./internal/notify ./internal/qqbot/... ./internal/api ./internal/config ./internal/db ./internal/updater/... ./cmd/vohive-verify ./cmd/vohivectl ./scripts/release-manifest}"
+	read -r -a packages <<< "${CI_GO_TEST_PACKAGES:-./internal/device ./internal/mbim ./internal/qmi ./internal/netprobe ./pkg/mbim ./internal/backend ./internal/esim ./internal/cscall ./internal/proxy/traffic ./internal/notify ./internal/qqbot/... ./internal/api ./internal/config ./internal/db ./internal/updater/... ./cmd/vohive-verify ./cmd/vohivectl ./scripts/release-manifest}"
 	if [[ ${#packages[@]} -eq 0 ]]; then
 		printf '\n==> no Go test packages configured\n'
 		return

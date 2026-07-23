@@ -7,10 +7,31 @@ import (
 	yaml "go.yaml.in/yaml/v3"
 )
 
+type DeviceLimitError struct {
+	Limit int
+}
+
+func (e *DeviceLimitError) Error() string {
+	return fmt.Sprintf("device count has reached the limit: %d", e.Limit)
+}
+
 func AddDeviceInFile(path string, device DeviceConfig) error {
+	return addDeviceInFile(path, device, 0)
+}
+
+// AddDeviceInFileWithLimit serializes the limit check and write through the
+// shared atomic config mutation. A limit of 0 means unlimited.
+func AddDeviceInFileWithLimit(path string, device DeviceConfig, limit int) error {
+	return addDeviceInFile(path, device, limit)
+}
+
+func addDeviceInFile(path string, device DeviceConfig, limit int) error {
 	return updateDevicesInFile(path, func(devices *yaml.Node) (*yaml.Node, error) {
 		if findDeviceNodeByID(devices, device.ID) != nil {
 			return nil, fmt.Errorf("设备已存在: %s", device.ID)
+		}
+		if limit > 0 && len(devices.Content) >= limit {
+			return nil, &DeviceLimitError{Limit: limit}
 		}
 		devices.Content = append(devices.Content, deviceConfigToNode(device))
 		return devices, nil

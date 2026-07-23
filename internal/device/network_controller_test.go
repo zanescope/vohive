@@ -11,10 +11,12 @@ import (
 )
 
 type fakeController struct {
-	connected   bool
-	connErr     error
-	rotated     int
-	connectHook func()
+	connected               bool
+	connectedChecks         int
+	disconnectOnSecondCheck bool
+	connErr                 error
+	rotated                 int
+	connectHook             func()
 }
 
 func (f *fakeController) Connect() error {
@@ -26,7 +28,13 @@ func (f *fakeController) Connect() error {
 }
 
 func (f *fakeController) Disconnect() error { f.connected = false; return nil }
-func (f *fakeController) IsConnected() bool { return f.connected }
+func (f *fakeController) IsConnected() bool {
+	f.connectedChecks++
+	if f.disconnectOnSecondCheck && f.connectedChecks >= 2 {
+		f.connected = false
+	}
+	return f.connected
+}
 func (f *fakeController) RotateIP() error {
 	f.rotated++
 	return nil
@@ -39,6 +47,31 @@ func TestNetControllerPrefersQMIThenMBIM(t *testing.T) {
 	w := &Worker{}
 	if w.NetworkController() != nil {
 		t.Fatal("empty worker should have nil controller")
+	}
+}
+
+func TestNetworkAddressSnapshotIsCoherentAcrossDisconnect(t *testing.T) {
+	fc := &fakeController{connected: true}
+	w := &Worker{netOverride: fc}
+	seedPublicIPRuntime(w, "10.1.2.3", "", "8.8.8.8", "2606:4700:4700::1111")
+
+	snapshot := w.NetworkAddressSnapshot()
+	if !snapshot.Connected || snapshot.PrivateIPv4 != "10.1.2.3" || snapshot.PrivateIPv6 != "" ||
+		snapshot.PublicIPv4 != "8.8.8.8" || snapshot.PublicIPv6 != "2606:4700:4700::1111" {
+		t.Fatalf("connected snapshot=%+v", snapshot)
+	}
+
+	fc.connected = false
+	fc.connectedChecks = 0
+	if snapshot := w.NetworkAddressSnapshot(); snapshot != (NetworkAddressSnapshot{}) {
+		t.Fatalf("disconnected snapshot leaked stale addresses: %+v", snapshot)
+	}
+
+	fc.connected = true
+	fc.connectedChecks = 0
+	fc.disconnectOnSecondCheck = true
+	if snapshot := w.NetworkAddressSnapshot(); snapshot != (NetworkAddressSnapshot{}) {
+		t.Fatalf("mid-snapshot disconnect leaked stale addresses: %+v", snapshot)
 	}
 }
 

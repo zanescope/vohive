@@ -1,6 +1,6 @@
 import { api } from '../stores/auth'
 import { callService } from './http'
-import type { CarrierWebsheetInfo, DeviceConfigDTO, DiscoveredDevice, EsimNotificationItem, EsimOverviewResponse, EsimSpaceDelta } from '../types/api'
+import type { CarrierWebsheetInfo, DeviceConfigDTO, DiscoveredDevice, EsimNotificationItem, EsimOverviewResponse, EsimSpaceDelta, PhoneNumberSource } from '../types/api'
 import type { DeviceDetailVM, DeviceListVM } from '../types/view-model'
 import axios from 'axios'
 
@@ -23,7 +23,9 @@ type DeleteEsimProfileResponse = {
 type NetworkControlResponse = {
   network_connected?: boolean
   private_ip?: string
+  private_ipv6?: string
   public_ip?: string
+  public_ipv6?: string
 }
 
 type FlightModeResponse = {
@@ -51,6 +53,15 @@ type UssdResult = {
 type UssdResponse = {
   result?: UssdResult
   channel?: string
+}
+
+export type PhoneNumberActionResponse = {
+  status?: string
+  local_phone?: string
+  local_phone_source?: PhoneNumberSource
+  acquired?: boolean
+  channel?: string
+  message?: string
 }
 
 const ESIM_BUSY_CODE = 'ESIM_BUSY'
@@ -135,6 +146,18 @@ export const devicesService = {
       return true
     })
   },
+  refreshPhoneNumber(id: string) {
+    return callService(async () => {
+      const res = await api.post<PhoneNumberActionResponse>(`/devices/${id}/actions/refresh-phone-number`)
+      return res.data
+    })
+  },
+  setManualPhoneNumber(id: string, manualPhoneNumber: string) {
+    return callService(async () => {
+      const res = await api.patch<PhoneNumberActionResponse>(`/devices/${id}/phone-number`, { manual_phone_number: manualPhoneNumber })
+      return res.data
+    })
+  },
   setFlightMode(id: string, flightModeEnabled: boolean) {
     return callService(async () => {
       const res = await api.patch<FlightModeResponse>(`/devices/${id}/flight-mode`, { enabled: flightModeEnabled })
@@ -161,7 +184,9 @@ export const devicesService = {
       return {
         networkConnected: res.data?.network_connected === true,
         privateIP: res.data?.private_ip || '',
-        publicIP: res.data?.public_ip || ''
+        privateIPv6: res.data?.private_ipv6 || '',
+        publicIP: res.data?.public_ip || '',
+        publicIPv6: res.data?.public_ipv6 || ''
       }
     })
   },
@@ -171,7 +196,9 @@ export const devicesService = {
       return {
         networkConnected: res.data?.network_connected === true,
         privateIP: res.data?.private_ip || '',
-        publicIP: res.data?.public_ip || ''
+        privateIPv6: res.data?.private_ipv6 || '',
+        publicIP: res.data?.public_ip || '',
+        publicIPv6: res.data?.public_ipv6 || ''
       }
     })
   },

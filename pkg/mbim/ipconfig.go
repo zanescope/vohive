@@ -81,6 +81,9 @@ func parseIPConfiguration(info []byte) (IPConfiguration, error) {
 }
 
 func QueryIPConfiguration(ctx context.Context, d *Device, sessionID uint32) (IPConfiguration, error) {
+	// MBIM 1.0 section 10.5.20 defines the query with the fixed 60-byte
+	// IP_CONFIGURATION structure. Only SessionId is populated; the remaining
+	// request fields are zero.
 	info := make([]byte, 60)
 	le.PutUint32(info[0:], sessionID)
 	resp, err := d.Command(ctx, UUIDBasicConnect, CIDBasicConnectIPConfiguration, CommandTypeQuery, info)
