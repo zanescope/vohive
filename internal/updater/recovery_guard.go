@@ -61,10 +61,22 @@ func GuardStart(deploymentFile string) error {
 func guardStartPaths(paths RuntimePaths) error {
 	state, err := LoadState(paths.StateFile())
 	if os.IsNotExist(err) {
-		if _, lockErr := os.Lstat(paths.LockFile()); os.IsNotExist(lockErr) {
+		lockInfo, lockErr := os.Lstat(paths.LockFile())
+		if os.IsNotExist(lockErr) {
 			return nil
-		} else if lockErr != nil {
+		}
+		if lockErr != nil {
 			return lockErr
+		}
+		if !lockInfo.Mode().IsRegular() || lockInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: update lock without transaction state is not a regular file", ErrInterruptedUpdate)
+		}
+		active, activeErr := updateLockProcessActive(paths.LockFile())
+		if activeErr != nil {
+			return fmt.Errorf("%w: update lock exists without transaction state: %v", ErrInterruptedUpdate, activeErr)
+		}
+		if active {
+			return nil
 		}
 		return fmt.Errorf("%w: update lock exists without transaction state", ErrInterruptedUpdate)
 	}
