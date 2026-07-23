@@ -162,10 +162,10 @@ type deviceMgmtOverviewItem struct {
 	RadioRegistered        bool               `json:"radio_registered"`
 	LifecyclePhase         string             `json:"lifecycle_phase"`
 	LifecycleReason        string             `json:"lifecycle_reason,omitempty"`
-	PrivateIP              string             `json:"private_ip,omitempty"`
-	PrivateIPv6            string             `json:"private_ipv6,omitempty"`
+	PrivateIP              string             `json:"private_ip"`
+	PrivateIPv6            string             `json:"private_ipv6"`
 	PublicIP               string             `json:"public_ip"`
-	PublicIPv6             string             `json:"public_ipv6,omitempty"`
+	PublicIPv6             string             `json:"public_ipv6"`
 	Config                 *deviceConfigDTO   `json:"config,omitempty"`
 	Modem                  modem.DeviceStatus `json:"modem"`
 	Traffic                map[string]string  `json:"traffic,omitempty"`
@@ -281,16 +281,17 @@ func (s *Server) handleDeviceMgmtOverview(c *gin.Context) {
 		}
 		status := w.GetCachedDeviceStatus() // 设备管理总览列表读缓存，0 IPC
 		controlOnline := w.GetCachedHealthy()
+		network := w.NetworkAddressSnapshot()
 		item := deviceMgmtOverviewItem{
 			ID:                     w.ID,
 			Name:                   cfg.Name,
 			Running:                true,
 			Healthy:                controlOnline, // 兼容旧客户端：healthy 表示控制面在线
 			ControlOnline:          controlOnline,
-			PublicIP:               w.GetCachedIP(),
-			PublicIPv6:             w.GetCachedIPv6(),
+			PublicIP:               network.PublicIPv4,
+			PublicIPv6:             network.PublicIPv6,
 			Modem:                  modemSummaryStatus(status),
-			NetworkConnected:       w.NetworkConnected(),
+			NetworkConnected:       network.Connected,
 			RegistrationStateLabel: registrationStateLabel(status.RegStatus),
 			BackendMode: func() string {
 				if w.Backend != nil {
@@ -307,10 +308,8 @@ func (s *Server) handleDeviceMgmtOverview(c *gin.Context) {
 			dto := deviceConfigToDTO(cfg)
 			item.Config = &dto
 		}
-		if nc := w.NetworkController(); nc != nil {
-			item.PrivateIP = nc.GetPrivateIP()
-			item.PrivateIPv6 = nc.GetPrivateIPv6()
-		}
+		item.PrivateIP = network.PrivateIPv4
+		item.PrivateIPv6 = network.PrivateIPv6
 		item.Traffic, item.TrafficRaw, item.TrafficMeta = buildTrafficOverviewFields(cfg.Interface, byTag[tagByID[w.ID]], now)
 		s.applyLifecycleToOverviewItem(&item, true, cfg)
 		items = append(items, item)
@@ -356,10 +355,10 @@ type deviceMgmtOverviewLiteItem struct {
 	RadioRegistered        bool               `json:"radio_registered"`
 	LifecyclePhase         string             `json:"lifecycle_phase"`
 	LifecycleReason        string             `json:"lifecycle_reason,omitempty"`
-	PrivateIP              string             `json:"private_ip,omitempty"`
-	PrivateIPv6            string             `json:"private_ipv6,omitempty"`
+	PrivateIP              string             `json:"private_ip"`
+	PrivateIPv6            string             `json:"private_ipv6"`
 	PublicIP               string             `json:"public_ip"`
-	PublicIPv6             string             `json:"public_ipv6,omitempty"`
+	PublicIPv6             string             `json:"public_ipv6"`
 	Interface              string             `json:"interface,omitempty"`
 	ControlDevice          string             `json:"control_device,omitempty"`
 	ESIMTransport          string             `json:"esim_transport,omitempty"`
@@ -367,6 +366,7 @@ type deviceMgmtOverviewLiteItem struct {
 	USBPath                string             `json:"usb_path,omitempty"`
 	AudioDevice            string             `json:"audio_device,omitempty"`
 	LocalPhone             string             `json:"local_phone,omitempty"`
+	LocalPhoneSource       string             `json:"local_phone_source"`
 	E911SetupAvailable     bool               `json:"e911_setup_available,omitempty"`
 	ActiveESIMProfileName  string             `json:"active_esim_profile_name,omitempty"`
 	SMSEnabled             bool               `json:"sms_enabled"`
@@ -414,7 +414,7 @@ type deviceMgmtListItem struct {
 	LifecyclePhase         string              `json:"lifecycle_phase"`
 	LifecycleReason        string              `json:"lifecycle_reason,omitempty"`
 	PublicIP               string              `json:"public_ip"`
-	PublicIPv6             string              `json:"public_ipv6,omitempty"`
+	PublicIPv6             string              `json:"public_ipv6"`
 	Interface              string              `json:"interface,omitempty"`
 	ESIMTransport          string              `json:"esim_transport,omitempty"`
 	SMSEnabled             bool                `json:"sms_enabled"`
@@ -577,21 +577,24 @@ func (s *Server) buildOverviewLiteDetailItemFromWorker(w *device.Worker, cfg con
 
 func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg config.DeviceConfig, status modem.DeviceStatus, radioLiveOK *bool, modemStatus modem.DeviceStatus) deviceMgmtOverviewLiteItem {
 	controlOnline := w.GetCachedHealthy()
+	network := w.NetworkAddressSnapshot()
+	phoneSnapshot := overviewLocalPhoneSnapshot(effectiveOverviewIMSI(w, status), strings.TrimSpace(status.ICCID))
 	item := deviceMgmtOverviewLiteItem{
 		ID:                     w.ID,
 		Name:                   cfg.Name,
 		Running:                true,
 		Healthy:                controlOnline,
 		ControlOnline:          controlOnline,
-		PublicIP:               w.GetCachedIP(),
-		PublicIPv6:             w.GetCachedIPv6(),
+		PublicIP:               network.PublicIPv4,
+		PublicIPv6:             network.PublicIPv6,
 		Interface:              cfg.Interface,
 		ControlDevice:          cfg.ControlDevice,
 		ESIMTransport:          config.NormalizeESIMTransport(cfg.ESIMTransport),
 		ATPort:                 w.ResolvedATPort(),
 		USBPath:                cfg.USBPath,
 		AudioDevice:            cfg.AudioDevice,
-		LocalPhone:             overviewLocalPhone(effectiveOverviewIMSI(w, status), strings.TrimSpace(status.ICCID)),
+		LocalPhone:             phoneSnapshot.PhoneNumber,
+		LocalPhoneSource:       phoneSnapshot.PhoneNumberSource,
 		E911SetupAvailable:     e911.SetupAvailable(modemStatus),
 		SMSEnabled:             cfg.SMSEnabled,
 		NetworkEnabled:         cfg.NetworkEnabled,
@@ -600,7 +603,7 @@ func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg 
 		VoWiFiRuntime:          s.getVoWiFiRuntimeDTO(w.ID),
 		RadioLiveOK:            radioLiveOK,
 		Modem:                  modemStatus,
-		NetworkConnected:       w.NetworkConnected(),
+		NetworkConnected:       network.Connected,
 		RegistrationStateLabel: registrationStateLabel(status.RegStatus),
 		BackendMode: func() string {
 			if w.Backend != nil {
@@ -609,10 +612,8 @@ func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg 
 			return "at"
 		}(),
 	}
-	if nc := w.NetworkController(); nc != nil {
-		item.PrivateIP = nc.GetPrivateIP()
-		item.PrivateIPv6 = nc.GetPrivateIPv6()
-	}
+	item.PrivateIP = network.PrivateIPv4
+	item.PrivateIPv6 = network.PrivateIPv6
 	if w.EsimMgr != nil {
 		if name, err := w.EsimMgr.ActiveProfileName(); err == nil {
 			item.ActiveESIMProfileName = name
@@ -622,24 +623,48 @@ func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg 
 	return item
 }
 
+type overviewStreamNetworkVersion struct {
+	NetworkConnected bool
+	PrivateIP        string
+	PrivateIPv6      string
+	PublicIP         string
+	PublicIPv6       string
+}
+
+func newOverviewStreamNetworkVersion(item deviceMgmtOverviewLiteItem) overviewStreamNetworkVersion {
+	return overviewStreamNetworkVersion{
+		NetworkConnected: item.NetworkConnected,
+		PrivateIP:        item.PrivateIP,
+		PrivateIPv6:      item.PrivateIPv6,
+		PublicIP:         item.PublicIP,
+		PublicIPv6:       item.PublicIPv6,
+	}
+}
+
 type overviewStreamEmitVersion struct {
-	VoWiFiActive    bool
-	LifecyclePhase  string
-	LifecycleReason string
-	HasRuntime      bool
-	Phase           string
-	TunnelReady     bool
-	IMSReady        bool
-	SMSReady        bool
-	LastErrorClass  string
+	VoWiFiActive     bool
+	LifecyclePhase   string
+	LifecycleReason  string
+	LocalPhone       string
+	LocalPhoneSource string
+	HasRuntime       bool
+	Phase            string
+	TunnelReady      bool
+	IMSReady         bool
+	SMSReady         bool
+	LastErrorClass   string
+	Network          overviewStreamNetworkVersion
 }
 
 func newOverviewStreamEmitVersion(item deviceMgmtOverviewLiteItem) overviewStreamEmitVersion {
 	v := overviewStreamEmitVersion{
-		VoWiFiActive:    item.VoWiFiActive,
-		LifecyclePhase:  item.LifecyclePhase,
-		LifecycleReason: item.LifecycleReason,
+		VoWiFiActive:     item.VoWiFiActive,
+		LifecyclePhase:   item.LifecyclePhase,
+		LifecycleReason:  item.LifecycleReason,
+		LocalPhone:       item.LocalPhone,
+		LocalPhoneSource: item.LocalPhoneSource,
 	}
+	v.Network = newOverviewStreamNetworkVersion(item)
 	if item.VoWiFiRuntime != nil {
 		v.HasRuntime = true
 		v.Phase = item.VoWiFiRuntime.Phase
@@ -700,6 +725,20 @@ func overviewLocalPhone(imsi, iccid string) string {
 	return strings.TrimSpace(phone)
 }
 
+func overviewLocalPhoneSnapshot(imsi, iccid string) db.PhoneNumberSnapshot {
+	empty := db.PhoneNumberSnapshot{PhoneNumberSource: db.PhoneNumberSourceNone}
+	imsi = strings.TrimSpace(imsi)
+	iccid = strings.TrimSpace(iccid)
+	if imsi == "" && iccid == "" {
+		return empty
+	}
+	snapshot, err := db.GetPhoneNumberSnapshotByIMSIOrICCID(imsi, iccid)
+	if err != nil {
+		return empty
+	}
+	return snapshot
+}
+
 func (s *Server) handleDeviceMgmtList(c *gin.Context) {
 	workers := s.pool.GetAllWorkers()
 	managed := config.ListDevices()
@@ -718,21 +757,22 @@ func (s *Server) handleDeviceMgmtList(c *gin.Context) {
 		}
 		status := w.GetCachedDeviceStatus()
 		controlOnline := w.GetCachedHealthy()
+		network := w.NetworkAddressSnapshot()
 		item := deviceMgmtListItem{
 			ID:                     w.ID,
 			Name:                   cfg.Name,
 			Running:                true,
 			Healthy:                controlOnline,
 			ControlOnline:          controlOnline,
-			PublicIP:               w.GetCachedIP(),
-			PublicIPv6:             w.GetCachedIPv6(),
+			PublicIP:               network.PublicIPv4,
+			PublicIPv6:             network.PublicIPv6,
 			Interface:              cfg.Interface,
 			ESIMTransport:          config.NormalizeESIMTransport(cfg.ESIMTransport),
 			SMSEnabled:             cfg.SMSEnabled,
 			NetworkEnabled:         cfg.NetworkEnabled,
 			VoWiFiEnabled:          s.pool.IsVoWiFiActive(w.ID), // 使用多设备状态查询
 			VoWiFiRuntime:          s.getVoWiFiRuntimeDTO(w.ID),
-			NetworkConnected:       w.NetworkConnected(),
+			NetworkConnected:       network.Connected,
 			RegistrationStateLabel: registrationStateLabel(status.RegStatus),
 			Modem: deviceMgmtListModem{
 				Operator:      status.Operator,
@@ -779,7 +819,7 @@ func (s *Server) handleDeviceMgmtList(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"devices": items, "device_limit": device.DefaultFreeDeviceLimit})
+	c.JSON(http.StatusOK, gin.H{"devices": items, "device_limit": s.pool.FreeDeviceLimit()})
 }
 
 // handleDeviceMgmtRefreshInfo 主动触发设备底层重新采集各种信息（SIM、信号等）
@@ -869,6 +909,7 @@ func (s *Server) handleDeviceMgmtOverviewLite(c *gin.Context) {
 				ControlDevice:          dc.ControlDevice,
 				ESIMTransport:          config.NormalizeESIMTransport(dc.ESIMTransport),
 				ATPort:                 dc.ATPort,
+				LocalPhoneSource:       db.PhoneNumberSourceNone,
 				USBPath:                dc.USBPath,
 				SMSEnabled:             pol.SMSEnabled,
 				NetworkEnabled:         pol.NetworkEnabled,
@@ -933,6 +974,7 @@ func (s *Server) handleDeviceMgmtOverviewLite(c *gin.Context) {
 			ControlDevice:          dc.ControlDevice,
 			ESIMTransport:          config.NormalizeESIMTransport(dc.ESIMTransport),
 			ATPort:                 dc.ATPort,
+			LocalPhoneSource:       db.PhoneNumberSourceNone,
 			SMSEnabled:             true, // SMS 恒开（系统不变量）
 			NetworkEnabled:         dc.NetworkEnabled,
 			VoWiFiActive:           false, // 非运行设备无活跃 VoWiFi
@@ -1473,9 +1515,9 @@ func validateDeviceBackendConfig(cfg config.DeviceConfig) error {
 	return nil
 }
 
-func validateFreeDeviceConfigLimit(devices []config.DeviceConfig) error {
-	if device.FreeDeviceLimitReached(len(devices)) {
-		return fmt.Errorf("%s", device.FreeDeviceAddLimitMessage())
+func validateFreeDeviceConfigLimit(devices []config.DeviceConfig, limit int) error {
+	if device.FreeDeviceLimitReached(len(devices), limit) {
+		return fmt.Errorf("%s", device.FreeDeviceAddLimitMessage(limit))
 	}
 	return nil
 }
@@ -1509,7 +1551,7 @@ func (s *Server) handleDeviceMgmtAddDevice(c *gin.Context) {
 		})
 		return
 	}
-	if err := validateFreeDeviceConfigLimit(config.ListDevices()); err != nil {
+	if err := validateFreeDeviceConfigLimit(config.ListDevices(), s.pool.FreeDeviceLimit()); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
@@ -1529,7 +1571,12 @@ func (s *Server) handleDeviceMgmtAddDevice(c *gin.Context) {
 		newCfg = enrichedCfg
 	}
 
-	if err := config.AddDeviceInFile(s.configPath, newCfg); err != nil {
+	if err := config.AddDeviceInFileWithLimit(s.configPath, newCfg, s.pool.FreeDeviceLimit()); err != nil {
+		var limitErr *config.DeviceLimitError
+		if errors.As(err, &limitErr) {
+			c.JSON(http.StatusConflict, gin.H{"status": "error", "message": device.FreeDeviceAddLimitMessage(limitErr.Limit)})
+			return
+		}
 		logger.Error("写入新设备配置失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "写入配置失败: " + err.Error()})
 		return
@@ -1619,7 +1666,9 @@ func (s *Server) handleDeviceMgmtExecuteAT(c *gin.Context) {
 	}
 
 	if worker.Backend != nil && isTransientATBackend(worker.Backend.Mode()) {
-		resp, err := executeManualATOnPort(manualATPortForWorker(worker), cmd, timeout)
+		resp, err := worker.WithTransientATPortContext(c.Request.Context(), func(port string) (string, error) {
+			return executeManualATOnPort(port, cmd, timeout)
+		})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
 			return
@@ -2612,6 +2661,7 @@ func (s *Server) handleDeviceMgmtOverviewStreamSingle(c *gin.Context) {
 				ESIMTransport:          config.NormalizeESIMTransport(md.ESIMTransport),
 				ATPort:                 md.ATPort,
 				AudioDevice:            md.AudioDevice,
+				LocalPhoneSource:       db.PhoneNumberSourceNone,
 				SMSEnabled:             pol.SMSEnabled,
 				NetworkEnabled:         pol.NetworkEnabled,
 				VoWiFiEnabled:          pol.VoWiFiEnabled,

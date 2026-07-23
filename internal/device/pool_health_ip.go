@@ -9,7 +9,6 @@ import (
 
 	"github.com/zanescope/vohive/internal/backend"
 	"github.com/zanescope/vohive/internal/config"
-	"github.com/zanescope/vohive/internal/db"
 	"github.com/zanescope/vohive/internal/modem"
 	"github.com/zanescope/vohive/pkg/logger"
 )
@@ -560,6 +559,14 @@ func (w *Worker) PreWarmCache() {
 }
 
 func (w *Worker) clearCachedIP() {
+	if w == nil {
+		return
+	}
+	if w.Pool != nil {
+		w.Pool.invalidatePublicIPState(w, true)
+		w.Pool.abortPublicIPRotation(w)
+		return
+	}
 	w.cacheMu.Lock()
 	w.cachedIP = ""
 	w.cachedPublicIPv6 = ""
@@ -583,150 +590,4 @@ func representativeIP(publicV4, publicV6 string) string {
 		return publicV4
 	}
 	return publicV6
-}
-
-func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
-	nc := worker.NetworkController()
-	if worker == nil || nc == nil || !nc.IsConnected() {
-		return
-	}
-
-	now := time.Now()
-	minInterval := 10 * time.Second
-	if checkPublic {
-		minInterval = 5 * time.Second
-	}
-
-	worker.ipRefreshMu.Lock()
-	if worker.ipRefreshInFlight {
-		worker.ipRefreshMu.Unlock()
-		return
-	}
-	if !worker.ipRefreshLast.IsZero() && now.Sub(worker.ipRefreshLast) < minInterval {
-		worker.ipRefreshMu.Unlock()
-		return
-	}
-	worker.ipRefreshInFlight = true
-	worker.ipRefreshLast = now
-	worker.ipRefreshMu.Unlock()
-
-	go func() {
-		defer func() {
-			worker.ipRefreshMu.Lock()
-			worker.ipRefreshInFlight = false
-			worker.ipRefreshMu.Unlock()
-		}()
-
-		privateIP := nc.GetPrivateIP()
-		privateIPv6 := nc.GetPrivateIPv6()
-
-		if checkPublic {
-			publicV4, publicV6 := nc.GetPublicIPv4AndV6NoCache()
-
-			worker.cacheMu.Lock()
-			oldIP := worker.cachedIP
-			oldIPv6 := worker.cachedPublicIPv6
-			if publicV4 != "" {
-				worker.cachedIP = publicV4
-			}
-			if publicV6 != "" {
-				worker.cachedPublicIPv6 = publicV6
-			}
-			worker.cacheTime = time.Now()
-			worker.cacheMu.Unlock()
-
-			if ipHealthy(publicV4, publicV6) {
-				worker.publicIPRetryMu.Lock()
-				worker.publicIPRetryCount = 0
-				if worker.publicIPRetryTimer != nil {
-					worker.publicIPRetryTimer.Stop()
-					worker.publicIPRetryTimer = nil
-				}
-				worker.publicIPRetryMu.Unlock()
-
-				if oldIP == "" && oldIPv6 == "" {
-					logger.Info(fmt.Sprintf("[%s] 获取到公网 IP", worker.ID), "public_ip", publicV4, "public_ipv6", publicV6, "private_ip", privateIP, "private_ipv6", privateIPv6)
-				} else if (publicV4 != "" && publicV4 != oldIP) || (publicV6 != "" && publicV6 != oldIPv6) {
-					logger.Info(fmt.Sprintf("[%s] 检测到 IP 变更", worker.ID), "old_ip", oldIP, "new_ip", publicV4, "old_ipv6", oldIPv6, "new_ipv6", publicV6, "private_ip", privateIP, "private_ipv6", privateIPv6)
-
-					if publicV4 != "" && oldIP != "" {
-						if app := p.voWiFiHost().Instance(worker.ID); app != nil {
-							logger.Info(fmt.Sprintf("[%s] 检测到内网抖动，正平滑触发底层 MOBIKE 漫游", worker.ID), "new_ip", publicV4)
-							if err := app.TriggerMOBIKE(oldIP, publicV4); err != nil {
-								logger.Warn(fmt.Sprintf("[%s] MOBIKE 漫游触发失败", worker.ID), "err", err)
-							}
-						}
-					} else if publicV6 != "" && oldIPv6 != "" {
-						if app := p.voWiFiHost().Instance(worker.ID); app != nil {
-							logger.Info(fmt.Sprintf("[%s] 检测到 IPv6 内网抖动，正平滑触发底层 MOBIKE 漫游", worker.ID), "new_ipv6", publicV6)
-							if err := app.TriggerMOBIKE(oldIPv6, publicV6); err != nil {
-								logger.Warn(fmt.Sprintf("[%s] MOBIKE 漫游触发失败", worker.ID), "err", err)
-							}
-						}
-					}
-				}
-
-				if imei := worker.getIMEI(); imei != "" {
-					_ = db.UpdateDeviceIPsV6(imei, publicV4, publicV6, privateIP, privateIPv6)
-				}
-			} else {
-				p.schedulePublicIPRetry(worker)
-			}
-		} else {
-			if imei := worker.getIMEI(); imei != "" {
-				cachedPublic := worker.GetCachedIP()
-				cachedPublicIPv6 := worker.GetCachedIPv6()
-				_ = db.UpdateDeviceIPsV6(imei, cachedPublic, cachedPublicIPv6, privateIP, privateIPv6)
-			}
-		}
-	}()
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func (p *Pool) schedulePublicIPRetry(worker *Worker) {
-	if worker == nil {
-		return
-	}
-	select {
-	case <-worker.stop:
-		return
-	default:
-	}
-
-	worker.publicIPRetryMu.Lock()
-	defer worker.publicIPRetryMu.Unlock()
-
-	worker.publicIPRetryCount++
-	attempt := worker.publicIPRetryCount
-
-	if attempt > 8 {
-		logger.Warn(fmt.Sprintf("[%s] 公网 IP 获取失败次数过多，停止重试", worker.ID))
-		return
-	}
-
-	delay := time.Duration(1<<minInt(attempt-1, 6)) * 2 * time.Second
-	if worker.publicIPRetryTimer != nil {
-		worker.publicIPRetryTimer.Stop()
-	}
-	worker.publicIPRetryTimer = time.AfterFunc(delay, func() {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-worker.stop:
-			return
-		default:
-		}
-		if p.GetWorker(worker.ID) != worker {
-			return
-		}
-		p.refreshIPs(worker, true)
-	})
-
-	logger.Info(fmt.Sprintf("[%s] 未获取到公网 IP，稍后重试", worker.ID), "attempt", attempt, "next_retry_in", delay.String())
 }

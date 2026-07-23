@@ -84,6 +84,7 @@ func (p *Pool) stopWorkerResources(worker *Worker) {
 		})
 		if p != nil {
 			p.cancelWorkerDeferredActions(worker.ID)
+			p.stopPublicIPState(worker)
 		}
 
 		worker.operatorScanMu.Lock()
@@ -93,15 +94,6 @@ func (p *Pool) stopWorkerResources(worker *Worker) {
 		worker.operatorScanMu.Unlock()
 		if operatorScanCancel != nil {
 			operatorScanCancel()
-		}
-
-		worker.publicIPRetryMu.Lock()
-		publicIPRetryTimer := worker.publicIPRetryTimer
-		worker.publicIPRetryTimer = nil
-		worker.publicIPRetryCount = 0
-		worker.publicIPRetryMu.Unlock()
-		if publicIPRetryTimer != nil {
-			publicIPRetryTimer.Stop()
 		}
 
 		if worker.Proxy != nil {

@@ -138,6 +138,9 @@ func ReconcileCurrentDatabase(database *gorm.DB) error {
 		if err := migrateSIMCardsToSubscriptions(tx); err != nil {
 			return err
 		}
+		if err := backfillPhoneNumberSources(tx); err != nil {
+			return err
+		}
 		if err := migrateSIMCardIdentityColumnsOnly(tx); err != nil {
 			return err
 		}
@@ -172,6 +175,9 @@ func migrateDatabaseSchema0To1(tx *gorm.DB) error {
 		return err
 	}
 	if err := migrateSIMCardsToSubscriptions(tx); err != nil {
+		return err
+	}
+	if err := backfillPhoneNumberSources(tx); err != nil {
 		return err
 	}
 	if err := migrateSIMCardIdentityColumnsOnly(tx); err != nil {

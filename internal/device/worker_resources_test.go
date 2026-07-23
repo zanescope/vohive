@@ -38,8 +38,9 @@ func TestStopWorkerResourcesIsIdempotent(t *testing.T) {
 			operatorCancels.Add(1)
 			cancel()
 		},
-		publicIPRetryTimer: time.AfterFunc(time.Hour, func() {}),
 	}
+	worker.publicIP.retryTimer = time.AfterFunc(time.Hour, func() {})
+	worker.publicIP.periodicTimer = time.AfterFunc(time.Hour, func() {})
 	pool.simEventTimers[worker.ID] = time.AfterFunc(time.Hour, func() {})
 	pool.deviceEventWakeups[worker.ID] = &deviceEventRecoverWakeup{
 		timer: time.AfterFunc(time.Hour, func() {}),
@@ -59,8 +60,12 @@ func TestStopWorkerResourcesIsIdempotent(t *testing.T) {
 	if worker.operatorScanActive || worker.operatorScanCancel != nil {
 		t.Fatal("operator scan state was not cleared")
 	}
-	if worker.publicIPRetryTimer != nil || worker.publicIPRetryCount != 0 {
-		t.Fatal("public IP retry state was not cleared")
+	worker.publicIP.mu.Lock()
+	retryTimer := worker.publicIP.retryTimer
+	periodicTimer := worker.publicIP.periodicTimer
+	worker.publicIP.mu.Unlock()
+	if retryTimer != nil || periodicTimer != nil {
+		t.Fatal("public IP timers were not cleared")
 	}
 	if _, ok := pool.simEventTimers[worker.ID]; ok {
 		t.Fatal("SIM event timer was not removed")

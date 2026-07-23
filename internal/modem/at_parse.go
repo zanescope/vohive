@@ -570,6 +570,12 @@ func parseCNUM(resp string) string {
 	return ""
 }
 
+// ParseCNUMResponse exposes the canonical AT+CNUM parser for transient serial
+// sessions that do not own a full Manager.
+func ParseCNUMResponse(resp string) string {
+	return parseCNUM(resp)
+}
+
 func canonicalPhoneCandidate(v string) string {
 	s := strings.TrimSpace(v)
 	if s == "" {

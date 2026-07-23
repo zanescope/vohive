@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zanescope/vohive/internal/apduarbiter"
+	"github.com/zanescope/vohive/internal/netprobe"
 	"github.com/zanescope/vohive/internal/simaid"
 	"github.com/zanescope/vohive/pkg/logger"
 	"github.com/zanescope/vohive/pkg/mbim"
@@ -34,32 +35,55 @@ type Manager struct {
 	controlDevice string
 	transportMode string
 
-	mu                sync.Mutex
-	dev               *mbim.Device
-	mon               *mbim.Monitor
-	smsCB             func()
-	simStatusCB       func()
-	slotStatusCB      func(slotIndex, state uint32)
-	caps              *mbim.Capabilities
-	dataCfg           DataConfig
-	netcfg            netConfigurator
-	desiredConnection bool
-	connected         bool
-	privateIPv4       string
-	privateIPv6       string
-	publicIPURLs      []string
+	mu                  sync.Mutex
+	dev                 *mbim.Device
+	mon                 *mbim.Monitor
+	smsCB               func()
+	simStatusCB         func()
+	slotStatusCB        func(slotIndex, state uint32)
+	caps                *mbim.Capabilities
+	dataCfg             DataConfig
+	netcfg              netConfigurator
+	desiredConnection   bool
+	connected           bool
+	privateIPv4         string
+	privateIPv6         string
+	ipv4DNS             []string
+	ipv6DNS             []string
+	appliedIPConfig     mbim.IPConfiguration
+	hasAppliedIPConfig  bool
+	publicIPv4URLs      []string
+	publicIPv6URLs      []string
+	publicIPLookupCache *netprobe.LookupCache
+	publicIPLookupEpoch uint64
+	dataConnectedCB     func()
+	dataDisconnectedCB  func()
+	ipConfigChangedCB   func()
+	dataEpoch           uint64
 
-	registrationTimeout time.Duration
-	connectTimeout      time.Duration
-	dataMu              sync.Mutex
-	activateRetryDelay  time.Duration
-	activateMaxAttempts int
+	registrationTimeout  time.Duration
+	connectTimeout       time.Duration
+	dataMu               sync.Mutex
+	pendingDataCallbacks []func()
+	activateRetryDelay   time.Duration
+	activateMaxAttempts  int
 
 	apduMu      sync.Mutex
 	apduArbiter *apduarbiter.Arbiter
 
-	ussdWaiter    *ussdWaiter
-	reconnectGate atomic.Bool
+	ussdWaiter                  *ussdWaiter
+	reconnectGate               atomic.Bool
+	reconnectCancel             context.CancelFunc
+	activeDataConnectCancel     context.CancelFunc
+	activeIPConfigRefreshCancel context.CancelFunc
+	dataStopRequested           bool
+	dataStopCount               int
+	ipConfigRefreshRunning      bool
+	ipConfigRefreshPending      bool
+	expectedDeactivationEpoch   uint64
+	expectedDeactivationUntil   time.Time
+	deactivationRecheckPending  bool
+	deactivationRecheckEpoch    uint64
 
 	healthProbeInterval time.Duration
 	healthProbeTimeout  time.Duration
@@ -86,10 +110,12 @@ func New(controlDevice, transportMode string) *Manager {
 	if transportMode == "" {
 		transportMode = "auto"
 	}
+	publicIPv4URLs, publicIPv6URLs := defaultPublicIPProbeURLs()
 	return &Manager{
 		controlDevice:       controlDevice,
 		transportMode:       transportMode,
-		publicIPURLs:        append([]string(nil), defaultPublicIPURLs...),
+		publicIPv4URLs:      publicIPv4URLs,
+		publicIPv6URLs:      publicIPv6URLs,
 		registrationTimeout: 20 * time.Second,
 		connectTimeout:      defaultDataConnectCommandTimeout,
 		activateRetryDelay:  time.Second,
@@ -134,6 +160,30 @@ func (m *Manager) OnSlotStatus(cb func(slotIndex, state uint32)) {
 	if m.mon != nil {
 		m.mon.SetOnSlotInfoStatus(func(s mbim.SlotInfoStatus) { cb(s.SlotIndex, s.State) })
 	}
+	m.mu.Unlock()
+}
+
+// OnDataConnected registers a callback fired after a data session has been
+// activated and its complete IP configuration has been applied.
+func (m *Manager) OnDataConnected(cb func()) {
+	m.mu.Lock()
+	m.dataConnectedCB = cb
+	m.mu.Unlock()
+}
+
+// OnDataDisconnected registers a callback fired after an established or
+// partially established data session has been invalidated and cleaned up.
+func (m *Manager) OnDataDisconnected(cb func()) {
+	m.mu.Lock()
+	m.dataDisconnectedCB = cb
+	m.mu.Unlock()
+}
+
+// OnIPConfigChanged registers a callback fired after an IP_CONFIGURATION
+// indication has been followed by an authoritative query and successful apply.
+func (m *Manager) OnIPConfigChanged(cb func()) {
+	m.mu.Lock()
+	m.ipConfigChangedCB = cb
 	m.mu.Unlock()
 }
 
@@ -197,6 +247,7 @@ func (m *Manager) openWithTransport(ctx context.Context, tr mbim.Transport) erro
 	}
 	mon.SetOnUSSD(m.handleUSSDIndication)
 	mon.SetOnConnect(m.handleConnectIndication)
+	mon.SetOnIPConfiguration(m.handleIPConfigurationIndication)
 	m.dev, m.mon = dev, mon
 	m.caps = caps
 	m.healthDone = make(chan struct{})
@@ -244,22 +295,36 @@ func (m *Manager) device() (*mbim.Device, error) {
 // Close stops the monitor, tears down any active data session, and closes
 // the device.
 func (m *Manager) Close() error {
+	m.beginDataStop()
 	m.dataMu.Lock()
-	defer m.dataMu.Unlock()
 
 	m.mu.Lock()
 	dev, mon := m.dev, m.mon
 	waiter := m.ussdWaiter
 	connected := m.connected
+	wasDesired := m.desiredConnection
+	hadBearerState := connected || m.privateIPv4 != "" || m.privateIPv6 != "" || len(m.ipv4DNS) > 0 || len(m.ipv6DNS) > 0
+	notifyDisconnected := hadBearerState || wasDesired
 	iface := m.dataCfg.Interface
 	nc := m.netcfg
 	healthDone := m.healthDone
+	reconnectCancel := m.reconnectCancel
 	m.dev, m.mon, m.ussdWaiter = nil, nil, nil
 	m.desiredConnection = false
 	m.connected = false
 	m.privateIPv4, m.privateIPv6 = "", ""
+	m.ipv4DNS, m.ipv6DNS = nil, nil
+	m.clearAppliedIPConfigLocked()
+	m.dataEpoch++
+	if connected || wasDesired {
+		m.markExpectedDeactivationLocked()
+	}
+	m.reconnectCancel = nil
 	m.mu.Unlock()
 	m.recoveryGate.Store(false)
+	if reconnectCancel != nil {
+		reconnectCancel()
+	}
 
 	notifyUSSDWaiter(waiter, errUSSDClosed)
 	if mon != nil {
@@ -268,18 +333,32 @@ func (m *Manager) Close() error {
 	if healthDone != nil {
 		m.healthOnce.Do(func() { close(healthDone) })
 	}
-	if connected && dev != nil {
+
+	if (connected || wasDesired) && dev != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, _ = mbim.Connect(ctx, dev, dataSessionID, mbim.ActivationCommandDeactivate, "", "", "", mbim.AuthProtocolNone, mbim.ContextIPTypeDefault)
+		_, err := mbim.Connect(ctx, dev, dataSessionID, mbim.ActivationCommandDeactivate, "", "", "", mbim.AuthProtocolNone, mbim.ContextIPTypeDefault)
 		cancel()
-		if nc != nil {
-			_ = nc.Flush(iface)
+		if err != nil {
+			logger.Debug("[mbim] close data-session deactivate failed", "control_device", m.controlDevice, "err", err)
 		}
 	}
-	if dev != nil {
-		return dev.Close()
+	if notifyDisconnected && nc != nil && iface != "" {
+		if err := flushNetwork(nc, iface); err != nil {
+			logger.Debug("[mbim] close network cleanup failed", "control_device", m.controlDevice, "err", err)
+		}
 	}
-	return nil
+	var closeErr error
+	if dev != nil {
+		closeErr = dev.Close()
+	}
+	if notifyDisconnected {
+		m.queueDataDisconnectedCallbackLocked()
+	}
+	callbacks := m.takePendingDataCallbacksLocked()
+	m.endDataStop()
+	m.dataMu.Unlock()
+	runDataCallbacks(callbacks)
+	return closeErr
 }
 
 func (m *Manager) SetDataConfig(c DataConfig) {

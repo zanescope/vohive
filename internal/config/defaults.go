@@ -13,7 +13,7 @@ import (
 func DefaultConfig() Config {
 	return Config{
 		ConfigSchema:    CurrentConfigSchema,
-		FreeDeviceLimit: 5,
+		FreeDeviceLimit: DefaultFreeDeviceLimit,
 		Server: ServerConfig{
 			Port: "7575",
 		},

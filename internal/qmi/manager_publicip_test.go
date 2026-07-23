@@ -2,263 +2,451 @@ package qmicore
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
+	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/zanescope/vohive/internal/config"
 	"github.com/miekg/dns"
+	qmimanager "github.com/zanescope/quectel-qmi-go/pkg/manager"
+	"github.com/zanescope/vohive/internal/netprobe"
 )
 
-func TestResolveIPv4WithTCPDNS(t *testing.T) {
-	dnsAddr := startTestTCPDNSServer(t, map[string][]string{
-		"probe.local.": {"127.0.0.1", "127.0.0.2"},
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	ips, err := resolveIPv4WithTCPDNS(ctx, "probe.local", []string{dnsAddr}, &net.Dialer{Timeout: time.Second})
-	if err != nil {
-		t.Fatalf("resolveIPv4WithTCPDNS() error = %v", err)
-	}
-	if len(ips) != 2 || ips[0] != "127.0.0.1" || ips[1] != "127.0.0.2" {
-		t.Fatalf("resolveIPv4WithTCPDNS() ips = %v, want [127.0.0.1 127.0.0.2]", ips)
-	}
-}
-
-func TestGetPublicIPNoCacheUsesCustomResolver(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("203.0.113.55"))
-	}))
-	defer server.Close()
-
-	parsedURL, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatalf("url.Parse(server.URL) error = %v", err)
-	}
-
-	dnsAddr := startTestTCPDNSServer(t, map[string][]string{
-		"probe.local.": {parsedURL.Hostname()},
-	})
-
-	manager := &Manager{
-		cfg: config.DeviceConfig{},
-		publicIPLookup: func(ctx context.Context, host string) ([]string, error) {
-			return resolveIPv4WithTCPDNS(ctx, host, []string{dnsAddr}, &net.Dialer{Timeout: time.Second})
-		},
-	}
-
-	originalURLs := ipCheckURLs
-	ipCheckURLs = []string{fmt.Sprintf("http://probe.local:%s", parsedURL.Port())}
-	defer func() {
-		ipCheckURLs = originalURLs
-	}()
-
-	if got := manager.GetPublicIPNoCache(); got != "203.0.113.55" {
-		t.Fatalf("GetPublicIPNoCache() = %q, want %q", got, "203.0.113.55")
-	}
-}
-
-// TestGetPublicIPv4AndV6NoCacheDualStack 复现并验证修复：在双栈模式下，公网 IP 探测
-// 不应被 IPv6 抢跑导致 IPv4 探测结果永远拿不到。两个地址族必须各自独立探测成功。
-func TestGetPublicIPv4AndV6NoCacheDualStack(t *testing.T) {
-	v4Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("203.0.113.55"))
-	}))
-	defer v4Server.Close()
-
-	v6Listener, err := net.Listen("tcp6", "[::1]:0")
-	if err != nil {
-		t.Skipf("no IPv6 loopback available: %v", err)
-	}
-	v6Server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("2001:db8::1"))
-	}))
-	v6Server.Listener = v6Listener
-	v6Server.Start()
-	defer v6Server.Close()
-
-	v4URL, err := url.Parse(v4Server.URL)
-	if err != nil {
-		t.Fatalf("url.Parse(v4Server.URL) error = %v", err)
-	}
-	v6URL, err := url.Parse(v6Server.URL)
-	if err != nil {
-		t.Fatalf("url.Parse(v6Server.URL) error = %v", err)
-	}
-
-	manager := &Manager{
-		cfg: config.DeviceConfig{IPVersion: "v4v6"},
-		publicIPLookup: func(ctx context.Context, host string) ([]string, error) {
-			switch host {
-			case "probe4.local":
-				return []string{"127.0.0.1"}, nil
-			case "probe6.local":
-				return []string{"::1"}, nil
-			}
-			return nil, fmt.Errorf("unexpected host %q", host)
-		},
-		hasIPv6Bearer: func() bool { return true },
-	}
-
-	originalURLs := ipCheckURLs
-	ipCheckURLs = []string{
-		fmt.Sprintf("http://probe4.local:%s", v4URL.Port()),
-		fmt.Sprintf("http://probe6.local:%s", v6URL.Port()),
-	}
-	defer func() {
-		ipCheckURLs = originalURLs
-	}()
-
-	gotV4, gotV6 := manager.GetPublicIPv4AndV6NoCache()
-	if gotV4 != "203.0.113.55" {
-		t.Errorf("GetPublicIPv4AndV6NoCache() v4 = %q, want %q", gotV4, "203.0.113.55")
-	}
-	if gotV6 != "2001:db8::1" {
-		t.Errorf("GetPublicIPv4AndV6NoCache() v6 = %q, want %q", gotV6, "2001:db8::1")
-	}
-}
-
-// TestGetPublicIPv4AndV6NoCacheSkipsV6WithoutBearer 复现并验证修复：配置允许 v6
-// (IPVersion=v4v6) 但 v6 数据承载实际未建立(网络拒绝 PDP type，如 ESM cause #50)时，
-// 不应再发起一轮专门的 v6 族探测(其自身有独立的 10s 超时，且会重新对所有 ipCheckURLs
-// 发起请求)，否则每轮刷新都白白多等一次注定失败的探测、拖慢刷新并占用退避重试。
-// 注意：probePublicIP 本身会对所有 ipCheckURLs 并发竞速、由拨号阶段按族过滤结果，
-// 因此 v4 探测中仍会解析到 probe6.local 一次（解析结果会被过滤掉），这不属于本测试要禁止的
-// "专门的 v6 探测轮次"，故按调用次数断言而非"零调用"。
-func TestGetPublicIPv4AndV6NoCacheSkipsV6WithoutBearer(t *testing.T) {
-	v4Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("203.0.113.55"))
-	}))
-	defer v4Server.Close()
-
-	v4URL, err := url.Parse(v4Server.URL)
-	if err != nil {
-		t.Fatalf("url.Parse(v4Server.URL) error = %v", err)
-	}
-
-	var mu sync.Mutex
-	v6LookupCalls := 0
-
-	manager := &Manager{
-		cfg: config.DeviceConfig{IPVersion: "v4v6"},
-		publicIPLookup: func(ctx context.Context, host string) ([]string, error) {
-			switch host {
-			case "probe4.local":
-				return []string{"127.0.0.1"}, nil
-			case "probe6.local":
-				mu.Lock()
-				v6LookupCalls++
-				mu.Unlock()
-				return nil, fmt.Errorf("no v6 route")
-			}
-			return nil, fmt.Errorf("unexpected host %q", host)
-		},
-		hasIPv6Bearer: func() bool { return false },
-	}
-
-	originalURLs := ipCheckURLs
-	ipCheckURLs = []string{
-		fmt.Sprintf("http://probe4.local:%s", v4URL.Port()),
-		"http://probe6.local:1",
-	}
-	defer func() {
-		ipCheckURLs = originalURLs
-	}()
-
-	gotV4, gotV6 := manager.GetPublicIPv4AndV6NoCache()
-	if gotV4 != "203.0.113.55" {
-		t.Errorf("GetPublicIPv4AndV6NoCache() v4 = %q, want %q", gotV4, "203.0.113.55")
-	}
-	if gotV6 != "" {
-		t.Errorf("GetPublicIPv4AndV6NoCache() v6 = %q, want empty (v6 bearer down)", gotV6)
-	}
-
-	mu.Lock()
-	calls := v6LookupCalls
-	mu.Unlock()
-	// 仅 v4 族探测竞速过程中触发的一次解析；若仍有独立的 v6 族探测轮次，会再触发一次（=2）。
-	if calls != 1 {
-		t.Errorf("probe6.local lookup called %d times, want 1 (no dedicated v6-family probe pass)", calls)
-	}
-}
-
-func TestExtractAAAARecords(t *testing.T) {
-	records := []dns.RR{
-		&dns.AAAA{
-			Hdr: dns.RR_Header{
-				Name:   "probe.local.",
-				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET,
-				Ttl:    30,
-			},
-			AAAA: net.ParseIP("2001:db8::1"),
-		},
-		&dns.A{
-			Hdr: dns.RR_Header{
-				Name:   "probe.local.",
-				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET,
-				Ttl:    30,
-			},
-			A: net.ParseIP("127.0.0.1").To4(),
-		},
-	}
-	ips := extractAAAARecords(records)
-	if len(ips) != 1 || ips[0] != "2001:db8::1" {
-		t.Fatalf("extractAAAARecords() = %v, want [2001:db8::1]", ips)
-	}
-}
-
-func startTestTCPDNSServer(t *testing.T, records map[string][]string) string {
-	t.Helper()
-
-	mux := dns.NewServeMux()
-	mux.HandleFunc(".", func(w dns.ResponseWriter, req *dns.Msg) {
-		resp := new(dns.Msg)
-		resp.SetReply(req)
-		for _, question := range req.Question {
-			if question.Qtype != dns.TypeA {
-				continue
-			}
-			for _, ip := range records[question.Name] {
-				resp.Answer = append(resp.Answer, &dns.A{
-					Hdr: dns.RR_Header{
-						Name:   question.Name,
-						Rrtype: dns.TypeA,
-						Class:  dns.ClassINET,
-						Ttl:    30,
-					},
-					A: net.ParseIP(ip).To4(),
-				})
-			}
+func TestResolveWithBoundDNSMovesToNextServerAfterUDPAndTCPFailure(t *testing.T) {
+	var calls []string
+	exchange := func(_ context.Context, msg *dns.Msg, server, network string, _ *net.Dialer) (*dns.Msg, error) {
+		calls = append(calls, server+"/"+network)
+		if server == "first:53" {
+			return nil, errors.New(network + " timeout")
 		}
-		_ = w.WriteMsg(resp)
-	})
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+		return dnsAResponse(msg, "8.8.8.8"), nil
+	}
+	ips, err := resolveWithBoundDNSExchange(context.Background(), "probe.example",
+		[]string{"first:53", "second:53"}, nil, dns.TypeA, exchange)
 	if err != nil {
-		t.Fatalf("net.Listen() error = %v", err)
+		t.Fatal(err)
 	}
+	if want := []string{"8.8.8.8"}; !reflect.DeepEqual(ips, want) {
+		t.Fatalf("IPs = %v, want %v", ips, want)
+	}
+	if want := []string{"first:53/udp", "first:53/tcp", "second:53/udp"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
 
-	server := &dns.Server{
-		Listener: listener,
-		Net:      "tcp",
-		Handler:  mux,
+func TestResolveWithBoundDNSUsesTCPAfterUDPFailure(t *testing.T) {
+	var calls []string
+	exchange := func(_ context.Context, msg *dns.Msg, server, network string, _ *net.Dialer) (*dns.Msg, error) {
+		calls = append(calls, server+"/"+network)
+		if network == "udp" {
+			return nil, errors.New("UDP is blocked")
+		}
+		return dnsAResponse(msg, "8.8.4.4"), nil
 	}
+	ips, err := resolveWithBoundDNSExchange(context.Background(), "probe.example",
+		[]string{"carrier:53"}, nil, dns.TypeA, exchange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"8.8.4.4"}; !reflect.DeepEqual(ips, want) {
+		t.Fatalf("IPs = %v, want %v", ips, want)
+	}
+	if want := []string{"carrier:53/udp", "carrier:53/tcp"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
+func TestResolveWithBoundDNSRejectsPrivateAnswerAndFallsBack(t *testing.T) {
+	var calls []string
+	exchange := func(_ context.Context, msg *dns.Msg, server, network string, _ *net.Dialer) (*dns.Msg, error) {
+		calls = append(calls, server+"/"+network)
+		if server == "carrier:53" {
+			return dnsAResponse(msg, "10.0.0.9"), nil
+		}
+		return dnsAResponse(msg, "8.8.8.8"), nil
+	}
+	ips, err := resolveWithBoundDNSExchange(context.Background(), "probe.example",
+		[]string{"carrier:53", "fallback:53"}, nil, dns.TypeA, exchange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"8.8.8.8"}; !reflect.DeepEqual(ips, want) {
+		t.Fatalf("IPs = %v, want %v", ips, want)
+	}
+	if want := []string{"carrier:53/udp", "fallback:53/udp"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
+func TestResolveWithBoundDNSUsesTCPForTruncatedUDP(t *testing.T) {
+	var calls []string
+	exchange := func(_ context.Context, msg *dns.Msg, server, network string, _ *net.Dialer) (*dns.Msg, error) {
+		calls = append(calls, server+"/"+network)
+		if network == "udp" {
+			resp := new(dns.Msg)
+			resp.SetReply(msg)
+			resp.Truncated = true
+			return resp, nil
+		}
+		return dnsAResponse(msg, "1.1.1.1"), nil
+	}
+	ips, err := resolveWithBoundDNSExchange(context.Background(), "probe.example",
+		[]string{"carrier:53"}, nil, dns.TypeA, exchange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"1.1.1.1"}; !reflect.DeepEqual(ips, want) {
+		t.Fatalf("IPs = %v, want %v", ips, want)
+	}
+	if want := []string{"carrier:53/udp", "carrier:53/tcp"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
+
+func TestResolveWithBoundDNSDoesNotTryTCPAfterUDPCancellation(t *testing.T) {
+	tests := []struct {
+		name     string
+		response func(*dns.Msg) (*dns.Msg, error)
+	}{
+		{name: "transport error", response: func(*dns.Msg) (*dns.Msg, error) {
+			return nil, errors.New("UDP failed")
+		}},
+		{name: "empty response", response: func(*dns.Msg) (*dns.Msg, error) {
+			return nil, nil
+		}},
+		{name: "truncated response", response: func(msg *dns.Msg) (*dns.Msg, error) {
+			response := new(dns.Msg)
+			response.SetReply(msg)
+			response.Truncated = true
+			return response, nil
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			var calls []string
+			exchange := func(_ context.Context, msg *dns.Msg, server, network string, _ *net.Dialer) (*dns.Msg, error) {
+				calls = append(calls, server+"/"+network)
+				cancel()
+				return tt.response(msg)
+			}
+			_, err := resolveWithBoundDNSExchange(ctx, "probe.example", []string{"carrier:53"}, nil, dns.TypeA, exchange)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			if want := []string{"carrier:53/udp"}; !reflect.DeepEqual(calls, want) {
+				t.Fatalf("calls = %v, want %v", calls, want)
+			}
+		})
+	}
+}
+func TestResolveWithBoundDNSStopsBeforeExchangeWhenCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	exchange := func(context.Context, *dns.Msg, string, string, *net.Dialer) (*dns.Msg, error) {
+		calls++
+		return nil, errors.New("must not be called")
+	}
+	_, err := resolveWithBoundDNSExchange(ctx, "probe.example", []string{"carrier:53"}, nil, dns.TypeA, exchange)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if calls != 0 {
+		t.Fatalf("exchange calls = %d, want 0", calls)
+	}
+}
+
+func TestResolveWithBoundDNSRecordFamilyIsIndependentOfServerFamily(t *testing.T) {
+	tests := []struct {
+		name, server string
+		queryType    uint16
+		want         []string
+	}{
+		{"AAAA over v4 DNS server", "10.0.0.53:53", dns.TypeAAAA, []string{"2606:4700:4700::1111"}},
+		{"A over v6 DNS server", "[fd00::53]:53", dns.TypeA, []string{"8.8.8.8"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exchange := func(_ context.Context, msg *dns.Msg, _ string, network string, _ *net.Dialer) (*dns.Msg, error) {
+				if network != "udp" {
+					return nil, errors.New("unexpected TCP query")
+				}
+				if tt.queryType == dns.TypeAAAA {
+					return dnsAAAAResponse(msg, tt.want[0]), nil
+				}
+				return dnsAResponse(msg, tt.want[0]), nil
+			}
+			got, err := resolveWithBoundDNSExchange(context.Background(), "probe.example",
+				[]string{tt.server}, nil, tt.queryType, exchange)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOrderedPublicIPDNSServersDecouplesQueryAndTransportFamilies(t *testing.T) {
+	v4 := []string{"10.0.0.53:53"}
+	v6 := []string{"[fd00::53]:53"}
+	tests := []struct {
+		name                   string
+		family                 netprobe.Family
+		v4, v6                 []string
+		reachable4, reachable6 bool
+		want                   []string
+	}{
+		{"A prefers v4 then v6 carrier", netprobe.FamilyV4, v4, v6, true, true,
+			concatStrings(v4, v6, fallbackPublicIPDNSServersV4, fallbackPublicIPDNSServersV6)},
+		{"AAAA prefers v6 then v4 carrier", netprobe.FamilyV6, v4, v6, true, true,
+			concatStrings(v6, v4, fallbackPublicIPDNSServersV6, fallbackPublicIPDNSServersV4)},
+		{"AAAA uses only v4 carrier DNS", netprobe.FamilyV6, v4, nil, true, false,
+			concatStrings(v4, fallbackPublicIPDNSServersV4)},
+		{"A uses only v6 carrier DNS", netprobe.FamilyV4, nil, v6, false, true,
+			concatStrings(v6, fallbackPublicIPDNSServersV6)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := orderedPublicIPDNSServers(tt.family, tt.v4, tt.v6, tt.reachable4, tt.reachable6)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOrderedPublicIPDNSServersOmitsUnreachableFallbacks(t *testing.T) {
+	if got := orderedPublicIPDNSServers(netprobe.FamilyV4, nil, nil, false, false); len(got) != 0 {
+		t.Fatalf("no bearer yielded %v", got)
+	}
+	if got := orderedPublicIPDNSServers(netprobe.FamilyV6, nil, nil, true, false); !reflect.DeepEqual(got, fallbackPublicIPDNSServersV4) {
+		t.Fatalf("v4-only bearer yielded %v", got)
+	}
+	if got := orderedPublicIPDNSServers(netprobe.FamilyV4, nil, nil, false, true); !reflect.DeepEqual(got, fallbackPublicIPDNSServersV6) {
+		t.Fatalf("v6-only bearer yielded %v", got)
+	}
+	v4Domestic := []string{"119.29.29.29:53", "223.5.5.5:53", "223.6.6.6:53"}
+	v6Domestic := []string{"[2402:4e00::]:53", "[2402:4e00:1::]:53", "[2400:3200::1]:53", "[2400:3200:baba::1]:53"}
+	if !reflect.DeepEqual(fallbackPublicIPDNSServersV4[:len(v4Domestic)], v4Domestic) {
+		t.Fatalf("v4 fallback order = %v", fallbackPublicIPDNSServersV4)
+	}
+	if !reflect.DeepEqual(fallbackPublicIPDNSServersV6[:len(v6Domestic)], v6Domestic) {
+		t.Fatalf("v6 fallback order = %v", fallbackPublicIPDNSServersV6)
+	}
+}
+
+func TestAppendDNSServerForInterfaceValidatesEndpoint(t *testing.T) {
+	tests := []struct {
+		name, ip, iface string
+		want            []string
+	}{
+		{"private v4", "10.0.0.53", "", []string{"10.0.0.53:53"}},
+		{"link-local v6 zone", "fe80::53", "wwan0", []string{"[fe80::53%wwan0]:53"}},
+		{"link-local v6 without zone", "fe80::53", "", nil},
+		{"unspecified v4", "0.0.0.0", "", nil},
+		{"unspecified v6", "::", "", nil},
+		{"multicast v4", "224.0.0.251", "", nil},
+		{"multicast v6", "ff02::fb", "", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := appendDNSServerForInterface(nil, net.ParseIP(tt.ip), tt.iface)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBearerAddressMatchesFamilyRejectsUnusableAddresses(t *testing.T) {
+	tests := []struct {
+		value  string
+		family netprobe.Family
+		want   bool
+	}{
+		{"10.0.0.2", netprobe.FamilyV4, true},
+		{"2606:4700:4700::1111", netprobe.FamilyV6, true},
+		{"10.0.0.2", netprobe.FamilyV6, false},
+		{"0.0.0.0", netprobe.FamilyV4, false},
+		{"::", netprobe.FamilyV6, false},
+		{"127.0.0.1", netprobe.FamilyV4, false},
+		{"::1", netprobe.FamilyV6, false},
+		{"169.254.1.1", netprobe.FamilyV4, false},
+		{"fe80::1", netprobe.FamilyV6, false},
+		{"224.0.0.1", netprobe.FamilyV4, false},
+		{"ff02::1", netprobe.FamilyV6, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			if got := bearerAddressMatchesFamily(tt.value, tt.family); got != tt.want {
+				t.Fatalf("bearerAddressMatchesFamily(%q, %s) = %v, want %v", tt.value, tt.family, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetPublicIPv4AndV6ContextUsesActualBearerFamilies(t *testing.T) {
+	var mu sync.Mutex
+	calls := make(map[netprobe.Family]int)
+	manager := &Manager{
+		hasIPv4Bearer: func() bool { return true },
+		hasIPv6Bearer: func() bool { return true },
+		publicIPProbeResult: func(_ context.Context, family netprobe.Family) (netprobe.Result, error) {
+			mu.Lock()
+			calls[family]++
+			mu.Unlock()
+			if family == netprobe.FamilyV4 {
+				return netprobe.Result{IP: "8.8.4.4"}, nil
+			}
+			return netprobe.Result{IP: "2606:4700:4700::1111"}, nil
+		},
+	}
+	gotV4, gotV6 := manager.GetPublicIPv4AndV6Context(context.Background())
+	if gotV4 != "8.8.4.4" || gotV6 != "2606:4700:4700::1111" {
+		t.Fatalf("got (%q, %q)", gotV4, gotV6)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls[netprobe.FamilyV4] != 1 || calls[netprobe.FamilyV6] != 1 {
+		t.Fatalf("calls = %v", calls)
+	}
+}
+
+func TestGetPublicIPv4AndV6ContextSkipsAbsentBearers(t *testing.T) {
+	tests := []struct {
+		name   string
+		v4     bool
+		calls  int32
+		wantV4 string
+	}{
+		{"v4 only", true, 1, "1.1.1.1"},
+		{"no bearer", false, 0, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			var wrongFamily atomic.Int32
+			manager := &Manager{
+				hasIPv4Bearer: func() bool { return tt.v4 },
+				hasIPv6Bearer: func() bool { return false },
+				publicIPProbeResult: func(_ context.Context, family netprobe.Family) (netprobe.Result, error) {
+					calls.Add(1)
+					if family != netprobe.FamilyV4 {
+						wrongFamily.Add(1)
+						return netprobe.Result{}, errors.New("unexpected probe family")
+					}
+					return netprobe.Result{IP: "1.1.1.1"}, nil
+				},
+			}
+			gotV4, gotV6 := manager.GetPublicIPv4AndV6Context(context.Background())
+			if gotV4 != tt.wantV4 || gotV6 != "" || calls.Load() != tt.calls || wrongFamily.Load() != 0 {
+				t.Fatalf("got (%q, %q), calls=%d, wrong-family=%d", gotV4, gotV6, calls.Load(), wrongFamily.Load())
+			}
+		})
+	}
+}
+
+func TestGetPublicIPv4AndV6ContextHonorsCancellation(t *testing.T) {
+	started := make(chan struct{})
+	manager := &Manager{
+		hasIPv4Bearer: func() bool { return true },
+		hasIPv6Bearer: func() bool { return false },
+		publicIPProbeResult: func(ctx context.Context, _ netprobe.Family) (netprobe.Result, error) {
+			close(started)
+			<-ctx.Done()
+			return netprobe.Result{}, ctx.Err()
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	go func() {
-		_ = server.ActivateAndServe()
+		defer close(done)
+		if v4, v6 := manager.GetPublicIPv4AndV6Context(ctx); v4 != "" || v6 != "" {
+			t.Errorf("canceled probe returned (%q, %q)", v4, v6)
+		}
 	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("probe ignored cancellation")
+	}
+}
 
-	t.Cleanup(func() {
-		_ = server.Shutdown()
+func TestPublicIPLookupRequiresBoundInterfaceBeforeResolver(t *testing.T) {
+	var calls atomic.Int32
+	manager := &Manager{publicIPLookup: func(context.Context, string) ([]string, error) {
+		calls.Add(1)
+		return []string{"8.8.8.8"}, nil
+	}}
+
+	_, err := manager.lookupPublicIPHostFamily(context.Background(), "probe.example", netprobe.FamilyV4)
+	if !errors.Is(err, netprobe.ErrInterfaceRequired) {
+		t.Fatalf("lookup error = %v, want ErrInterfaceRequired", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("unbound lookup called resolver %d times", got)
+	}
+}
+func TestPublicIPLookupCacheResetsOnNetworkChange(t *testing.T) {
+	var calls atomic.Int32
+	manager := &Manager{publicIPLookup: func(context.Context, string) ([]string, error) {
+		calls.Add(1)
+		return []string{"8.8.8.8"}, nil
+	}}
+	manager.cfg.Interface = "wwan0"
+	manager.resetPublicIPLookupCache()
+	for i := 0; i < 2; i++ {
+		ips, err := manager.lookupPublicIPHostFamily(context.Background(), "probe.example", netprobe.FamilyV4)
+		if err != nil || !reflect.DeepEqual(ips, []string{"8.8.8.8"}) {
+			t.Fatalf("lookup %d = %v, %v", i, ips, err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls before reset = %d", calls.Load())
+	}
+	manager.dispatchNetworkEvent(qmimanager.Event{Type: qmimanager.EventIPChanged})
+	if _, err := manager.lookupPublicIPHostFamily(context.Background(), "probe.example", netprobe.FamilyV4); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls after reset = %d", calls.Load())
+	}
+}
+
+func dnsAResponse(query *dns.Msg, address string) *dns.Msg {
+	resp := new(dns.Msg)
+	resp.SetReply(query)
+	resp.Answer = append(resp.Answer, &dns.A{
+		Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 30},
+		A:   net.ParseIP(address).To4(),
 	})
+	return resp
+}
 
-	return listener.Addr().String()
+func dnsAAAAResponse(query *dns.Msg, address string) *dns.Msg {
+	resp := new(dns.Msg)
+	resp.SetReply(query)
+	resp.Answer = append(resp.Answer, &dns.AAAA{
+		Hdr:  dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 30},
+		AAAA: net.ParseIP(address),
+	})
+	return resp
+}
+
+func concatStrings(groups ...[]string) []string {
+	var out []string
+	for _, group := range groups {
+		out = append(out, group...)
+	}
+	return out
 }

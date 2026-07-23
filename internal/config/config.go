@@ -14,6 +14,7 @@ const (
 	MBIMTransportAuto          = "auto"
 	MBIMTransportProxy         = "proxy"
 	MBIMTransportDirect        = "direct"
+	DefaultFreeDeviceLimit     = 5
 	DefaultWebhookTextTemplate = "{{device_label}} {{text}}"
 )
 
@@ -89,7 +90,7 @@ func ResolveIPFamily(in string) (enableV4 bool, enableV6 bool, err error) {
 
 type Config struct {
 	ConfigSchema    int            `mapstructure:"config_schema"`
-	FreeDeviceLimit int            `mapstructure:"free_device_limit"`
+	FreeDeviceLimit int            `mapstructure:"free_device_limit"` // 0 means unlimited
 	Server          ServerConfig   `mapstructure:"server"`
 	Devices         []DeviceConfig `mapstructure:"devices"`
 	Telegram        TelegramConfig `mapstructure:"telegram"`
@@ -97,12 +98,13 @@ type Config struct {
 	QQ              QQConfig       `mapstructure:"qq"`
 	Webhook         WebhookConfig  `mapstructure:"webhook"`
 
-	Bark     BarkConfig     `mapstructure:"bark"`
-	Email    EmailConfig    `mapstructure:"email"`
-	Pushplus PushplusConfig `mapstructure:"pushplus"`
-	Web      WebConfig      `mapstructure:"web"`
-	Proxy    ProxyConfig    `mapstructure:"proxy"`
-	VoWiFi   VoWiFiConfig   `mapstructure:"vowifi"`
+	Bark          BarkConfig          `mapstructure:"bark"`
+	Email         EmailConfig         `mapstructure:"email"`
+	Pushplus      PushplusConfig      `mapstructure:"pushplus"`
+	Web           WebConfig           `mapstructure:"web"`
+	Proxy         ProxyConfig         `mapstructure:"proxy"`
+	VoWiFi        VoWiFiConfig        `mapstructure:"vowifi"`
+	PublicIPProbe PublicIPProbeConfig `mapstructure:"public_ip_probe"`
 }
 
 // ProxyConfig 定义代理服务配置
