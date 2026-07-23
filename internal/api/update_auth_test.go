@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/zanescope/vohive/internal/config"
 	"github.com/zanescope/vohive/internal/updater"
 )
 
@@ -63,5 +64,75 @@ func TestUpdateRoutesRequireAuthentication(t *testing.T) {
 	}
 	if coordinator.calls != 0 {
 		t.Fatalf("unauthenticated requests reached update coordinator %d times", coordinator.calls)
+	}
+}
+
+func TestUpdateStartRequiresCurrentPasswordWithAValidSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	coordinator := &countingUpdateCoordinator{}
+	server := &Server{
+		auth:    config.WebConfig{Username: "admin", Password: "current-secret"},
+		updates: coordinator,
+	}
+	router := server.newRouter()
+	token, _, err := server.issueSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name     string
+		password string
+		status   int
+	}{
+		{name: "missing", status: http.StatusForbidden},
+		{name: "incorrect", password: "wrong-secret", status: http.StatusForbidden},
+		{name: "current", password: "current-secret", status: http.StatusAccepted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"channel":"stable","version":"v1.6.0","current_password":"` + test.password + `"}`
+			request := httptest.NewRequest(http.MethodPost, "/api/system/update/jobs", bytes.NewBufferString(body))
+			request.Header.Set("Authorization", "Bearer "+token)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("status = %d, want %d: %s", response.Code, test.status, response.Body.String())
+			}
+		})
+	}
+	if coordinator.calls != 1 {
+		t.Fatalf("update coordinator calls = %d, want only the reauthenticated request", coordinator.calls)
+	}
+}
+
+func TestUpdateReauthenticationFailuresAreRateLimited(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	coordinator := &countingUpdateCoordinator{}
+	server := &Server{
+		auth:    config.WebConfig{Username: "admin", Password: "current-secret"},
+		updates: coordinator,
+	}
+	router := server.newRouter()
+	token, _, err := server.issueSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= updateAuthorizationLimit+1; attempt++ {
+		request := httptest.NewRequest(http.MethodPost, "/api/system/update/jobs", bytes.NewBufferString(`{"channel":"stable","version":"v1.6.0","current_password":"wrong"}`))
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		want := http.StatusForbidden
+		if attempt > updateAuthorizationLimit {
+			want = http.StatusTooManyRequests
+		}
+		if response.Code != want {
+			t.Fatalf("attempt %d status = %d, want %d", attempt, response.Code, want)
+		}
+	}
+	if coordinator.calls != 0 {
+		t.Fatalf("rate-limited requests reached update coordinator %d times", coordinator.calls)
 	}
 }

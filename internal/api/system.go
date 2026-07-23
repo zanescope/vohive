@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"regexp"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/zanescope/vohive/internal/updater"
+	"github.com/zanescope/vohive/pkg/logger"
 )
 
 var updateJobIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -19,9 +22,15 @@ type updateCheckResponse struct {
 }
 
 type startUpdateRequest struct {
-	Channel updater.Channel `json:"channel"`
-	Version string          `json:"version"`
+	Channel         updater.Channel `json:"channel"`
+	Version         string          `json:"version"`
+	CurrentPassword string          `json:"current_password"`
 }
+
+const (
+	updateAuthorizationWindow = 5 * time.Minute
+	updateAuthorizationLimit  = 5
+)
 
 func newDefaultUpdateCoordinator() updater.Coordinator {
 	verifier, err := updater.DefaultSignatureVerifier()
@@ -89,12 +98,65 @@ func (s *Server) handleUpdateCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+func (s *Server) updateAuthorizationAttemptKey(c *gin.Context) string {
+	token := s.requestSessionToken(c)
+	if token == "" {
+		return "remote:" + c.Request.RemoteAddr
+	}
+	digest := sha256.Sum256([]byte(token))
+	return "session:" + hex.EncodeToString(digest[:])
+}
+
+func (s *Server) allowUpdateAuthorizationAttempt(key string, now time.Time) bool {
+	s.updateAuthMu.Lock()
+	defer s.updateAuthMu.Unlock()
+	if s.updateAuthAttempts == nil {
+		s.updateAuthAttempts = make(map[string]loginAttempt)
+	}
+	attempt := s.updateAuthAttempts[key]
+	if attempt.ResetAt.IsZero() || now.After(attempt.ResetAt) {
+		attempt = loginAttempt{ResetAt: now.Add(updateAuthorizationWindow)}
+	}
+	if attempt.Count >= updateAuthorizationLimit {
+		s.updateAuthAttempts[key] = attempt
+		return false
+	}
+	attempt.Count++
+	s.updateAuthAttempts[key] = attempt
+	return true
+}
+
+func (s *Server) clearUpdateAuthorizationAttempts(key string) {
+	s.updateAuthMu.Lock()
+	delete(s.updateAuthAttempts, key)
+	s.updateAuthMu.Unlock()
+}
+
 func (s *Server) handleStartUpdateJob(c *gin.Context) {
 	var body startUpdateRequest
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": "invalid_request", "error": "channel and exact version must be valid JSON fields"})
+		c.JSON(http.StatusBadRequest, gin.H{"code": "invalid_request", "error": "channel, exact version, and current password must be valid JSON fields"})
 		return
 	}
+	clientIP := c.ClientIP()
+	authorizationKey := s.updateAuthorizationAttemptKey(c)
+	if !s.allowUpdateAuthorizationAttempt(authorizationKey, time.Now()) {
+		logger.Warn("系统更新二次认证已限速", "username", s.auth.Username, "ip", clientIP, "request_id", requestID(c))
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"code":  "update_reauthentication_rate_limited",
+			"error": "too many update authorization attempts; try again later",
+		})
+		return
+	}
+	if body.CurrentPassword == "" || !checkPassword(s.auth.Password, body.CurrentPassword) {
+		logger.Warn("系统更新二次认证失败", "username", s.auth.Username, "ip", clientIP, "request_id", requestID(c))
+		c.JSON(http.StatusForbidden, gin.H{
+			"code":  "update_reauthentication_required",
+			"error": "the current administrator password is required to start an update",
+		})
+		return
+	}
+	s.clearUpdateAuthorizationAttempts(authorizationKey)
 	if body.Channel != "" {
 		channel, err := updater.ParseChannel(string(body.Channel))
 		if err != nil {
@@ -107,15 +169,25 @@ func (s *Server) handleStartUpdateJob(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "exact_version_required", "error": "an exact checked version is required"})
 		return
 	}
+	version := strings.TrimSpace(body.Version)
+	auditFields := []any{
+		"username", s.auth.Username,
+		"ip", clientIP,
+		"request_id", requestID(c),
+		"channel", body.Channel,
+	}
+	logger.Info("系统更新请求已通过二次认证", auditFields...)
 	state, err := s.updateCoordinator().Start(c.Request.Context(), updater.UpdateRequest{
 		Schema:  1,
 		Channel: body.Channel,
-		Version: strings.TrimSpace(body.Version),
+		Version: version,
 	})
 	if err != nil {
+		logger.Warn("系统更新任务启动失败", append(auditFields, "err", err)...)
 		writeUpdateError(c, err)
 		return
 	}
+	logger.Info("系统更新任务已接受", append(auditFields, "version", version, "job_id", state.ID)...)
 	c.JSON(http.StatusAccepted, state)
 }
 

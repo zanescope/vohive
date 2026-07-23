@@ -307,7 +307,7 @@ export const systemService = {
       return res.data
     })
   },
-  startUpdate(payload: { channel: UpdateChannel; version: string }) {
+  startUpdate(payload: { channel: UpdateChannel; version: string; current_password: string }) {
     return callService(async () => {
       const res = await api.post<UpdateTransaction>('/system/update/jobs', payload)
       return res.data
