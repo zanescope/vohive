@@ -88,6 +88,9 @@ type Server struct {
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
 
+	updateAuthMu       sync.Mutex
+	updateAuthAttempts map[string]loginAttempt
+
 	shutdownCh chan struct{}
 }
 
@@ -140,20 +143,21 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 		configPath = "config/config.yaml"
 	}
 	s := &Server{
-		cfg:           cfg.Server,
-		fullCfg:       cfg,
-		auth:          cfg.Web,
-		pool:          pool,
-		fs:            fs,
-		configPath:    configPath,
-		proxyMgr:      proxyMgr,
-		voiceGW:       voiceGW,
-		notifyMgr:     notifyMgr,
-		proxyRepo:     repo.NewDBRepo(),
-		websheets:     vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
-		updates:       newDefaultUpdateCoordinator(),
-		loginAttempts: make(map[string]loginAttempt),
-		shutdownCh:    make(chan struct{}),
+		cfg:                cfg.Server,
+		fullCfg:            cfg,
+		auth:               cfg.Web,
+		pool:               pool,
+		fs:                 fs,
+		configPath:         configPath,
+		proxyMgr:           proxyMgr,
+		voiceGW:            voiceGW,
+		notifyMgr:          notifyMgr,
+		proxyRepo:          repo.NewDBRepo(),
+		websheets:          vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
+		updates:            newDefaultUpdateCoordinator(),
+		loginAttempts:      make(map[string]loginAttempt),
+		updateAuthAttempts: make(map[string]loginAttempt),
+		shutdownCh:         make(chan struct{}),
 	}
 
 	return s

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/zanescope/vohive/internal/config"
 	"github.com/zanescope/vohive/internal/updater"
 )
 
@@ -44,7 +45,10 @@ func (f *fakeUpdateCoordinator) State(context.Context, string) (updater.Transact
 
 func updateHandlerRouter(coordinator updater.Coordinator) *gin.Engine {
 	gin.SetMode(gin.TestMode)
-	server := &Server{updates: coordinator}
+	server := &Server{
+		auth:    config.WebConfig{Username: "admin", Password: "current-secret"},
+		updates: coordinator,
+	}
 	router := gin.New()
 	router.GET("/capabilities", server.handleUpdateCapabilities)
 	router.GET("/check", server.handleUpdateCheck)
@@ -108,7 +112,7 @@ func TestStartUpdateJobUsesExactVersionWithoutChangingChannel(t *testing.T) {
 		startState: updater.TransactionState{Schema: 1, ID: "job-1", Phase: updater.PhaseChecking},
 	}
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/jobs", bytes.NewBufferString(`{"channel":"stable","version":"v1.6.0"}`))
+	request := httptest.NewRequest(http.MethodPost, "/jobs", bytes.NewBufferString(`{"channel":"stable","version":"v1.6.0","current_password":"current-secret"}`))
 	request.Header.Set("Content-Type", "application/json")
 	updateHandlerRouter(fake).ServeHTTP(response, request)
 
@@ -123,7 +127,7 @@ func TestStartUpdateJobUsesExactVersionWithoutChangingChannel(t *testing.T) {
 func TestStartUpdateJobReportsConcurrentTransaction(t *testing.T) {
 	fake := &fakeUpdateCoordinator{startErr: updater.ErrUpdateLocked}
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/jobs", bytes.NewBufferString(`{"channel":"stable","version":"v1.6.0"}`))
+	request := httptest.NewRequest(http.MethodPost, "/jobs", bytes.NewBufferString(`{"channel":"stable","version":"v1.6.0","current_password":"current-secret"}`))
 	request.Header.Set("Content-Type", "application/json")
 	updateHandlerRouter(fake).ServeHTTP(response, request)
 
