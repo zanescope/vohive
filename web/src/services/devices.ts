@@ -1,6 +1,6 @@
 import { api } from '../stores/auth'
 import { callService } from './http'
-import type { CarrierWebsheetInfo, DeviceConfigDTO, DiscoveredDevice, EsimNotificationItem, EsimOverviewResponse, EsimSpaceDelta } from '../types/api'
+import type { CarrierWebsheetInfo, DeviceConfigDTO, DiscoveredDevice, EsimNotificationItem, EsimOverviewResponse, EsimSpaceDelta, PhoneNumberSource } from '../types/api'
 import type { DeviceDetailVM, DeviceListVM } from '../types/view-model'
 import axios from 'axios'
 
@@ -53,6 +53,15 @@ type UssdResult = {
 type UssdResponse = {
   result?: UssdResult
   channel?: string
+}
+
+export type PhoneNumberActionResponse = {
+  status?: string
+  local_phone?: string
+  local_phone_source?: PhoneNumberSource
+  acquired?: boolean
+  channel?: string
+  message?: string
 }
 
 const ESIM_BUSY_CODE = 'ESIM_BUSY'
@@ -135,6 +144,18 @@ export const devicesService = {
     return callService(async () => {
       await api.post(`/devices/${id}/actions/refresh`)
       return true
+    })
+  },
+  refreshPhoneNumber(id: string) {
+    return callService(async () => {
+      const res = await api.post<PhoneNumberActionResponse>(`/devices/${id}/actions/refresh-phone-number`)
+      return res.data
+    })
+  },
+  setManualPhoneNumber(id: string, manualPhoneNumber: string) {
+    return callService(async () => {
+      const res = await api.patch<PhoneNumberActionResponse>(`/devices/${id}/phone-number`, { manual_phone_number: manualPhoneNumber })
+      return res.data
     })
   },
   setFlightMode(id: string, flightModeEnabled: boolean) {

@@ -18,14 +18,30 @@ const props = defineProps<{
   trafficMinuteRx: string
   trafficMinuteTx: string
   e911Starting: boolean
+  phoneNumberRefreshing: boolean
+  phoneNumberSaving: boolean
 }>()
 
 const emit = defineEmits<{
   'setup-e911': []
   'refresh': []
+  'refresh-phone-number': []
+  'edit-phone-number': []
 }>()
 
 const showSensitive = useSensitiveVisibility()
+
+const phoneNumberSourceLabel = computed(() => {
+  switch (props.device?.local_phone_source) {
+    case 'manual': return '\u624b\u52a8'
+    case 'vowifi': return 'VoWiFi'
+    case 'modem': return '\u6a21\u7ec4'
+    case 'legacy': return '\u5386\u53f2'
+    default: return ''
+  }
+})
+
+const phoneNumberActionsDisabled = computed(() => !isControlOnline(props.device))
 const showOperatorSelection = ref(false)
 
 const trafficStateLabel = computed(() => {
@@ -332,6 +348,29 @@ const networkPanelMessage = computed(() => {
         <FieldRow label="ICCID"     :value="device?.modem?.iccid"  :sensitive="!showSensitive" monospace copyable />
         <FieldRow label="IMSI"      :value="device?.modem?.imsi"   :sensitive="!showSensitive" monospace copyable />
         <FieldRow label="本机号码" :value="device?.local_phone || '--'"  :sensitive="!showSensitive" monospace copyable />
+        <div class="flex items-center justify-end gap-1.5">
+          <el-tag v-if="phoneNumberSourceLabel" size="small" type="info" effect="plain">
+            {{ phoneNumberSourceLabel }}
+          </el-tag>
+          <el-button
+            size="small"
+            link
+            :loading="phoneNumberRefreshing"
+            :disabled="phoneNumberActionsDisabled || phoneNumberSaving"
+            @click="emit('refresh-phone-number')"
+          >
+            &#33719;&#21462;
+          </el-button>
+          <el-button
+            size="small"
+            link
+            :loading="phoneNumberSaving"
+            :disabled="phoneNumberActionsDisabled || phoneNumberRefreshing"
+            @click="emit('edit-phone-number')"
+          >
+            &#25163;&#21160;
+          </el-button>
+        </div>
         <div v-if="device?.e911_setup_available" class="flex justify-between gap-3">
           <span class="text-gray-500">E911地址</span>
           <el-button

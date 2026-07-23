@@ -120,6 +120,8 @@ type Worker struct {
 	cacheMu             sync.RWMutex
 	state               deviceStateStore
 	publicIP            publicIPRuntime
+	transientATOnce     sync.Once
+	transientATGate     chan struct{}
 	rotateMu            sync.Mutex // 防止并发换 IP
 	consecutiveFailures int        // 连续切换失败次数
 
@@ -294,6 +296,25 @@ func (p *Pool) registerWorkerStarting(worker *Worker) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if current := p.workers[worker.ID]; current != nil && current != worker {
+		return fmt.Errorf("设备已存在")
+	}
+	p.workers[worker.ID] = worker
+	if worker.generation == 0 {
+		worker.generation = p.nextWorkerGenerationLocked(worker.ID)
+	}
+	return nil
+}
+
+func (p *Pool) registerWorkerStartingForAttempt(worker *Worker, attempt uint64) error {
+	if p == nil || worker == nil || strings.TrimSpace(worker.ID) == "" {
+		return fmt.Errorf("worker_nil")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rebuildAttempt[worker.ID] != attempt || !p.rebuilding[worker.ID] {
+		return fmt.Errorf("设备 %s 启动流程已失效", worker.ID)
+	}
 	if current := p.workers[worker.ID]; current != nil && current != worker {
 		return fmt.Errorf("设备已存在")
 	}
@@ -525,12 +546,29 @@ type liveSIMIdentityRefreshResult struct {
 	IMSI  string
 }
 
+type LiveSIMIdentity struct {
+	ICCID string
+	IMSI  string
+}
+
+func (w *Worker) RefreshIdentityLiveVerified(ctx context.Context, reason string) (LiveSIMIdentity, error) {
+	result, err := w.refreshIdentityLiveWithOptions(ctx, reason, true)
+	return LiveSIMIdentity{ICCID: result.ICCID, IMSI: result.IMSI}, err
+}
+
 func (w *Worker) RefreshIdentityLive(ctx context.Context, reason string) error {
 	_, err := w.refreshIdentityLive(ctx, reason)
 	return err
 }
 
 func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSIMIdentityRefreshResult, error) {
+	return w.refreshIdentityLiveWithOptions(ctx, reason, false)
+}
+
+// refreshIdentityLiveWithOptions replaces both cached SIM identifiers only for
+// verified callers. This prevents a partial live read from pairing a new IMSI
+// with a stale ICCID (or vice versa) in overview and persistence paths.
+func (w *Worker) refreshIdentityLiveWithOptions(ctx context.Context, reason string, replaceSIMIdentity bool) (liveSIMIdentityRefreshResult, error) {
 	if w == nil {
 		return liveSIMIdentityRefreshResult{}, fmt.Errorf("worker_nil")
 	}
@@ -600,6 +638,9 @@ func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSI
 		}
 	}
 	result := liveSIMIdentityRefreshResult{ICCID: iccid, IMSI: imsi}
+	if replaceSIMIdentity && iccid == "" && imsi == "" {
+		return result, fmt.Errorf("live_identity_empty")
+	}
 	if iccid == "" && imsi == "" && nativeSPN == "" && !hasSIMMetadata(simMetadata) {
 		return result, fmt.Errorf("live_identity_empty")
 	}
@@ -618,12 +659,18 @@ func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSI
 		w.cacheMu.Unlock()
 		return result, err
 	}
-	identityChangedForSPN := (iccid != "" && iccid != strings.TrimSpace(w.state.Identity.ICCID)) ||
-		(imsi != "" && imsi != strings.TrimSpace(w.state.Identity.IMSI))
-	if iccid != "" {
+	currentICCID := strings.TrimSpace(w.state.Identity.ICCID)
+	currentIMSI := strings.TrimSpace(w.state.Identity.IMSI)
+	identityChangedForSPN := (iccid != "" && iccid != currentICCID) ||
+		(imsi != "" && imsi != currentIMSI)
+	if replaceSIMIdentity {
+		identityChangedForSPN = iccid != currentICCID || imsi != currentIMSI
+		w.state.Identity.ICCID = iccid
+		w.state.Identity.IMSI = imsi
+	} else if iccid != "" {
 		w.state.Identity.ICCID = iccid
 	}
-	if imsi != "" {
+	if !replaceSIMIdentity && imsi != "" {
 		w.state.Identity.IMSI = imsi
 	}
 	if nativeSPN != "" {
@@ -1117,7 +1164,7 @@ func (p *Pool) endRebuildAttemptIfCurrent(deviceID string, attempt uint64) {
 
 // startBootstrapWatchdog 为单次 AddWorkerFromConfig 执行设置硬上限看门狗。
 // 如果启动流程在 deadline 内既没有成功完成、也没有被更新的尝试取代，
-// 看门狗会强制释放 rebuilding 标记，让设备重新可以被重试或删除；
+// 看门狗会作废本次 attempt 并释放 rebuilding 标记，让设备重新可以被重试或删除；
 // 调用方应在自身正常返回时 close 掉返回的 stop channel 以避免看门狗误触发日志。
 func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline time.Duration) chan struct{} {
 	stop := make(chan struct{})
@@ -1134,11 +1181,12 @@ func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline 
 		p.mu.Lock()
 		isCurrent := p.rebuildAttempt[deviceID] == attempt
 		if isCurrent {
+			p.rebuildAttempt[deviceID]++
 			delete(p.rebuilding, deviceID)
 		}
 		p.mu.Unlock()
 		if isCurrent {
-			logger.Warn("QMI worker 启动看门狗超时，强制释放 rebuilding 标记，设备可能仍在后台初始化",
+			logger.Warn("QMI worker 启动看门狗超时，作废当前 attempt 并释放 rebuilding 标记",
 				"device", deviceID,
 				"deadline", deadline.String())
 		}
@@ -1314,12 +1362,13 @@ func (p *Pool) StartAll() error {
 	p.startPoolBackgroundServicesOnce()
 
 	devices := append([]config.DeviceConfig(nil), p.cfg.Devices...)
+	limit := p.FreeDeviceLimit()
 	for i := range devices {
 		devCfg := devices[i]
-		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", devCfg.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 		go p.startConfiguredDeviceBootstrap(devCfg, "start_all")
@@ -1394,13 +1443,14 @@ func (p *Pool) startAllSynchronousLegacy() error {
 	}
 
 	var firstErr error
+	limit := p.FreeDeviceLimit()
 	for i := range p.cfg.Devices {
 		// 使用指针以便修改配置
 		devCfg := &p.cfg.Devices[i]
-		if !FreeDeviceLimitAllowsConfiguredDevice(p.cfg.Devices, devCfg.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(p.cfg.Devices, devCfg.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", devCfg.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 		var matchedModem *QMIDevice
@@ -1983,6 +2033,7 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	hardware := p.collectRescanHardware(discovered, liveWorkerIndex)
 	managed := config.ListDevices()
 	resolved := ResolveDeviceIdentities(hardware, managed)
+	limit := p.FreeDeviceLimit()
 
 	if len(resolved.Degraded) > 0 || len(resolved.Unmatched) > 0 {
 		logger.Debug("rescan 发现未匹配或退化设备", "degraded", len(resolved.Degraded), "unmatched", len(resolved.Unmatched))
@@ -1990,10 +2041,10 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 
 	for _, pair := range resolved.Matched {
 		md := pair.Config
-		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", md.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 
@@ -2167,7 +2218,7 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	}
 
 	for _, md := range resolved.Offline {
-		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID, limit) {
 			continue
 		}
 		worker := p.GetWorker(md.ID)
@@ -2207,8 +2258,9 @@ func (p *Pool) RebuildWorker(deviceID string) error {
 	if err != nil || cfg == nil {
 		return fmt.Errorf("读取设备 %s 配置失败: %w", deviceID, err)
 	}
-	if !FreeDeviceLimitAllowsConfiguredDevice(config.ListDevices(), cfg.ID) {
-		return fmt.Errorf("%s", FreeDeviceWorkerLimitMessage())
+	limit := p.FreeDeviceLimit()
+	if !FreeDeviceLimitAllowsConfiguredDevice(config.ListDevices(), cfg.ID, limit) {
+		return fmt.Errorf("%s", FreeDeviceWorkerLimitMessage(limit))
 	}
 
 	// 先停止 VoWiFi（如有），并让任何正在启动中的旧实例失效。
@@ -2781,38 +2833,27 @@ func (p *Pool) PersistIdentityState(worker *Worker) {
 	if worker == nil {
 		return
 	}
-
+	p.PersistIdentityOnly(worker)
 	status := worker.ProjectDeviceStatus()
-	iccid := strings.TrimSpace(status.ICCID)
-	imsi := strings.TrimSpace(status.IMSI)
-	if iccid == "" {
-		return
-	}
 	imei := strings.TrimSpace(status.IMEI)
-	operator := strings.TrimSpace(status.Operator)
-
-	if imei == "" {
-		logger.Warn(fmt.Sprintf("[%s] 无法同步设备 SIM 身份：IMEI 为空", worker.ID))
+	imsi := strings.TrimSpace(status.IMSI)
+	iccid := strings.TrimSpace(status.ICCID)
+	if imsi == "" && iccid == "" {
 		return
 	}
-
-	if err := db.UpsertSIMCard(iccid, imsi, "", operator, &imei); err != nil {
-		logger.Warn(fmt.Sprintf("[%s] 更新 SIM 卡信息失败", worker.ID), "err", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := p.PersistPhoneNumber(ctx, worker, imsi, iccid, false)
+	if result.Err != nil {
+		logger.Debug("phone number sync failed", "device", worker.ID, "channel", result.Channel, "err", result.Err)
 	}
-	if err := db.UpdateDeviceCurrentSIM(imei, &iccid); err != nil {
-		logger.Warn(fmt.Sprintf("[%s] 更新设备 SIM 关联失败", worker.ID), "err", err)
+	if imei != "" && iccid != "" {
+		logger.Info(fmt.Sprintf("[%s] \u8bbe\u5907 SIM \u8eab\u4efd\u5df2\u540c\u6b65\u5230\u6570\u636e\u5e93", worker.ID),
+			"imei", imei, "iccid", iccid, "backend", func() string {
+				if worker.Backend != nil {
+					return worker.Backend.Mode()
+				}
+				return "none"
+			}())
 	}
-	if phone := strings.TrimSpace(worker.getPhoneNumberWithContext(context.Background())); phone != "" {
-		if err := db.RecordModemPhoneNumber(imsi, iccid, phone); err != nil {
-			logger.Warn(fmt.Sprintf("[%s] 更新调制解调器本机号码失败", worker.ID), "err", err)
-		}
-	}
-
-	logger.Info(fmt.Sprintf("[%s] 设备 SIM 身份已同步到数据库", worker.ID),
-		"imei", imei, "iccid", iccid, "backend", func() string {
-			if worker.Backend != nil {
-				return worker.Backend.Mode()
-			}
-			return "none"
-		}())
 }

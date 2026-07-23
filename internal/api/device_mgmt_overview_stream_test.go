@@ -83,6 +83,14 @@ func TestOverviewStreamEmitVersionTracksRuntimeBusinessState(t *testing.T) {
 			name: "runtime disappeared",
 			item: deviceMgmtOverviewLiteItem{VoWiFiActive: true},
 		},
+		{
+			name: "local phone changed",
+			item: deviceMgmtOverviewLiteItem{VoWiFiActive: true, LocalPhone: "+447700904001", VoWiFiRuntime: &voWiFiRuntimeDTO{Phase: "registering", TunnelReady: true}},
+		},
+		{
+			name: "local phone source changed",
+			item: deviceMgmtOverviewLiteItem{VoWiFiActive: true, LocalPhoneSource: "manual", VoWiFiRuntime: &voWiFiRuntimeDTO{Phase: "registering", TunnelReady: true}},
+		},
 	}
 
 	for _, tc := range tests {

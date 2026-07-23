@@ -17,6 +17,7 @@ export const AT_TEMPLATES: ATTemplateGroup[] = [
       { label: 'IMEI (AT+CGSN)', value: 'AT+CGSN' },
       { label: 'ICCID (AT+QCCID)', value: 'AT+QCCID' },
       { label: 'IMSI (AT+CIMI)', value: 'AT+CIMI' },
+      { label: '\u672c\u673a\u53f7\u7801 (AT+CNUM)', value: 'AT+CNUM' },
       { label: '信号 (AT+CSQ)', value: 'AT+CSQ' },
       { label: '运营商 (AT+COPS?)', value: 'AT+COPS?' },
       { label: '网络模式 (AT+QNWINFO)', value: 'AT+QNWINFO' },
