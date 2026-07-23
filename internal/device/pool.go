@@ -114,6 +114,7 @@ type Worker struct {
 	stop             chan struct{}
 	stopOnce         sync.Once
 	resourceStopOnce sync.Once
+	retired          atomic.Bool
 
 	cachedIP            string
 	cachedPublicIPv6    string
@@ -301,6 +302,35 @@ func (p *Pool) currentWorkerGeneration(deviceID string) uint64 {
 	return generation
 }
 
+func (p *Pool) isCurrentWorker(worker *Worker) bool {
+	if p == nil || worker == nil || worker.retired.Load() {
+		return false
+	}
+	p.mu.RLock()
+	current := p.workers[worker.ID]
+	p.mu.RUnlock()
+	return current == worker
+}
+
+// acceptsWorkerCallback also permits callbacks fired during startup, after a generation
+// has been assigned but before the Worker is published in the pool.
+func (p *Pool) acceptsWorkerCallback(worker *Worker, generation uint64) bool {
+	if p == nil || worker == nil || worker.retired.Load() {
+		return false
+	}
+	if generation != 0 && worker.generation != 0 && generation != worker.generation {
+		return false
+	}
+	p.mu.RLock()
+	current := p.workers[worker.ID]
+	currentGeneration := p.workerGenerations[worker.ID]
+	p.mu.RUnlock()
+	if generation != 0 && currentGeneration != 0 && generation != currentGeneration {
+		return false
+	}
+	return current == nil || current == worker
+}
+
 func (p *Pool) registerWorkerStarting(worker *Worker) error {
 	if p == nil || worker == nil || strings.TrimSpace(worker.ID) == "" {
 		return fmt.Errorf("worker_nil")
@@ -343,6 +373,7 @@ func (p *Pool) removeWorkerRegistrationIfCurrent(worker *Worker) {
 	p.mu.Lock()
 	if current := p.workers[worker.ID]; current == worker {
 		delete(p.workers, worker.ID)
+		worker.retired.Store(true)
 	}
 	p.mu.Unlock()
 }
@@ -541,7 +572,7 @@ func (w *Worker) RefreshRuntime(ctx context.Context, reason string) error {
 	}
 
 	status := w.collectRuntimeStatus(ctx, reason)
-	healthy := w.IsDeviceHealthy()
+	healthy := w.HealthSnapshot().State == HealthStateHealthy
 
 	w.cacheMu.Lock()
 	updated := w.mergeRuntimeStateLocked(status, healthy)
@@ -713,12 +744,19 @@ func (p *Pool) bindQMIStateIndications(worker *Worker) {
 	if worker == nil || worker.QMICore == nil {
 		return
 	}
+	generation := worker.generation
 
 	worker.QMICore.OnSimStatusChanged(func() {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		logger.Info("[事件驱动] SIM 状态变化", "device", worker.ID)
 		p.handleSIMStatusEvent(worker.ID, "qmi_sim_status", nil, "")
 		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "post_switch_qmi_sim_status")
 		go func() {
+			if !p.acceptsWorkerCallback(worker, generation) {
+				return
+			}
 			if err := p.applyNetworkPreference(worker); err != nil {
 				logger.Warn("SIM 状态变化后 QMI 网络偏好协调失败", "device", worker.ID, "err", err)
 			}
@@ -730,8 +768,12 @@ func (p *Pool) bindMBIMStateIndications(worker *Worker) {
 	if worker == nil || worker.MBIMCore == nil {
 		return
 	}
+	generation := worker.generation
 
 	worker.MBIMCore.OnSimStatusChanged(func() {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		logger.Info("[事件驱动] MBIM SIM 状态变化", "device", worker.ID)
 		p.handleSIMStatusEvent(worker.ID, "mbim_sim_status", nil, "")
 		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "post_switch_mbim_sim_status")
@@ -761,7 +803,11 @@ func (p *Pool) bindMBIMSlotIndications(worker *Worker) {
 	if worker == nil || worker.MBIMCore == nil {
 		return
 	}
+	generation := worker.generation
 	worker.MBIMCore.OnSlotStatus(func(slotIndex, state uint32) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		logger.Debug("收到 MBIM 卡槽状态指示", "device", worker.ID, "slot", slotIndex, "state", state)
 		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "mbim_slot_status")
 	})
@@ -771,10 +817,17 @@ func (p *Pool) bindMBIMHealthIndications(worker *Worker) {
 	if worker == nil || worker.MBIMCore == nil {
 		return
 	}
+	generation := worker.generation
 	worker.MBIMCore.OnRecoveryExhausted(func(reason string, err error) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		p.maybeScheduleTransportRebuild(worker, HealthLayerMBIM, reason, err)
 	})
 	worker.MBIMCore.OnHealth(func(event mbimcore.HealthEvent) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		switch event.State {
 		case mbimcore.HealthEventHealthy:
 			worker.RecordWatchdogEvent(WatchdogEvent{
@@ -814,7 +867,11 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 	if worker == nil || worker.QMICore == nil {
 		return
 	}
+	generation := worker.generation
 	worker.QMICore.OnRecoveryExhausted(func(reason string, err error) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		p.maybeScheduleTransportRebuild(worker, HealthLayerQMI, reason, err)
 	})
 	worker.QMICore.OnIPChanged(func() {
@@ -830,6 +887,9 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		p.invalidatePublicIPState(worker, true)
 	})
 	worker.QMICore.OnHealthEvent(func(event qmicore.HealthEvent) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		switch event.State {
 		case qmicore.HealthEventHealthy:
 			worker.RecordWatchdogEvent(WatchdogEvent{
@@ -1077,6 +1137,7 @@ func (p *Pool) RemoveWorker(deviceID string) error {
 	alreadyRebuilding := p.rebuilding[deviceID]
 	if worker != nil {
 		delete(p.workers, deviceID)
+		worker.retired.Store(true)
 		if !alreadyRebuilding {
 			p.rebuilding[deviceID] = true
 		}
@@ -1660,7 +1721,7 @@ func (p *Pool) startAllSynchronousLegacy() error {
 
 		if qmiCore != nil {
 			qmiCore.SetOnConnect(func() {
-				if !p.isCurrentPublicIPWorker(w) {
+				if !p.acceptsWorkerCallback(w, w.generation) {
 					return
 				}
 				p.markQMIControlRecovered(w, "qmi_connected")
@@ -1678,6 +1739,9 @@ func (p *Pool) startAllSynchronousLegacy() error {
 		if backendUsesATRuntime(bMode) {
 			// 注册掉线回调：串口断开后延迟等待模块重启，然后自动重连
 			m.SetOnDisconnectWithReason(func(reason string) {
+				if !p.acceptsWorkerCallback(w, w.generation) {
+					return
+				}
 				devID := w.ID
 				if strings.TrimSpace(reason) == "" {
 					reason = "modem_disconnect"

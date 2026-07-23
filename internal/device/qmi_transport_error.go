@@ -63,7 +63,7 @@ func (p *Pool) handleTransportRecoveryExhausted(worker *Worker, generation uint6
 // scheduling a worker rebuild. Over-cap devices are marked Failed instead of
 // looping rebuilds.
 func (p *Pool) maybeScheduleTransportRebuild(worker *Worker, layer HealthLayer, reason string, err error) bool {
-	if p == nil || worker == nil {
+	if p == nil || worker == nil || !p.acceptsWorkerCallback(worker, worker.generation) {
 		return false
 	}
 	if p.transportRecovery != nil && !p.transportRecovery.AllowRebuild(worker.ID) {

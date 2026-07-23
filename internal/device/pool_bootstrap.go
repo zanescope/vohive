@@ -484,6 +484,9 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 	if qmiCore != nil {
 		var resetRecoveryRunning atomic.Bool
 		qmiCore.OnModemReset(func() {
+			if !p.acceptsWorkerCallback(w, w.generation) {
+				return
+			}
 			if p.lifecycle != nil {
 				p.lifecycle.BeginRecovery(w.ID, LifecyclePhaseRecovering, "qmi_modem_reset", qmiLifecycleRecoveryTTL)
 			}
@@ -540,7 +543,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 		})
 
 		qmiCore.SetOnConnect(func() {
-			if !p.isCurrentPublicIPWorker(w) {
+			if !p.acceptsWorkerCallback(w, w.generation) {
 				return
 			}
 			p.markQMIControlRecovered(w, "qmi_connected")
@@ -551,6 +554,9 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 
 	if backendUsesATRuntime(backendMode) {
 		m.SetOnDisconnectWithReason(func(reason string) {
+			if !p.acceptsWorkerCallback(w, w.generation) {
+				return
+			}
 			devID := w.ID
 			if strings.TrimSpace(reason) == "" {
 				reason = "modem_disconnect"
