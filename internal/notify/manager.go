@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/zanescope/vohive/internal/config"
+	"github.com/zanescope/vohive/internal/db"
 	"github.com/zanescope/vohive/internal/device"
 	"github.com/zanescope/vohive/pkg/logger"
 )
@@ -24,6 +25,10 @@ type NotificationContext struct {
 	DeviceName string
 	Timestamp  time.Time
 }
+
+const unknownNotificationLocalPhone = "--"
+
+type notificationPhoneLookup func(imsi, iccid string) (string, error)
 
 func (c NotificationContext) DeviceLabel() string {
 	id := strings.TrimSpace(c.DeviceID)
@@ -209,8 +214,15 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 	if source == "" {
 		source = "蜂窝"
 	}
-	msg := fmt.Sprintf("收到新短信 / %s\n设备  %s\n号码  %s\n时间  %s\n内容  %s",
-		source, deviceID, sender, timestamp.Format("2006-01-02 15:04:05"), content)
+	deviceName := m.resolveDeviceName(deviceID)
+	msg := formatSMSNotification(
+		notificationDeviceDisplayName(deviceID, deviceName),
+		m.resolveDeviceLocalPhone(deviceID),
+		sender,
+		content,
+		source,
+		timestamp,
+	)
 
 	logger.Info("开始发送短信通知",
 		"event", "sms_received",
@@ -222,9 +234,66 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 		Event:      "sms_received",
 		Text:       msg,
 		DeviceID:   deviceID,
-		DeviceName: m.resolveDeviceName(deviceID),
+		DeviceName: deviceName,
 		Timestamp:  timestamp,
 	})
+}
+
+func formatSMSNotification(deviceDisplayName, localPhone, sender, content, source string, timestamp time.Time) string {
+	localPhone = strings.TrimSpace(localPhone)
+	if localPhone == "" {
+		localPhone = unknownNotificationLocalPhone
+	}
+	return fmt.Sprintf("收到新短信 / %s\n设备  %s\n本机  %s\n号码  %s\n时间  %s\n内容  %s",
+		source, deviceDisplayName, localPhone, sender, timestamp.Format("2006-01-02 15:04:05"), content)
+}
+
+func notificationDeviceDisplayName(deviceID, deviceName string) string {
+	if name := strings.TrimSpace(deviceName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(deviceID)
+}
+
+func resolveNotificationLocalPhone(imsi, iccid string, identityUsable bool, lookup notificationPhoneLookup) (string, error) {
+	if !identityUsable || lookup == nil {
+		return unknownNotificationLocalPhone, nil
+	}
+	imsi = strings.TrimSpace(imsi)
+	iccid = strings.TrimSpace(iccid)
+	if imsi == "" && iccid == "" {
+		return unknownNotificationLocalPhone, nil
+	}
+	phone, err := lookup(imsi, iccid)
+	if err != nil {
+		return unknownNotificationLocalPhone, err
+	}
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return unknownNotificationLocalPhone, nil
+	}
+	return phone, nil
+}
+
+func (m *Manager) resolveDeviceLocalPhone(deviceID string) string {
+	if m == nil || m.pool == nil {
+		return unknownNotificationLocalPhone
+	}
+	worker := m.pool.GetWorker(strings.TrimSpace(deviceID))
+	if worker == nil {
+		return unknownNotificationLocalPhone
+	}
+	imsi, iccid, identityUsable := worker.SIMIdentityForPhoneLookup()
+	phone, err := resolveNotificationLocalPhone(
+		imsi,
+		iccid,
+		identityUsable,
+		db.GetPhoneNumberByIMSIOrICCID,
+	)
+	if err != nil {
+		logger.Warn("读取通知本机号码失败", "device", deviceID, "err", err)
+	}
+	return phone
 }
 
 // NotifyRaw 发送原始文本通知到所有渠道
@@ -238,18 +307,14 @@ func (m *Manager) NotifyRaw(msg string) {
 
 // NotifyIPRotated 实现 device.Notifier 接口 — IP 切换通知
 func (m *Manager) NotifyIPRotated(deviceID, oldIP, newIP string, duration time.Duration) {
-	displayName := deviceID
-	if m.pool != nil {
-		if worker := m.pool.GetWorker(deviceID); worker != nil && worker.Config.Name != "" {
-			displayName = fmt.Sprintf("%s (%s)", worker.Config.Name, deviceID)
-		}
-	}
+	deviceName := m.resolveDeviceName(deviceID)
+	displayName := notificationDeviceDisplayName(deviceID, deviceName)
 	msg := fmt.Sprintf("公网切换 / 完成\n设备    %s\n旧 IP   %s\n新 IP   %s\n耗时    %s", displayName, oldIP, newIP, duration.String())
 	m.broadcastWithContext(NotificationContext{
 		Event:      "ip_rotated",
 		Text:       msg,
 		DeviceID:   deviceID,
-		DeviceName: m.resolveDeviceName(deviceID),
+		DeviceName: deviceName,
 		Timestamp:  time.Now(),
 	})
 }
@@ -260,8 +325,9 @@ func (m *Manager) NotifyIncomingCall(deviceID, caller, callee string) {
 		return
 	}
 
+	deviceName := m.resolveDeviceName(deviceID)
 	msg := fmt.Sprintf("来电通知\n设备    %s\n主叫    %s\n被叫    %s",
-		deviceID, caller, callee)
+		notificationDeviceDisplayName(deviceID, deviceName), caller, callee)
 
 	logger.Info("开始发送来电通知", "device", deviceID, "caller", caller, "channel_count", len(m.channels))
 
@@ -269,7 +335,7 @@ func (m *Manager) NotifyIncomingCall(deviceID, caller, callee string) {
 		Event:      "incoming_call",
 		Text:       msg,
 		DeviceID:   deviceID,
-		DeviceName: m.resolveDeviceName(deviceID),
+		DeviceName: deviceName,
 		Timestamp:  time.Now(),
 	})
 }
