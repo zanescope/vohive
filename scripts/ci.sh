@@ -29,7 +29,28 @@ run() {
 }
 
 workflow_lint() {
-	local actionlint_bin tmpbin
+	local action_ref action_value actionlint_bin invalid_pin tmpbin workflow_use
+
+	invalid_pin=0
+	while IFS= read -r workflow_use; do
+		read -r action_value _ <<< "${workflow_use#*uses:}"
+		case "$action_value" in
+			./*|docker://*) continue ;;
+		esac
+		if [[ "$action_value" != *@* ]]; then
+			printf 'remote action has no immutable ref: %s\n' "$workflow_use" >&2
+			invalid_pin=1
+			continue
+		fi
+		action_ref="${action_value##*@}"
+		if [[ ! "$action_ref" =~ ^[0-9a-f]{40}$ ]]; then
+			printf 'remote action must use a full commit SHA: %s\n' "$workflow_use" >&2
+			invalid_pin=1
+		fi
+	done < <(grep -HnE '^[[:space:]]*uses:[[:space:]]+' .github/workflows/*.yml)
+	if [[ "$invalid_pin" -ne 0 ]]; then
+		return 1
+	fi
 
 	if [[ -n "${ACTIONLINT_BIN:-}" ]]; then
 		actionlint_bin="$ACTIONLINT_BIN"
