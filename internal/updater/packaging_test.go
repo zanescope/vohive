@@ -62,6 +62,37 @@ func TestBootstrapTrustAndRepositoryAreFixed(t *testing.T) {
 	}
 }
 
+func TestDocumentedInstallerBootstrapRequiresProvenanceVerification(t *testing.T) {
+	for _, name := range []string{"README.md", "DEPLOYMENT.zh-CN.md"} {
+		path := filepath.Join("..", "..", name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		for _, required := range []string{
+			"VOHIVE_BOOTSTRAP_VERSION=v1.6.0",
+			"gh attestation verify vohive-install.sh",
+			"--repo zanescope/vohive",
+			"--signer-workflow zanescope/vohive/.github/workflows/binary-release.yml",
+			`--source-ref "refs/tags/${VOHIVE_BOOTSTRAP_VERSION}"`,
+			"--deny-self-hosted-runners",
+		} {
+			if !strings.Contains(text, required) {
+				t.Errorf("%s is missing bootstrap provenance constraint %q", name, required)
+			}
+		}
+		if strings.Contains(text, "releases/latest/download/vohive-install.sh") {
+			t.Errorf("%s still downloads an unauthenticated moving installer", name)
+		}
+		verify := strings.Index(text, "gh attestation verify vohive-install.sh")
+		execute := strings.Index(text, "sudo sh vohive-install.sh")
+		if verify < 0 || execute < 0 || verify > execute {
+			t.Errorf("%s must verify installer provenance before root execution: verify=%d execute=%d", name, verify, execute)
+		}
+	}
+}
+
 func TestSystemdUnitKeepsConfigWritableWithoutHOMEOverride(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "systemd", "vohive.service"))
 	if err != nil {
