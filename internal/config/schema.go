@@ -9,13 +9,15 @@ import (
 	"strings"
 
 	"github.com/spf13/viper"
+	"github.com/zanescope/vohive/internal/schemacontract"
 	yaml "go.yaml.in/yaml/v3"
 )
 
 const (
 	LegacyConfigSchema           = 0
-	MinimumSupportedConfigSchema = LegacyConfigSchema
-	CurrentConfigSchema          = 1
+	MinimumSupportedConfigSchema = schemacontract.ConfigMin
+	CurrentConfigSchema          = schemacontract.ConfigTarget
+	MaximumSupportedConfigSchema = schemacontract.ConfigMax
 )
 
 var (
@@ -80,7 +82,7 @@ func PlanMigrationTo(data []byte, target int) (ConfigMigrationPlan, error) {
 		return ConfigMigrationPlan{}, err
 	}
 	plan := ConfigMigrationPlan{CurrentSchema: current, TargetSchema: target}
-	if target < MinimumSupportedConfigSchema || target > CurrentConfigSchema {
+	if target < MinimumSupportedConfigSchema || target > MaximumSupportedConfigSchema {
 		return plan, fmt.Errorf("%w: target schema %d", ErrConfigSchemaUnsupported, target)
 	}
 	if current > target {
