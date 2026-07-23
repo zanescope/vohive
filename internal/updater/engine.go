@@ -276,10 +276,13 @@ func (e *Engine) Backup(ctx context.Context) (string, error) {
 	backupPath, backupErr := createBackup(paths, deployment.CurrentVersion, e.now())
 	startErr := e.Service.Start(context.Background())
 	if backupErr != nil {
-		return "", backupErr
+		backupErr = fmt.Errorf("create backup: %w", backupErr)
 	}
 	if startErr != nil {
-		return backupPath, startErr
+		startErr = fmt.Errorf("restart VoHive after backup attempt: %w", startErr)
+	}
+	if err := errors.Join(backupErr, startErr); err != nil {
+		return backupPath, err
 	}
 	return backupPath, nil
 }
