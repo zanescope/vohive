@@ -379,11 +379,13 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 			managerDevice = &md
 		}
 		qmiCore = qmicore.New(devCfg, managerDevice)
+		p.configurePublicIPProbeSources(qmiCore)
 	}
 	var mbimCore *mbimcore.Manager
 	var mbimSource backend.MBIMSource
 	if isMBIMRequired {
 		mbimCore = mbimcore.New(devCfg.ControlDevice, config.NormalizeMBIMTransport(devCfg.MBIMTransport))
+		p.configurePublicIPProbeSources(mbimCore)
 		mbimCore.SetDataConfig(mbimcore.DataConfig{APN: devCfg.APN, Interface: devCfg.Interface, IPVersion: devCfg.IPVersion})
 		if err := mbimCore.Open(p.ctx); err != nil {
 			m.Stop()
@@ -526,8 +528,11 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 		})
 
 		qmiCore.SetOnConnect(func() {
+			if !p.isCurrentPublicIPWorker(w) {
+				return
+			}
 			p.markQMIControlRecovered(w, "qmi_connected")
-			p.refreshIPs(w, true)
+			p.refreshIPs(w, false)
 			p.notifyDataConnected(w.ID)
 		})
 	}

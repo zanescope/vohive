@@ -29,7 +29,7 @@ const emit = defineEmits<{
             <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5 truncate">
               <span class="font-mono cursor-pointer hover:underline" @click="emit('copy-text', device.id)">{{ device.id }}</span>
               · 公网 IP:
-              <span class="font-mono cursor-pointer hover:underline" @click="emit('copy-text', device.public_ip || '')">{{ device.public_ip || '---' }}</span>
+              <span class="font-mono cursor-pointer hover:underline" @click="emit('copy-text', device.public_ip || device.public_ipv6 || '')">{{ device.public_ip || device.public_ipv6 || '---' }}</span>
             </div>
           </div>
         </div>

@@ -23,7 +23,9 @@ type DeleteEsimProfileResponse = {
 type NetworkControlResponse = {
   network_connected?: boolean
   private_ip?: string
+  private_ipv6?: string
   public_ip?: string
+  public_ipv6?: string
 }
 
 type FlightModeResponse = {
@@ -182,7 +184,9 @@ export const devicesService = {
       return {
         networkConnected: res.data?.network_connected === true,
         privateIP: res.data?.private_ip || '',
-        publicIP: res.data?.public_ip || ''
+        privateIPv6: res.data?.private_ipv6 || '',
+        publicIP: res.data?.public_ip || '',
+        publicIPv6: res.data?.public_ipv6 || ''
       }
     })
   },
@@ -192,7 +196,9 @@ export const devicesService = {
       return {
         networkConnected: res.data?.network_connected === true,
         privateIP: res.data?.private_ip || '',
-        publicIP: res.data?.public_ip || ''
+        privateIPv6: res.data?.private_ipv6 || '',
+        publicIP: res.data?.public_ip || '',
+        publicIPv6: res.data?.public_ipv6 || ''
       }
     })
   },

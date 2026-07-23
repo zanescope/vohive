@@ -30,6 +30,7 @@ type Monitor struct {
 	once              sync.Once
 	onSMS             func()
 	onConnect         func(ConnectState)
+	onIPConfiguration func()
 	onUSSD            func(USSDResponse)
 	onSubscriberReady func(Snapshot)
 	onSlotInfoStatus  func(SlotInfoStatus)
@@ -77,6 +78,16 @@ func (m *Monitor) SetOnSMS(cb func()) {
 func (m *Monitor) SetOnConnect(cb func(ConnectState)) {
 	m.mu.Lock()
 	m.onConnect = cb
+	m.mu.Unlock()
+}
+
+// SetOnIPConfiguration registers a callback fired when the modem reports that
+// the data session's IP configuration may have changed. The indication payload
+// is deliberately not exposed: MBIM indications may contain only the changed
+// fields, so callers must issue an authoritative IP_CONFIGURATION query.
+func (m *Monitor) SetOnIPConfiguration(cb func()) {
+	m.mu.Lock()
+	m.onIPConfiguration = cb
 	m.mu.Unlock()
 }
 
@@ -154,6 +165,15 @@ func (m *Monitor) apply(ind Indication) {
 			if cb != nil {
 				cb(st)
 			}
+		}
+		return
+	}
+	if ind.CID == CIDBasicConnectIPConfiguration {
+		m.mu.RLock()
+		cb := m.onIPConfiguration
+		m.mu.RUnlock()
+		if cb != nil {
+			cb()
 		}
 		return
 	}

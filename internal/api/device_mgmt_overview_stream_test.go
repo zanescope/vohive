@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -105,6 +106,88 @@ func TestOverviewStreamEmitVersionTracksRuntimeBusinessState(t *testing.T) {
 	appeared := newOverviewStreamEmitVersion(baseItem)
 	if shouldSkipOverviewStatePush(&empty, appeared) {
 		t.Fatal("state push was skipped when runtime state appeared")
+	}
+}
+
+func TestDeviceMgmtIPFieldsSerializeWhenEmpty(t *testing.T) {
+	tests := []struct {
+		name   string
+		value  any
+		fields []string
+	}{
+		{
+			name:   "overview",
+			value:  deviceMgmtOverviewItem{},
+			fields: []string{"private_ip", "private_ipv6", "public_ip", "public_ipv6"},
+		},
+		{
+			name:   "overview lite",
+			value:  deviceMgmtOverviewLiteItem{},
+			fields: []string{"private_ip", "private_ipv6", "public_ip", "public_ipv6"},
+		},
+		{
+			name:   "list",
+			value:  deviceMgmtListItem{},
+			fields: []string{"public_ip", "public_ipv6"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, err := json.Marshal(tt.value)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			decoded := map[string]json.RawMessage{}
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			for _, field := range tt.fields {
+				raw, ok := decoded[field]
+				if !ok {
+					t.Errorf("missing empty IP field %q in %s", field, payload)
+					continue
+				}
+				if string(raw) != `""` {
+					t.Errorf("IP field %q is not an empty string in %s", field, payload)
+				}
+			}
+		})
+	}
+}
+
+func TestOverviewStreamEmitVersionTracksNetworkAndIPState(t *testing.T) {
+	baseItem := deviceMgmtOverviewLiteItem{
+		NetworkConnected: true,
+		PrivateIP:        "10.0.0.2",
+		PrivateIPv6:      "2001:db8::2",
+		PublicIP:         "198.51.100.2",
+		PublicIPv6:       "2001:db8::3",
+	}
+	base := newOverviewStreamEmitVersion(baseItem)
+	if !shouldSkipOverviewStatePush(&base, newOverviewStreamEmitVersion(baseItem)) {
+		t.Fatal("unchanged network and IP state was not skipped")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*deviceMgmtOverviewLiteItem)
+	}{
+		{name: "network disconnected", mutate: func(item *deviceMgmtOverviewLiteItem) { item.NetworkConnected = false }},
+		{name: "private IPv4 cleared", mutate: func(item *deviceMgmtOverviewLiteItem) { item.PrivateIP = "" }},
+		{name: "private IPv6 cleared", mutate: func(item *deviceMgmtOverviewLiteItem) { item.PrivateIPv6 = "" }},
+		{name: "public IPv4 cleared", mutate: func(item *deviceMgmtOverviewLiteItem) { item.PublicIP = "" }},
+		{name: "public IPv6 cleared", mutate: func(item *deviceMgmtOverviewLiteItem) { item.PublicIPv6 = "" }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := baseItem
+			tt.mutate(&item)
+			if shouldSkipOverviewStatePush(&base, newOverviewStreamEmitVersion(item)) {
+				t.Fatal("state push was skipped despite network or IP state change")
+			}
+		})
 	}
 }
 

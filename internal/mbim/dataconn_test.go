@@ -3,8 +3,7 @@ package mbimcore
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,40 +11,285 @@ import (
 	"github.com/zanescope/vohive/pkg/mbim"
 )
 
+type fakeRoute struct {
+	gateway string
+	direct  bool
+	ipv6    bool
+}
+
 type fakeNetcfg struct {
-	iface    string
-	v4addr   string
-	v4gw     string
-	v4prefix int
-	mtu      int
-	dns      []string
-	up       bool
-	flushed  bool
+	iface          string
+	v4addr         string
+	v6addr         string
+	v4gw           string
+	v6gw           string
+	v4prefix       int
+	v6prefix       int
+	mtu            int
+	dns            []string
+	up             bool
+	flushed        bool
+	addressFlushes int
+	routeFlushes   int
+	flushErr       error
+	routeFlushErr  error
+	routes         []fakeRoute
+	operations     []string
 }
 
 func (f *fakeNetcfg) SetIPv4(iface, addr string, prefix int) error {
 	f.iface, f.v4addr, f.v4prefix = iface, addr, prefix
+	f.operations = append(f.operations, "set-v4")
 	return nil
 }
 
-func (f *fakeNetcfg) SetIPv6(iface, addr string, prefix int) error { return nil }
+func (f *fakeNetcfg) SetIPv6(iface, addr string, prefix int) error {
+	f.iface, f.v6addr, f.v6prefix = iface, addr, prefix
+	f.operations = append(f.operations, "set-v6")
+	return nil
+}
+
 func (f *fakeNetcfg) SetMTU(iface string, mtu int) error {
 	f.mtu = mtu
+	f.operations = append(f.operations, "set-mtu")
 	return nil
 }
-func (f *fakeNetcfg) BringUp(iface string) error { f.up = true; return nil }
-func (f *fakeNetcfg) AddDefaultRoute(iface, gw string) error {
-	f.v4gw = gw
-	return nil
-}
-func (f *fakeNetcfg) SetDNS(dns []string) error { f.dns = append([]string(nil), dns...); return nil }
-func (f *fakeNetcfg) Flush(iface string) error  { f.flushed = true; return nil }
 
+func (f *fakeNetcfg) BringUp(iface string) error {
+	f.up = true
+	f.operations = append(f.operations, "up")
+	return nil
+}
+
+func (f *fakeNetcfg) AddDefaultRoute(iface, gw string) error {
+	route := fakeRoute{gateway: gw, ipv6: strings.Contains(gw, ":")}
+	f.routes = append(f.routes, route)
+	if route.ipv6 {
+		f.v6gw = gw
+	} else {
+		f.v4gw = gw
+	}
+	f.operations = append(f.operations, "route-gateway")
+	return nil
+}
+
+func (f *fakeNetcfg) AddDefaultRouteDirect(iface string, ipv6 bool) error {
+	f.routes = append(f.routes, fakeRoute{direct: true, ipv6: ipv6})
+	f.operations = append(f.operations, "route-direct")
+	return nil
+}
+
+func (f *fakeNetcfg) SetDNS(dns []string) error {
+	f.dns = append([]string(nil), dns...)
+	f.operations = append(f.operations, "dns")
+	return nil
+}
+
+func (f *fakeNetcfg) Flush(iface string) error {
+	f.flushed = true
+	f.addressFlushes++
+	f.operations = append(f.operations, "flush-addresses")
+	return f.flushErr
+}
+
+func (f *fakeNetcfg) FlushRoutes(iface string) error {
+	f.routeFlushes++
+	f.operations = append(f.operations, "flush-routes")
+	return f.routeFlushErr
+}
+
+func TestCleanupActivatedDataSessionPreservesOriginalError(t *testing.T) {
+	tr := mbim.NewFakeTransport(func(written []byte) ([]byte, bool) {
+		h, service, cid, commandType, info, ok := dataTestCommand(written)
+		if ok && service.Equal(mbim.UUIDBasicConnect) && cid == mbim.CIDBasicConnectConnect &&
+			commandType == uint32(mbim.CommandTypeSet) && len(info) >= 8 &&
+			mbim.ReadU32ForTest(info[4:]) == mbim.ActivationCommandDeactivate {
+			return mbim.BuildCommandDoneStatusForTest(h.TransactionID, service, cid, 1, nil), true
+		}
+		return mbim.TestAnswerConnectAndIPv4Config(written)
+	})
+	d := mbim.NewDevice(tr)
+	if err := d.Open(context.Background(), 4096); err != nil {
+		t.Fatalf("open device: %v", err)
+	}
+	defer d.Close()
+
+	m := New("/dev/cdc-wdm0", "auto")
+	fnc := &fakeNetcfg{
+		flushErr:      errors.New("address cleanup failed"),
+		routeFlushErr: errors.New("route cleanup failed"),
+	}
+	cause := errors.New("original IP configuration error")
+	got := m.cleanupActivatedDataSessionLocked(context.Background(), d, fnc, "wwan0", cause)
+	if got != cause {
+		t.Fatalf("cleanup returned %v, want original cause %v", got, cause)
+	}
+	if !fnc.flushed || fnc.routeFlushes != 1 {
+		t.Fatalf("best-effort cleanup was skipped: addresses=%v routes=%d", fnc.flushed, fnc.routeFlushes)
+	}
+}
 func TestSetDataConfigStoresValues(t *testing.T) {
 	m := New("/dev/cdc-wdm0", "auto")
 	m.SetDataConfig(DataConfig{APN: "internet", Interface: "wwan0", IPVersion: "v4v6"})
 	if m.dataCfg.APN != "internet" || m.dataCfg.Interface != "wwan0" || m.dataCfg.IPVersion != "v4v6" {
 		t.Fatalf("dataCfg not stored: %+v", m.dataCfg)
+	}
+}
+
+func TestApplyIPConfigIPv6GatewayMTUAndDNS(t *testing.T) {
+	m := New("/dev/cdc-wdm0", "auto")
+	fnc := &fakeNetcfg{}
+	ipc := mbim.IPConfiguration{
+		IPv6Address:      "2001:db8::5",
+		IPv6PrefixLength: 64,
+		IPv6Gateway:      "2001:db8::1",
+		IPv6DNS:          []string{"2001:4860:4860::8888"},
+		IPv6MTU:          1420,
+	}
+	if err := m.applyIPConfig(fnc, "wwan0", ipc); err != nil {
+		t.Fatalf("applyIPConfig: %v", err)
+	}
+	if fnc.v6addr != "2001:db8::5" || fnc.v6prefix != 64 || fnc.v6gw != "2001:db8::1" {
+		t.Fatalf("IPv6 config not applied: %+v", fnc)
+	}
+	if fnc.mtu != 1420 || len(fnc.dns) != 1 || fnc.dns[0] != "2001:4860:4860::8888" {
+		t.Fatalf("IPv6 MTU/DNS not applied: mtu=%d dns=%v", fnc.mtu, fnc.dns)
+	}
+	if fnc.routeFlushes != 1 || fnc.addressFlushes != 1 {
+		t.Fatalf("stale network was not fully flushed: routes=%d addresses=%d", fnc.routeFlushes, fnc.addressFlushes)
+	}
+	if len(fnc.operations) < 2 || fnc.operations[0] != "flush-routes" || fnc.operations[1] != "flush-addresses" {
+		t.Fatalf("flush must precede reconfiguration, operations=%v", fnc.operations)
+	}
+}
+
+func TestApplyIPConfigIPv6WithoutGatewayUsesDirectRoute(t *testing.T) {
+	for _, gateway := range []string{"", "::"} {
+		t.Run("gateway="+gateway, func(t *testing.T) {
+			m := New("/dev/cdc-wdm0", "auto")
+			fnc := &fakeNetcfg{}
+			ipc := mbim.IPConfiguration{
+				IPv6Address:      "2001:db8::5",
+				IPv6PrefixLength: 64,
+				IPv6Gateway:      gateway,
+				IPv6MTU:          1280,
+			}
+			if err := m.applyIPConfig(fnc, "wwan0", ipc); err != nil {
+				t.Fatalf("applyIPConfig: %v", err)
+			}
+			if len(fnc.routes) != 1 || !fnc.routes[0].direct || !fnc.routes[0].ipv6 {
+				t.Fatalf("IPv6 direct route not added: %+v", fnc.routes)
+			}
+		})
+	}
+}
+
+func TestApplyIPConfigRejectsUnsafeIPv6MTU(t *testing.T) {
+	m := New("/dev/cdc-wdm0", "auto")
+	fnc := &fakeNetcfg{}
+	err := m.applyIPConfig(fnc, "wwan0", mbim.IPConfiguration{
+		IPv6Address:      "2001:db8::5",
+		IPv6PrefixLength: 64,
+		IPv6MTU:          1279,
+	})
+	if err == nil || !strings.Contains(err.Error(), "below 1280") {
+		t.Fatalf("applyIPConfig error = %v, want IPv6 MTU validation", err)
+	}
+	if fnc.routeFlushes != 0 || fnc.addressFlushes != 0 {
+		t.Fatalf("invalid snapshot must be rejected before flushing: %+v", fnc)
+	}
+}
+
+func TestApplyIPConfigRejectsNonBearerAddressesBeforeFlush(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  mbim.IPConfiguration
+	}{
+		{name: "IPv4 unspecified", cfg: mbim.IPConfiguration{IPv4Address: "0.0.0.0", IPv4PrefixLength: 24}},
+		{name: "IPv4 loopback", cfg: mbim.IPConfiguration{IPv4Address: "127.0.0.1", IPv4PrefixLength: 8}},
+		{name: "IPv4 link local", cfg: mbim.IPConfiguration{IPv4Address: "169.254.1.1", IPv4PrefixLength: 16}},
+		{name: "IPv4 multicast", cfg: mbim.IPConfiguration{IPv4Address: "224.0.0.1", IPv4PrefixLength: 24}},
+		{name: "IPv6 unspecified", cfg: mbim.IPConfiguration{IPv6Address: "::", IPv6PrefixLength: 64}},
+		{name: "IPv6 loopback", cfg: mbim.IPConfiguration{IPv6Address: "::1", IPv6PrefixLength: 128}},
+		{name: "IPv6 link local", cfg: mbim.IPConfiguration{IPv6Address: "fe80::1", IPv6PrefixLength: 64}},
+		{name: "IPv6 multicast", cfg: mbim.IPConfiguration{IPv6Address: "ff02::1", IPv6PrefixLength: 64}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New("/dev/cdc-wdm0", "auto")
+			fnc := &fakeNetcfg{}
+			err := m.applyIPConfig(fnc, "wwan0", tt.cfg)
+			if err == nil || !strings.Contains(err.Error(), "not global unicast") {
+				t.Fatalf("applyIPConfig error = %v, want non-bearer address rejection", err)
+			}
+			if fnc.routeFlushes != 0 || fnc.addressFlushes != 0 {
+				t.Fatalf("invalid address was flushed/applied: %+v", fnc)
+			}
+		})
+	}
+}
+
+func TestValidateDataAddressAcceptsPrivateAndULA(t *testing.T) {
+	for _, tt := range []struct {
+		address string
+		prefix  uint32
+		ipv6    bool
+	}{
+		{address: "10.0.0.5", prefix: 24},
+		{address: "fd00::5", prefix: 64, ipv6: true},
+	} {
+		if err := validateDataAddress(tt.address, tt.prefix, tt.ipv6); err != nil {
+			t.Fatalf("validateDataAddress(%q) rejected valid bearer address: %v", tt.address, err)
+		}
+	}
+}
+func TestApplyIPConfigDualStackUsesTwoRoutesAndMinimumMTU(t *testing.T) {
+	m := New("/dev/cdc-wdm0", "auto")
+	fnc := &fakeNetcfg{}
+	ipc := mbim.IPConfiguration{
+		IPv4Address:      "10.0.0.5",
+		IPv4PrefixLength: 24,
+		IPv4Gateway:      "10.0.0.1",
+		IPv4DNS:          []string{"8.8.8.8"},
+		IPv4MTU:          1500,
+		IPv6Address:      "2001:db8::5",
+		IPv6PrefixLength: 64,
+		IPv6Gateway:      "2001:db8::1",
+		IPv6DNS:          []string{"2001:4860:4860::8888"},
+		IPv6MTU:          1420,
+	}
+	if err := m.applyIPConfig(fnc, "wwan0", ipc); err != nil {
+		t.Fatalf("applyIPConfig: %v", err)
+	}
+	if fnc.mtu != 1420 {
+		t.Fatalf("MTU = %d, want minimum 1420", fnc.mtu)
+	}
+	if len(fnc.routes) != 2 || fnc.routes[0].ipv6 || !fnc.routes[1].ipv6 {
+		t.Fatalf("dual-stack routes = %+v, want IPv4 then IPv6", fnc.routes)
+	}
+	if got := strings.Join(fnc.dns, ","); got != "8.8.8.8,2001:4860:4860::8888" {
+		t.Fatalf("DNS = %s, want both family snapshots", got)
+	}
+}
+
+func TestApplyIPConfigGatewayChangeFlushesOldRoute(t *testing.T) {
+	m := New("/dev/cdc-wdm0", "auto")
+	fnc := &fakeNetcfg{}
+	first := mbim.IPConfiguration{IPv4Address: "10.0.0.5", IPv4PrefixLength: 24, IPv4Gateway: "10.0.0.1"}
+	second := mbim.IPConfiguration{IPv4Address: "10.0.1.5", IPv4PrefixLength: 24, IPv4Gateway: "10.0.1.1"}
+	if err := m.applyIPConfig(fnc, "wwan0", first); err != nil {
+		t.Fatalf("first applyIPConfig: %v", err)
+	}
+	beforeSecond := len(fnc.operations)
+	if err := m.applyIPConfig(fnc, "wwan0", second); err != nil {
+		t.Fatalf("second applyIPConfig: %v", err)
+	}
+	if fnc.v4gw != "10.0.1.1" || fnc.routeFlushes != 2 {
+		t.Fatalf("gateway refresh did not replace route: gateway=%s flushes=%d", fnc.v4gw, fnc.routeFlushes)
+	}
+	secondOps := fnc.operations[beforeSecond:]
+	if len(secondOps) < 2 || secondOps[0] != "flush-routes" || secondOps[1] != "flush-addresses" {
+		t.Fatalf("gateway refresh did not flush first: %v", secondOps)
 	}
 }
 
@@ -306,18 +550,30 @@ func TestRotateIPDeactivatesThenReconnects(t *testing.T) {
 	}
 }
 
-func TestGetPublicIPv4UsesProber(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("198.51.100.9"))
-	}))
-	defer srv.Close()
-
+func TestPublicIPProbeURLsAreCopiedAndContextCanCancel(t *testing.T) {
 	m := New("/dev/cdc-wdm0", "auto")
-	m.SetDataConfig(DataConfig{Interface: "", IPVersion: "v4"})
-	m.publicIPURLs = []string{srv.URL}
-	v4, _ := m.GetPublicIPv4AndV6NoCache()
-	if v4 != "198.51.100.9" {
-		t.Fatalf("v4 = %q, want 198.51.100.9", v4)
+	m.SetDataConfig(DataConfig{Interface: "wwan0", IPVersion: "v4"})
+	ipv4 := []string{"https://v4.example/ip"}
+	ipv6 := []string{"https://v6.example/ip"}
+	m.SetPublicIPProbeURLs(ipv4, ipv6)
+	ipv4[0], ipv6[0] = "changed", "changed"
+
+	m.mu.Lock()
+	if m.publicIPv4URLs[0] != "https://v4.example/ip" || m.publicIPv6URLs[0] != "https://v6.example/ip" {
+		t.Fatalf("probe URL setters retained caller slices: v4=%v v6=%v", m.publicIPv4URLs, m.publicIPv6URLs)
+	}
+	m.privateIPv4 = "10.0.0.5"
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	v4, v6 := m.GetPublicIPv4AndV6Context(ctx)
+	if v4 != "" || v6 != "" {
+		t.Fatalf("canceled probe = (%q, %q), want empty", v4, v6)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("canceled probe took %v, want < 1s", elapsed)
 	}
 }
 
@@ -370,7 +626,7 @@ func TestCloseFlushesNetworkWhenConnected(t *testing.T) {
 	}
 }
 
-func TestCloseDoesNotFlushWhenNeverConnected(t *testing.T) {
+func TestCloseDoesNotFlushNeverOwnedInterface(t *testing.T) {
 	tr := mbim.NewFakeTransport(mbim.TestAnswerConnectAndIPv4Config)
 	m := New("/dev/cdc-wdm0", "auto")
 	fnc := &fakeNetcfg{}
@@ -383,8 +639,8 @@ func TestCloseDoesNotFlushWhenNeverConnected(t *testing.T) {
 	if err := m.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if fnc.flushed {
-		t.Fatal("Close should not flush netcfg when never connected")
+	if fnc.flushed || fnc.routeFlushes != 0 {
+		t.Fatalf("Close flushed a never-owned interface: addresses=%v routes=%d", fnc.flushed, fnc.routeFlushes)
 	}
 }
 

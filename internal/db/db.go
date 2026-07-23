@@ -1044,6 +1044,20 @@ func UpdateDeviceIPsV6(imei, publicV4, publicV6, privateV4, privateV6 string) er
 	return DB.Model(&Device{}).Where("imei = ?", imei).Updates(updates).Error
 }
 
+// ReplaceDeviceIPsV6 authoritatively replaces the current data-bearer address
+// snapshot. Unlike UpdateDeviceIPsV6, empty values are significant: callers use
+// them to clear addresses after a disconnect or when a new bearer generation is
+// established, so stale addresses are never presented as current.
+func ReplaceDeviceIPsV6(imei, publicV4, publicV6, privateV4, privateV6 string) error {
+	return DB.Model(&Device{}).Where("imei = ?", imei).Updates(map[string]interface{}{
+		"public_ip":    strings.TrimSpace(publicV4),
+		"public_ipv6":  strings.TrimSpace(publicV6),
+		"private_ip":   strings.TrimSpace(privateV4),
+		"private_ipv6": strings.TrimSpace(privateV6),
+		"last_seen":    time.Now(),
+	}).Error
+}
+
 func rebuildSMSContactTx(tx *gorm.DB, imsi, peer string) (bool, error) {
 	imsi = strings.TrimSpace(imsi)
 	peer = strings.TrimSpace(peer)
