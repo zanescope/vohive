@@ -311,6 +311,25 @@ func (p *Pool) registerWorkerStarting(worker *Worker) error {
 	return nil
 }
 
+func (p *Pool) registerWorkerStartingForAttempt(worker *Worker, attempt uint64) error {
+	if p == nil || worker == nil || strings.TrimSpace(worker.ID) == "" {
+		return fmt.Errorf("worker_nil")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rebuildAttempt[worker.ID] != attempt || !p.rebuilding[worker.ID] {
+		return fmt.Errorf("设备 %s 启动流程已失效", worker.ID)
+	}
+	if current := p.workers[worker.ID]; current != nil && current != worker {
+		return fmt.Errorf("设备已存在")
+	}
+	p.workers[worker.ID] = worker
+	if worker.generation == 0 {
+		worker.generation = p.nextWorkerGenerationLocked(worker.ID)
+	}
+	return nil
+}
+
 func (p *Pool) removeWorkerRegistrationIfCurrent(worker *Worker) {
 	if p == nil || worker == nil || strings.TrimSpace(worker.ID) == "" {
 		return
@@ -1096,7 +1115,7 @@ func (p *Pool) endRebuildAttemptIfCurrent(deviceID string, attempt uint64) {
 
 // startBootstrapWatchdog 为单次 AddWorkerFromConfig 执行设置硬上限看门狗。
 // 如果启动流程在 deadline 内既没有成功完成、也没有被更新的尝试取代，
-// 看门狗会强制释放 rebuilding 标记，让设备重新可以被重试或删除；
+// 看门狗会作废本次 attempt 并释放 rebuilding 标记，让设备重新可以被重试或删除；
 // 调用方应在自身正常返回时 close 掉返回的 stop channel 以避免看门狗误触发日志。
 func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline time.Duration) chan struct{} {
 	stop := make(chan struct{})
@@ -1113,11 +1132,12 @@ func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline 
 		p.mu.Lock()
 		isCurrent := p.rebuildAttempt[deviceID] == attempt
 		if isCurrent {
+			p.rebuildAttempt[deviceID]++
 			delete(p.rebuilding, deviceID)
 		}
 		p.mu.Unlock()
 		if isCurrent {
-			logger.Warn("QMI worker 启动看门狗超时，强制释放 rebuilding 标记，设备可能仍在后台初始化",
+			logger.Warn("QMI worker 启动看门狗超时，作废当前 attempt 并释放 rebuilding 标记",
 				"device", deviceID,
 				"deadline", deadline.String())
 		}
@@ -1294,12 +1314,13 @@ func (p *Pool) StartAll() error {
 	p.startPoolBackgroundServicesOnce()
 
 	devices := append([]config.DeviceConfig(nil), p.cfg.Devices...)
+	limit := p.FreeDeviceLimit()
 	for i := range devices {
 		devCfg := devices[i]
-		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", devCfg.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 		go p.startConfiguredDeviceBootstrap(devCfg, "start_all")
@@ -1374,13 +1395,14 @@ func (p *Pool) startAllSynchronousLegacy() error {
 	}
 
 	var firstErr error
+	limit := p.FreeDeviceLimit()
 	for i := range p.cfg.Devices {
 		// 使用指针以便修改配置
 		devCfg := &p.cfg.Devices[i]
-		if !FreeDeviceLimitAllowsConfiguredDevice(p.cfg.Devices, devCfg.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(p.cfg.Devices, devCfg.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", devCfg.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 		var matchedModem *QMIDevice
@@ -1958,6 +1980,7 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	hardware := p.collectRescanHardware(discovered, liveWorkerIndex)
 	managed := config.ListDevices()
 	resolved := ResolveDeviceIdentities(hardware, managed)
+	limit := p.FreeDeviceLimit()
 
 	if len(resolved.Degraded) > 0 || len(resolved.Unmatched) > 0 {
 		logger.Debug("rescan 发现未匹配或退化设备", "degraded", len(resolved.Degraded), "unmatched", len(resolved.Unmatched))
@@ -1965,10 +1988,10 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 
 	for _, pair := range resolved.Matched {
 		md := pair.Config
-		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
 				"device", md.ID,
-				"limit", DefaultFreeDeviceLimit)
+				"limit", limit)
 			continue
 		}
 
@@ -2142,7 +2165,7 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	}
 
 	for _, md := range resolved.Offline {
-		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID) {
+		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID, limit) {
 			continue
 		}
 		worker := p.GetWorker(md.ID)
@@ -2182,8 +2205,9 @@ func (p *Pool) RebuildWorker(deviceID string) error {
 	if err != nil || cfg == nil {
 		return fmt.Errorf("读取设备 %s 配置失败: %w", deviceID, err)
 	}
-	if !FreeDeviceLimitAllowsConfiguredDevice(config.ListDevices(), cfg.ID) {
-		return fmt.Errorf("%s", FreeDeviceWorkerLimitMessage())
+	limit := p.FreeDeviceLimit()
+	if !FreeDeviceLimitAllowsConfiguredDevice(config.ListDevices(), cfg.ID, limit) {
+		return fmt.Errorf("%s", FreeDeviceWorkerLimitMessage(limit))
 	}
 
 	// 先停止 VoWiFi（如有），并让任何正在启动中的旧实例失效。
