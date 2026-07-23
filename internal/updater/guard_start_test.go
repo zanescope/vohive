@@ -67,3 +67,34 @@ func TestGuardStartRejectsCorruptState(t *testing.T) {
 		t.Fatal("corrupt update state did not block service start")
 	}
 }
+
+func TestGuardStartAllowsLiveLockWithoutTransactionState(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("live updater process verification is Linux-only")
+	}
+	paths := testRuntimePaths(t)
+	lock, err := AcquireUpdateLock(paths.LockFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	if err := guardStartPaths(paths); err != nil {
+		t.Fatalf("live backup worker was blocked: %v", err)
+	}
+}
+
+func TestGuardStartRejectsOrphanLockWithoutTransactionState(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("live updater process verification is Linux-only")
+	}
+	paths := testRuntimePaths(t)
+	if err := os.MkdirAll(paths.StateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.LockFile(), []byte("pid=2147483647\nstarted=2020-01-01T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := guardStartPaths(paths); !errors.Is(err, ErrInterruptedUpdate) {
+		t.Fatalf("orphan lock error = %v, want ErrInterruptedUpdate", err)
+	}
+}
