@@ -257,6 +257,7 @@ import {
 } from '../services/system'
 
 const UPDATE_JOB_STORAGE_KEY = 'vohive_update_job_id'
+const UPDATE_JOB_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/
 const checkingUpdate = ref(false)
 const applyingUpdate = ref(false)
 const updateChannel = ref<'stable' | 'beta'>('stable')
@@ -272,6 +273,7 @@ let updateProbeController: AbortController | undefined
 let updatePollTimer: number | undefined
 let updateReloadTimer: number | undefined
 let updateOfflineSince = 0
+let updateJobFallbackID = ''
 
 const updatePhaseLabels: Record<UpdatePhase, string> = {
   checking: '确认目标版本',
@@ -329,6 +331,54 @@ function updateErrorMessage(error: unknown, fallback: string): string {
   return fallback
 }
 
+function validUpdateJobID(jobID: string): boolean {
+  return UPDATE_JOB_ID_PATTERN.test(jobID)
+}
+
+function readStoredUpdateJobID(): string {
+  let stored = ''
+  try {
+    stored = String(localStorage.getItem(UPDATE_JOB_STORAGE_KEY) || '').trim()
+  } catch {
+    return validUpdateJobID(updateJobFallbackID) ? updateJobFallbackID : ''
+  }
+  if (validUpdateJobID(stored)) {
+    updateJobFallbackID = stored
+    return stored
+  }
+  if (stored) {
+    try {
+      if (localStorage.getItem(UPDATE_JOB_STORAGE_KEY) === stored) {
+        localStorage.removeItem(UPDATE_JOB_STORAGE_KEY)
+      }
+    } catch {
+      // Keep the in-memory job ID when storage becomes unavailable.
+    }
+  }
+  return validUpdateJobID(updateJobFallbackID) ? updateJobFallbackID : ''
+}
+
+function storeUpdateJobID(jobID: string) {
+  if (!validUpdateJobID(jobID)) throw new Error('更新任务返回了无效任务编号')
+  updateJobFallbackID = jobID
+  try {
+    localStorage.setItem(UPDATE_JOB_STORAGE_KEY, jobID)
+  } catch {
+    // Polling can continue in this tab using the in-memory fallback.
+  }
+}
+
+function clearStoredUpdateJobID(expectedJobID: string) {
+  if (updateJobFallbackID === expectedJobID) updateJobFallbackID = ''
+  try {
+    if (localStorage.getItem(UPDATE_JOB_STORAGE_KEY) === expectedJobID) {
+      localStorage.removeItem(UPDATE_JOB_STORAGE_KEY)
+    }
+  } catch {
+    // The in-memory fallback has already been cleared for this tab.
+  }
+}
+
 function clearUpdateTimers() {
   if (updatePollTimer !== undefined) {
     window.clearTimeout(updatePollTimer)
@@ -367,13 +417,13 @@ async function probePublicReadiness(): Promise<boolean> {
   }
 }
 
-function finishUpdatePolling() {
+function finishUpdatePolling(jobID: string) {
   applyingUpdate.value = false
   updateWaitingForRestart.value = false
   updateNeedsDiagnosis.value = false
   updateDiagnosticMessage.value = ''
   updateOfflineSince = 0
-  sessionStorage.removeItem(UPDATE_JOB_STORAGE_KEY)
+  clearStoredUpdateJobID(jobID)
   if (updatePollTimer !== undefined) {
     window.clearTimeout(updatePollTimer)
     updatePollTimer = undefined
@@ -392,6 +442,8 @@ function markUpdateNeedsDiagnosis(message: string) {
 }
 
 function validateUpdateState(state: UpdateTransaction): string {
+  if (!validUpdateJobID(String(state.id || ''))) return '更新任务编号无效'
+  if (state.operation !== 'update') return '更新任务类型不匹配'
   if (state.schema !== 1) return '更新任务使用了未知状态格式'
   if (!knownUpdatePhases.has(String(state.phase))) return '更新任务返回了未知阶段'
   const startedAt = Date.parse(state.started_at)
@@ -408,7 +460,7 @@ function validateUpdateState(state: UpdateTransaction): string {
 
 function handleTerminalUpdate(state: UpdateTransaction): boolean {
   if (state.phase === 'completed') {
-    finishUpdatePolling()
+    finishUpdatePolling(state.id)
     if (!updateDisposed) {
       ElMessage.success('更新已完成，新版本运行正常')
       updateReloadTimer = window.setTimeout(() => {
@@ -418,19 +470,19 @@ function handleTerminalUpdate(state: UpdateTransaction): boolean {
     return true
   }
   if (state.phase === 'rolled_back') {
-    finishUpdatePolling()
+    finishUpdatePolling(state.id)
     if (!updateDisposed) {
       ElMessage.warning('新版本未通过健康检查，系统已自动恢复旧版本' + (state.error ? '：' + state.error : ''))
     }
     return true
   }
   if (state.phase === 'failed') {
-    finishUpdatePolling()
+    finishUpdatePolling(state.id)
     if (!updateDisposed) ElMessage.error(state.error || '更新失败，当前版本保持不变')
     return true
   }
   if (state.phase === 'manual_recovery_required') {
-    finishUpdatePolling()
+    finishUpdatePolling(state.id)
     if (!updateDisposed) {
       ElMessage.error('自动恢复未完成，请在主机执行 vohivectl doctor，并按部署文档恢复')
     }
@@ -441,7 +493,7 @@ function handleTerminalUpdate(state: UpdateTransaction): boolean {
 
 async function pollUpdateJob() {
   if (updateDisposed) return
-  const jobID = sessionStorage.getItem(UPDATE_JOB_STORAGE_KEY) || updateJob.value?.id || ''
+  const jobID = readStoredUpdateJobID() || updateJob.value?.id || ''
   if (!jobID) {
     applyingUpdate.value = false
     return
@@ -449,6 +501,11 @@ async function pollUpdateJob() {
 
   const result = await systemService.getUpdateJob(jobID)
   if (updateDisposed) return
+  const activeJobID = readStoredUpdateJobID()
+  if (activeJobID && activeJobID !== jobID) {
+    scheduleUpdatePoll(0)
+    return
+  }
   if (result.ok) {
     updateOfflineSince = 0
     updateWaitingForRestart.value = false
@@ -535,6 +592,7 @@ async function doApplyUpdate() {
   }
 
   const releaseNote = (candidate.release_note || '暂无更新说明').slice(0, 3000)
+  let currentPassword = ''
   try {
     await ElMessageBox.confirm(
       [
@@ -548,44 +606,95 @@ async function doApplyUpdate() {
       '开始安全更新',
       { confirmButtonText: '下载并更新', cancelButtonText: '取消', type: 'warning' }
     )
+    const authorization = await ElMessageBox.prompt(
+      '长期登录会话不能直接启动系统更新。请输入当前管理员密码以确认本次操作。',
+      '验证管理员身份',
+      {
+        confirmButtonText: '验证并更新',
+        cancelButtonText: '取消',
+        inputType: 'password',
+        inputPlaceholder: '当前管理员密码',
+        closeOnClickModal: false,
+        inputValidator: (value: string) => value.length > 0 || '请输入当前管理员密码'
+      }
+    )
     if (updateDisposed) return
+    currentPassword = String(authorization.value || '')
     applyingUpdate.value = true
     const result = await systemService.startUpdate({
       channel: candidate.manifest.channel,
-      version: candidate.latest_version
+      version: candidate.latest_version,
+      current_password: currentPassword
     })
+    currentPassword = ''
     if (updateDisposed) return
     if (!result.ok) throw result.error
     updateJob.value = result.data
-    sessionStorage.setItem(UPDATE_JOB_STORAGE_KEY, result.data.id)
+    storeUpdateJobID(result.data.id)
+    const stateError = validateUpdateState(result.data)
+    if (stateError) {
+      markUpdateNeedsDiagnosis(stateError + '，任务编号已保留，请重试查询或在主机执行 vohivectl status')
+      ElMessage.error(updateDiagnosticMessage.value)
+      return
+    }
     ElMessage.info('更新任务已启动，请勿关闭设备电源')
     scheduleUpdatePoll(500)
   } catch (error: unknown) {
     if (error === 'cancel' || error === 'close') return
     applyingUpdate.value = false
     if (!updateDisposed) ElMessage.error(updateErrorMessage(error, '启动更新失败'))
+  } finally {
+    currentPassword = ''
   }
 }
 
 function resumeUpdatePolling() {
-  const jobID = sessionStorage.getItem(UPDATE_JOB_STORAGE_KEY) || ''
-  if (!/^[A-Za-z0-9._-]{1,128}$/.test(jobID)) {
-    sessionStorage.removeItem(UPDATE_JOB_STORAGE_KEY)
-    return
-  }
+  const jobID = readStoredUpdateJobID()
+  if (!jobID) return
   updateNeedsDiagnosis.value = false
   applyingUpdate.value = true
   scheduleUpdatePoll(0)
 }
+
+function handleUpdateJobStorage(event: StorageEvent) {
+  if (event.key !== UPDATE_JOB_STORAGE_KEY) return
+  const nextJobID = String(event.newValue || '').trim()
+  if (nextJobID) {
+    if (!validUpdateJobID(nextJobID)) return
+    updateJobFallbackID = nextJobID
+    if (updateJob.value?.id !== nextJobID) updateJob.value = null
+    updateNeedsDiagnosis.value = false
+    updateDiagnosticMessage.value = ''
+    updateWaitingForRestart.value = false
+    updateOfflineSince = 0
+    applyingUpdate.value = true
+    scheduleUpdatePoll(0)
+    return
+  }
+
+  const currentJobID = updateJobFallbackID || updateJob.value?.id || ''
+  if (!validUpdateJobID(currentJobID)) {
+    applyingUpdate.value = false
+    return
+  }
+  // Another tab clears the shared key only after observing a terminal state.
+  // Keep this tab's last ID long enough to fetch and display that same result.
+  updateJobFallbackID = currentJobID
+  applyingUpdate.value = true
+  scheduleUpdatePoll(0)
+}
+
 onMounted(() => {
   updateDisposed = false
   loadNotifications()
   loadSystemInfo()
+  window.addEventListener('storage', handleUpdateJobStorage)
   resumeUpdatePolling()
 })
 
 onBeforeUnmount(() => {
   updateDisposed = true
+  window.removeEventListener('storage', handleUpdateJobStorage)
   clearUpdateTimers()
 })
 </script>
