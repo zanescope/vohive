@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/zanescope/vohive/internal/schemacontract"
 	"golang.org/x/mod/semver"
 )
 
@@ -304,15 +305,27 @@ func validatePolicy(policy releasePolicy) error {
 			return fmt.Errorf("invalid upgrade_via version %q", version)
 		}
 	}
-	if err := validateSchemaRange("config_schema", policy.ConfigSchema); err != nil {
+	expectedConfig := manifestSchemaRange(schemacontract.Config())
+	if err := validateSchemaRange("config_schema", policy.ConfigSchema, expectedConfig); err != nil {
 		return err
 	}
-	return validateSchemaRange("database_schema", policy.DatabaseSchema)
+	expectedDatabase := manifestSchemaRange(schemacontract.Database())
+	return validateSchemaRange("database_schema", policy.DatabaseSchema, expectedDatabase)
 }
 
-func validateSchemaRange(name string, schema schemaRange) error {
+func manifestSchemaRange(schema schemacontract.Range) schemaRange {
+	return schemaRange{Min: schema.Min, Target: schema.Target, Max: schema.Max}
+}
+
+func validateSchemaRange(name string, schema, compiled schemaRange) error {
 	if schema.Min < 0 || schema.Min > schema.Target || schema.Target > schema.Max {
 		return fmt.Errorf("%s must satisfy 0 <= min <= target <= max", name)
+	}
+	if schema != compiled {
+		return fmt.Errorf(
+			"%s=%+v does not match compiled runtime capability %+v",
+			name, schema, compiled,
+		)
 	}
 	return nil
 }

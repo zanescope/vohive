@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/zanescope/vohive/internal/schemacontract"
 )
 
 const (
@@ -215,12 +217,20 @@ func (m ReleaseManifest) Validate(releaseTag string) error {
 			return fmt.Errorf("invalid bridge version %q", bridge)
 		}
 	}
-	for name, schema := range map[string]SchemaRange{
-		"config":   m.ConfigSchema,
-		"database": m.DatabaseSchema,
+	for name, schemas := range map[string]struct {
+		declared SchemaRange
+		compiled schemacontract.Range
+	}{
+		"config":   {declared: m.ConfigSchema, compiled: schemacontract.Config()},
+		"database": {declared: m.DatabaseSchema, compiled: schemacontract.Database()},
 	} {
+		schema := schemas.declared
 		if schema.Min < 0 || schema.Target < schema.Min || schema.Max < schema.Target {
 			return fmt.Errorf("%s schema range must satisfy 0 <= min <= target <= max", name)
+		}
+		supported := SchemaRange{Min: schemas.compiled.Min, Target: schemas.compiled.Target, Max: schemas.compiled.Max}
+		if schema != supported {
+			return fmt.Errorf("%s schema range %+v does not match updater capability %+v", name, schema, supported)
 		}
 	}
 	if len(m.Artifacts) == 0 {
