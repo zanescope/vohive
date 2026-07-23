@@ -51,7 +51,7 @@ docker compose logs vohive
 
 ## 健康检查
 
-镜像和 Compose 都通过无需登录的 `/healthz` 检查进程存活：
+镜像和 Compose 都使用镜像内的 `vohivectl probe --liveness`，从持久化配置解析实际 `server.port` 后请求无需登录的 `/healthz`：
 
 ```sh
 docker inspect --format='{{json .State.Health}}' vohive

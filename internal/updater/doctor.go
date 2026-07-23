@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -81,11 +82,23 @@ func Doctor(ctx context.Context, deploymentFile string, checker ReadyChecker) Do
 		}
 		add(name, statErr, path+" is available")
 	}
-	if checker != nil && deployment.ReadyURL != "" {
-		readyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		readyErr := checker.Ready(readyCtx, deployment.ReadyURL)
-		cancel()
-		add("readiness", readyErr, "service readiness endpoint is healthy")
+	if checker != nil {
+		endpoint, resolveErr := ResolveReadyURL(deployment)
+		if resolveErr != nil {
+			add("readiness", fmt.Errorf("resolve readiness endpoint: %w", resolveErr), "")
+		} else {
+			version := normalizeVersion(deployment.CurrentVersion)
+			expectation := ReadyExpectation{
+				Endpoint:        endpoint,
+				ExpectedVersion: version,
+				KeyFile:         paths.ReadinessKeyFile(),
+				AllowLegacy:     strings.HasPrefix(version, "v0.0.0-legacy."),
+			}
+			readyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			readyErr := checker.Ready(readyCtx, expectation)
+			cancel()
+			add("readiness", readyErr, "managed service readiness and version are verified")
+		}
 	}
 	return report
 }

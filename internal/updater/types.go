@@ -19,7 +19,10 @@ const (
 	DefaultDeploymentPath = "/etc/vohive/deployment.json"
 	DefaultStateRoot      = "/var/lib/vohive/update"
 	DefaultDataPath       = "/var/lib/vohive/data"
-	DefaultReadyURL       = "http://127.0.0.1:7575/readyz"
+	DefaultReadinessKey   = DefaultStateRoot + "/readiness.key"
+
+	ReadinessChallengeHeader = "X-VoHive-Readiness-Challenge"
+	ReadinessKeyFileEnv      = "VOHIVE_READINESS_KEY_FILE"
 )
 
 var (
@@ -84,7 +87,7 @@ type Deployment struct {
 	ConfigPath      string      `json:"config_path"`
 	DataPath        string      `json:"data_path"`
 	StateRoot       string      `json:"state_root"`
-	ReadyURL        string      `json:"ready_url"`
+	ReadyURL        string      `json:"ready_url,omitempty"`
 }
 
 func DefaultDeployment() Deployment {
@@ -99,7 +102,6 @@ func DefaultDeployment() Deployment {
 		ConfigPath:  DefaultConfigPath,
 		DataPath:    DefaultDataPath,
 		StateRoot:   DefaultStateRoot,
-		ReadyURL:    DefaultReadyURL,
 	}
 }
 

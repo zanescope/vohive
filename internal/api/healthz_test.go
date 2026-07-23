@@ -17,7 +17,7 @@ func TestPublicHealthEndpoints(t *testing.T) {
 		body string
 	}{
 		{path: "/healthz", body: `{"status":"ok"}`},
-		{path: "/readyz", body: `{"status":"ready"}`},
+		{path: "/readyz", body: `{"status":"ready","version":"Unknown"}`},
 	}
 
 	for _, tt := range tests {

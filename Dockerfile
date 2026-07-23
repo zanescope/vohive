@@ -62,6 +62,6 @@ ENV CONFIG_PATH=/app/config/config.yaml
 EXPOSE 7575
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -q -T 5 -O /dev/null http://127.0.0.1:7575/healthz || exit 1
+  CMD ["/usr/local/bin/vohivectl", "probe", "--liveness", "--config", "/app/config/config.yaml"]
 ENTRYPOINT ["/usr/local/bin/vohive"]
 CMD ["-c", "/app/config/config.yaml"]

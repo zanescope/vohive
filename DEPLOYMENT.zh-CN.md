@@ -243,11 +243,11 @@ Web 页面不再直接让进程替换自身。推荐流程是：
 当前提供两个无需登录、只返回最小信息的接口：
 
 - `GET /healthz`：进程事件循环和 HTTP 服务可响应即返回 200，用于 systemd/Docker 存活检查。
-- `GET /readyz`：配置已加载、数据库可用、核心服务完成初始化时返回 200，用于安装和更新确认。
+- `GET /readyz`：配置已加载、数据库可用、核心服务完成初始化时返回 200；响应包含运行版本，更新器传入随机挑战时还返回基于 root-only 密钥的证明，用于排除错误端口上的其他进程。
 
-响应不包含设备标识、配置路径、版本细节或其他敏感信息。
+响应不包含设备标识、配置路径或其他敏感信息。就绪证明不能脱离每次随机挑战重放。
 
-Dockerfile 和 Compose 都已声明 healthcheck，当前使用镜像内的 `wget` 请求 `/healthz`。
+Dockerfile 和 Compose 都已声明 healthcheck，当前使用镜像内的 `vohivectl` 从配置解析实际 `server.port` 后请求 `/healthz`。
 
 ## 9. Docker Compose 方案
 
@@ -266,7 +266,7 @@ logs/
 - 复制 `.env.example` 为 `.env` 后必须填入不可变镜像 digest；缺失时 Compose 直接报错。
 - 使用 `network_mode: host`，不再声明无效的 `ports` 映射，也不硬编码代理。
 - 主容器不挂载 Docker Socket、不替换自身二进制；没有受限宿主机更新代理时，Web 更新 fail closed。
-- Dockerfile 与 Compose 都使用 `/healthz`；正式镜像只发布 `amd64`、`arm64`，armv7 走原生安装或 OpenWrt。
+- Dockerfile 与 Compose 都通过 `vohivectl` 按配置端口检查 `/healthz`；正式镜像只发布 `amd64`、`arm64`，armv7 走原生安装或 OpenWrt。
 - 配置、数据和日志均由宿主机 bind mount 持久化，镜像升级不得覆盖配置。
 
 当前版本按 `CONTAINER.md` 手工保存旧 digest、拉取并解析新 digest、重建、检查 healthy，失败时恢复旧 `.env`。仓库尚未提供 `install-docker.sh` 或可控制宿主 Docker 的 `vohivectl update`，前端不会把多条宿主机命令伪装成“一键更新”。

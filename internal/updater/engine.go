@@ -219,19 +219,24 @@ func (e *Engine) Update(ctx context.Context, request UpdateRequest) (state Trans
 	if err := e.saveState(paths, &state, PhaseStarting, nil); err != nil {
 		return e.rollbackFailedUpdate(paths, originalDeployment, state, err, false)
 	}
+	readiness, err := e.prepareReadiness(paths, deployment, candidate.Manifest.Version)
+	if err != nil {
+		return e.rollbackFailedUpdate(paths, originalDeployment, state, err, false)
+	}
 	if err := e.Service.Start(ctx); err != nil {
 		return e.rollbackFailedUpdate(paths, originalDeployment, state, fmt.Errorf("start new version: %w", err), false)
 	}
 	if err := e.saveState(paths, &state, PhaseVerifyingService, nil); err != nil {
 		return e.rollbackFailedUpdate(paths, originalDeployment, state, err, false)
 	}
-	if err := waitReady(ctx, e.Ready, deployment.ReadyURL, e.readyTimeout(), e.readyInterval(), e.stableFor()); err != nil {
+	if err := e.waitManagedReady(ctx, readiness); err != nil {
 		return e.rollbackFailedUpdate(paths, originalDeployment, state, err, false)
 	}
 
 	deployment.LastGoodVersion = normalizeVersion(previousVersion)
 	deployment.CurrentVersion = normalizeVersion(candidate.Manifest.Version)
 	deployment.Channel = channel
+	deployment.ReadyURL = readiness.Endpoint
 	if err := SaveDeployment(paths.DeploymentFile, deployment); err != nil {
 		return e.rollbackFailedUpdate(paths, originalDeployment, state, fmt.Errorf("save deployment metadata: %w", err), false)
 	}
@@ -346,13 +351,18 @@ func (e *Engine) Rollback(ctx context.Context) (TransactionState, error) {
 	if err := switchVersionPointer(paths, paths.LastGoodLink(), currentTarget); err != nil {
 		return e.restoreRollbackOriginal(paths, originalDeployment, state, err)
 	}
+	readiness, err := e.prepareReadiness(paths, deployment, deployment.LastGoodVersion)
+	if err != nil {
+		return e.restoreRollbackOriginal(paths, originalDeployment, state, err)
+	}
 	if err := e.Service.Start(ctx); err != nil {
 		return e.restoreRollbackOriginal(paths, originalDeployment, state, err)
 	}
-	if err := waitReady(ctx, e.Ready, deployment.ReadyURL, e.readyTimeout(), e.readyInterval(), e.stableFor()); err != nil {
+	if err := e.waitManagedReady(ctx, readiness); err != nil {
 		return e.restoreRollbackOriginal(paths, originalDeployment, state, err)
 	}
 	deployment.CurrentVersion, deployment.LastGoodVersion = deployment.LastGoodVersion, deployment.CurrentVersion
+	deployment.ReadyURL = readiness.Endpoint
 	if err := SaveDeployment(paths.DeploymentFile, deployment); err != nil {
 		return e.restoreRollbackOriginal(paths, originalDeployment, state, err)
 	}
@@ -363,7 +373,7 @@ func (e *Engine) Rollback(ctx context.Context) (TransactionState, error) {
 }
 
 func (e *Engine) Recover(ctx context.Context, startService bool) (TransactionState, error) {
-	deployment, paths, err := e.load()
+	_, paths, err := e.load()
 	if err != nil {
 		return TransactionState{}, err
 	}
@@ -417,7 +427,7 @@ func (e *Engine) Recover(ctx context.Context, startService bool) (TransactionSta
 			return e.manualRecovery(paths, state, interruptedErr, cleanupErr)
 		}
 		if startService {
-			state, err = e.startRestoredService(paths, state, deployment.ReadyURL, interruptedErr)
+			state, err = e.startRestoredService(paths, state, interruptedErr)
 			if err != nil {
 				return state, err
 			}
@@ -435,7 +445,7 @@ func (e *Engine) Recover(ctx context.Context, startService bool) (TransactionSta
 		return e.manualRecovery(paths, state, errors.New("recover interrupted update"), cleanupErr)
 	}
 	if startService {
-		state, err = e.startRestoredService(paths, state, deployment.ReadyURL, errors.New("recover interrupted update"))
+		state, err = e.startRestoredService(paths, state, errors.New("recover interrupted update"))
 		if err != nil {
 			return state, err
 		}
@@ -519,11 +529,19 @@ func (e *Engine) restoreOriginalState(paths RuntimePaths, state TransactionState
 	return errors.Join(restoreErrors...)
 }
 
-func (e *Engine) startRestoredService(paths RuntimePaths, state TransactionState, readyURL string, original error) (TransactionState, error) {
+func (e *Engine) startRestoredService(paths RuntimePaths, state TransactionState, original error) (TransactionState, error) {
+	deployment, err := LoadDeployment(paths.DeploymentFile)
+	if err != nil {
+		return e.manualRecovery(paths, state, original, fmt.Errorf("load restored deployment metadata: %w", err))
+	}
+	readiness, err := e.prepareReadiness(paths, deployment, deployment.CurrentVersion)
+	if err != nil {
+		return e.manualRecovery(paths, state, original, err)
+	}
 	if err := e.Service.Start(context.Background()); err != nil {
 		return e.manualRecovery(paths, state, original, fmt.Errorf("start restored service: %w", err))
 	}
-	if err := waitReady(context.Background(), e.Ready, readyURL, e.readyTimeout(), e.readyInterval(), e.stableFor()); err != nil {
+	if err := e.waitManagedReady(context.Background(), readiness); err != nil {
 		stopErr := e.Service.Stop(context.Background())
 		if stopErr != nil {
 			err = errors.Join(err, fmt.Errorf("stop unhealthy restored service: %w", stopErr))
@@ -541,7 +559,7 @@ func (e *Engine) restoreRollbackOriginal(paths RuntimePaths, deployment Deployme
 		return e.manualRecovery(paths, state, original, restoreErr)
 	}
 	var err error
-	state, err = e.startRestoredService(paths, state, deployment.ReadyURL, original)
+	state, err = e.startRestoredService(paths, state, original)
 	if err != nil {
 		return state, err
 	}
@@ -566,7 +584,7 @@ func (e *Engine) rollbackFailedUpdate(paths RuntimePaths, deployment Deployment,
 		return e.manualRecovery(paths, state, original, cleanupErr)
 	}
 	var err error
-	state, err = e.startRestoredService(paths, state, deployment.ReadyURL, original)
+	state, err = e.startRestoredService(paths, state, original)
 	if err != nil {
 		return state, err
 	}
@@ -603,6 +621,39 @@ func (e *Engine) load() (Deployment, RuntimePaths, error) {
 		return Deployment{}, RuntimePaths{}, err
 	}
 	return deployment, paths, nil
+}
+
+func (e *Engine) prepareReadiness(paths RuntimePaths, deployment Deployment, version string) (ReadyExpectation, error) {
+	endpoint, err := ResolveReadyURL(deployment)
+	if err != nil {
+		return ReadyExpectation{}, fmt.Errorf("resolve readiness endpoint: %w", err)
+	}
+	keyFile := paths.ReadinessKeyFile()
+	if err := RotateReadinessKey(keyFile); err != nil {
+		return ReadyExpectation{}, err
+	}
+	canonicalVersion := normalizeVersion(version)
+	return ReadyExpectation{
+		Endpoint:        endpoint,
+		ExpectedVersion: canonicalVersion,
+		KeyFile:         keyFile,
+		AllowLegacy:     strings.HasPrefix(canonicalVersion, "v0.0.0-legacy."),
+	}, nil
+}
+
+func (e *Engine) waitManagedReady(ctx context.Context, expectation ReadyExpectation) error {
+	checker := managedReadyChecker{
+		service: e.Service,
+		next:    e.Ready,
+	}
+	return waitReady(
+		ctx,
+		checker,
+		expectation,
+		e.readyTimeout(),
+		e.readyInterval(),
+		e.stableFor(),
+	)
 }
 
 func (e *Engine) now() time.Time {

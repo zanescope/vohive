@@ -194,7 +194,7 @@ container_hygiene() {
 		return 1
 	fi
 	for file in Dockerfile Dockerfile.github Dockerfile.runtime; do
-		for needle in 'ARG ALPINE_VERSION=3.23' 'org.opencontainers.image.source' 'org.opencontainers.image.revision' 'org.opencontainers.image.version' '/healthz'; do
+		for needle in 'ARG ALPINE_VERSION=3.23' 'org.opencontainers.image.source' 'org.opencontainers.image.revision' 'org.opencontainers.image.version' '/usr/local/bin/vohivectl' '"--liveness"'; do
 			if ! grep -Fq -- "$needle" "$file"; then
 				printf '%s is missing required image constraint: %s\n' "$file" "$needle" >&2
 				return 1
@@ -246,7 +246,7 @@ container_hygiene() {
 			return 1
 		fi
 	done
-	for needle in 'VOHIVE_IMAGE:?' 'ghcr.io/zanescope/vohive@sha256:<digest>' 'network_mode: host' '/healthz'; do
+	for needle in 'VOHIVE_IMAGE:?' 'ghcr.io/zanescope/vohive@sha256:<digest>' 'network_mode: host' '/usr/local/bin/vohivectl' '"--liveness"'; do
 		if ! grep -Fq -- "$needle" "$compose"; then
 			printf 'Compose file is missing constraint: %s\n' "$needle" >&2
 			return 1
