@@ -119,6 +119,8 @@ type Worker struct {
 	cacheTime           time.Time
 	cacheMu             sync.RWMutex
 	state               deviceStateStore
+	transientATOnce     sync.Once
+	transientATGate     chan struct{}
 	rotateMu            sync.Mutex // 防止并发换 IP
 	consecutiveFailures int        // 连续切换失败次数
 
@@ -551,12 +553,29 @@ type liveSIMIdentityRefreshResult struct {
 	IMSI  string
 }
 
+type LiveSIMIdentity struct {
+	ICCID string
+	IMSI  string
+}
+
+func (w *Worker) RefreshIdentityLiveVerified(ctx context.Context, reason string) (LiveSIMIdentity, error) {
+	result, err := w.refreshIdentityLiveWithOptions(ctx, reason, true)
+	return LiveSIMIdentity{ICCID: result.ICCID, IMSI: result.IMSI}, err
+}
+
 func (w *Worker) RefreshIdentityLive(ctx context.Context, reason string) error {
 	_, err := w.refreshIdentityLive(ctx, reason)
 	return err
 }
 
 func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSIMIdentityRefreshResult, error) {
+	return w.refreshIdentityLiveWithOptions(ctx, reason, false)
+}
+
+// refreshIdentityLiveWithOptions replaces both cached SIM identifiers only for
+// verified callers. This prevents a partial live read from pairing a new IMSI
+// with a stale ICCID (or vice versa) in overview and persistence paths.
+func (w *Worker) refreshIdentityLiveWithOptions(ctx context.Context, reason string, replaceSIMIdentity bool) (liveSIMIdentityRefreshResult, error) {
 	if w == nil {
 		return liveSIMIdentityRefreshResult{}, fmt.Errorf("worker_nil")
 	}
@@ -626,6 +645,9 @@ func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSI
 		}
 	}
 	result := liveSIMIdentityRefreshResult{ICCID: iccid, IMSI: imsi}
+	if replaceSIMIdentity && iccid == "" && imsi == "" {
+		return result, fmt.Errorf("live_identity_empty")
+	}
 	if iccid == "" && imsi == "" && nativeSPN == "" && !hasSIMMetadata(simMetadata) {
 		return result, fmt.Errorf("live_identity_empty")
 	}
@@ -644,12 +666,18 @@ func (w *Worker) refreshIdentityLive(ctx context.Context, reason string) (liveSI
 		w.cacheMu.Unlock()
 		return result, err
 	}
-	identityChangedForSPN := (iccid != "" && iccid != strings.TrimSpace(w.state.Identity.ICCID)) ||
-		(imsi != "" && imsi != strings.TrimSpace(w.state.Identity.IMSI))
-	if iccid != "" {
+	currentICCID := strings.TrimSpace(w.state.Identity.ICCID)
+	currentIMSI := strings.TrimSpace(w.state.Identity.IMSI)
+	identityChangedForSPN := (iccid != "" && iccid != currentICCID) ||
+		(imsi != "" && imsi != currentIMSI)
+	if replaceSIMIdentity {
+		identityChangedForSPN = iccid != currentICCID || imsi != currentIMSI
+		w.state.Identity.ICCID = iccid
+		w.state.Identity.IMSI = imsi
+	} else if iccid != "" {
 		w.state.Identity.ICCID = iccid
 	}
-	if imsi != "" {
+	if !replaceSIMIdentity && imsi != "" {
 		w.state.Identity.IMSI = imsi
 	}
 	if nativeSPN != "" {
@@ -2784,38 +2812,27 @@ func (p *Pool) PersistIdentityState(worker *Worker) {
 	if worker == nil {
 		return
 	}
-
+	p.PersistIdentityOnly(worker)
 	status := worker.ProjectDeviceStatus()
-	iccid := strings.TrimSpace(status.ICCID)
-	imsi := strings.TrimSpace(status.IMSI)
-	if iccid == "" {
-		return
-	}
 	imei := strings.TrimSpace(status.IMEI)
-	operator := strings.TrimSpace(status.Operator)
-
-	if imei == "" {
-		logger.Warn(fmt.Sprintf("[%s] 无法同步设备 SIM 身份：IMEI 为空", worker.ID))
+	imsi := strings.TrimSpace(status.IMSI)
+	iccid := strings.TrimSpace(status.ICCID)
+	if imsi == "" && iccid == "" {
 		return
 	}
-
-	if err := db.UpsertSIMCard(iccid, imsi, "", operator, &imei); err != nil {
-		logger.Warn(fmt.Sprintf("[%s] 更新 SIM 卡信息失败", worker.ID), "err", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := p.PersistPhoneNumber(ctx, worker, imsi, iccid, false)
+	if result.Err != nil {
+		logger.Debug("phone number sync failed", "device", worker.ID, "channel", result.Channel, "err", result.Err)
 	}
-	if err := db.UpdateDeviceCurrentSIM(imei, &iccid); err != nil {
-		logger.Warn(fmt.Sprintf("[%s] 更新设备 SIM 关联失败", worker.ID), "err", err)
+	if imei != "" && iccid != "" {
+		logger.Info(fmt.Sprintf("[%s] \u8bbe\u5907 SIM \u8eab\u4efd\u5df2\u540c\u6b65\u5230\u6570\u636e\u5e93", worker.ID),
+			"imei", imei, "iccid", iccid, "backend", func() string {
+				if worker.Backend != nil {
+					return worker.Backend.Mode()
+				}
+				return "none"
+			}())
 	}
-	if phone := strings.TrimSpace(worker.getPhoneNumberWithContext(context.Background())); phone != "" {
-		if err := db.RecordModemPhoneNumber(imsi, iccid, phone); err != nil {
-			logger.Warn(fmt.Sprintf("[%s] 更新调制解调器本机号码失败", worker.ID), "err", err)
-		}
-	}
-
-	logger.Info(fmt.Sprintf("[%s] 设备 SIM 身份已同步到数据库", worker.ID),
-		"imei", imei, "iccid", iccid, "backend", func() string {
-			if worker.Backend != nil {
-				return worker.Backend.Mode()
-			}
-			return "none"
-		}())
 }

@@ -29,7 +29,7 @@ import { getMccMncIndex, isoToFlagEmoji, type MccMncRow } from '../utils/mcc-mnc
 import type { CardPolicy, CarrierWebsheetInfo, DeviceConfigDTO, DeviceMgmtListItem, DeviceOverviewItem, DiscoveredDevice, ModemStatus, PNNRecord, RealtimeTrafficSnapshot } from '../types/api'
 import type { AppError } from '../types/domain'
 import { toAppError } from '../services/http'
-import { devicesService } from '../services/devices'
+import { devicesService, type PhoneNumberActionResponse } from '../services/devices'
 import { cardsService } from '../services/cards'
 import { createEmptyTrafficAnalysis, trafficService, type TrafficRange } from '../services/traffic'
 import {
@@ -73,6 +73,8 @@ const saving = ref(false)
 const rotating = ref(false)
 const reconnectingVoWiFi = ref(false)
 const e911Starting = ref(false)
+const phoneNumberRefreshing = ref(false)
+const phoneNumberSaving = ref(false)
 const e911WebsheetOpen = ref(false)
 const e911Websheet = ref<CarrierWebsheetInfo | null>(null)
 const deleting = ref(false)
@@ -845,6 +847,66 @@ async function finishE911Websheet() {
   await refreshDeviceViews()
 }
 
+function applyPhoneNumberAction(id: string, payload: PhoneNumberActionResponse) {
+  if (selectedDetail.value?.id !== id) return
+  selectedDetail.value = {
+    ...selectedDetail.value,
+    local_phone: payload.local_phone || '',
+    local_phone_source: payload.local_phone_source || 'none'
+  }
+}
+
+async function refreshLocalPhoneNumber() {
+  const id = String(selectedDetail.value?.id || '').trim()
+  if (!id || phoneNumberRefreshing.value) return
+  phoneNumberRefreshing.value = true
+  try {
+    const result = await devicesService.refreshPhoneNumber(id)
+    if (!result.ok) throw new Error(result.error.message || '\u83b7\u53d6\u672c\u673a\u53f7\u7801\u5931\u8d25')
+    applyPhoneNumberAction(id, result.data)
+    if (result.data.acquired) {
+      ElMessage.success(result.data.message || '\u672c\u673a\u53f7\u7801\u5df2\u5237\u65b0')
+    } else {
+      ElMessage.warning(result.data.message || '\u672a\u83b7\u53d6\u5230\u672c\u673a\u53f7\u7801')
+    }
+  } catch (e: unknown) {
+    const err = toAppError(e)
+    ElMessage.error(err.message || '\u83b7\u53d6\u672c\u673a\u53f7\u7801\u5931\u8d25')
+  } finally {
+    phoneNumberRefreshing.value = false
+  }
+}
+
+async function editLocalPhoneNumber() {
+  const detail = selectedDetail.value
+  const id = String(detail?.id || '').trim()
+  if (!id || phoneNumberSaving.value) return
+  const inputValue = detail?.local_phone_source === 'manual' ? (detail.local_phone || '') : ''
+  const value = await ElMessageBox.prompt(
+    '\u7559\u7a7a\u5e76\u786e\u8ba4\u53ef\u6e05\u9664\u624b\u52a8\u8986\u76d6\uff0c\u5e76\u6062\u590d\u81ea\u52a8\u83b7\u53d6\u7684\u53f7\u7801\u3002',
+    '\u624b\u52a8\u8bbe\u7f6e\u672c\u673a\u53f7\u7801',
+    {
+      inputValue,
+      inputPlaceholder: '\u4f8b\u5982 +8613800138000',
+      confirmButtonText: '\u4fdd\u5b58',
+      cancelButtonText: '\u53d6\u6d88'
+    }
+  ).then(({ value }) => String(value ?? '')).catch(() => null)
+  if (value === null) return
+
+  phoneNumberSaving.value = true
+  try {
+    const result = await devicesService.setManualPhoneNumber(id, value)
+    if (!result.ok) throw new Error(result.error.message || '\u4fdd\u5b58\u672c\u673a\u53f7\u7801\u5931\u8d25')
+    applyPhoneNumberAction(id, result.data)
+    ElMessage.success(result.data.message || '\u672c\u673a\u53f7\u7801\u5df2\u66f4\u65b0')
+  } catch (e: unknown) {
+    const err = toAppError(e)
+    ElMessage.error(err.message || '\u4fdd\u5b58\u672c\u673a\u53f7\u7801\u5931\u8d25')
+  } finally {
+    phoneNumberSaving.value = false
+  }
+}
 const rebooting = ref(false)
 async function rebootModem() {
   const id = String(selectedId.value || '').trim()
@@ -1298,6 +1360,10 @@ usePollingScheduler(async () => {
                   :traffic-minute-rx="rollingMinuteRx"
                   :traffic-minute-tx="rollingMinuteTx"
                   :e911-starting="e911Starting"
+                  :phone-number-refreshing="phoneNumberRefreshing"
+                  :phone-number-saving="phoneNumberSaving"
+                  @refresh-phone-number="refreshLocalPhoneNumber"
+                  @edit-phone-number="editLocalPhoneNumber"
                   @setup-e911="openE911Websheet"
                 />
                 <TrafficAnalysisPanel

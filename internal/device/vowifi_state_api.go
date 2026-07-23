@@ -137,3 +137,9 @@ func (p *Pool) clearVoWiFiStartupStateAndBroadcast(deviceID string) {
 func (p *Pool) broadcastVoWiFiStateChange(deviceID string) {
 	p.voWiFiHost().BroadcastState(deviceID)
 }
+
+// BroadcastOverviewStateChange wakes overview SSE subscribers after a
+// SIM-scoped display value changes outside the runtime state machine.
+func (p *Pool) BroadcastOverviewStateChange(deviceID string) {
+	p.broadcastVoWiFiStateChange(deviceID)
+}
