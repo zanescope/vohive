@@ -6,8 +6,13 @@ umask 077
 PURGE=0
 ASSUME_YES=0
 KEEP_CONFIG=0
+LOCK_FILE='/var/lib/vohive/update/update.lock'
+LOCK_HELD=0
+LOCK_BOOT_ID=''
+LOCK_PROCESS_START_TICKS=''
 
 say() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
@@ -62,10 +67,57 @@ refuse_active_transaction_services() {
 	done
 }
 
-refuse_unresolved_lock() {
-	if [ -e /var/lib/vohive/update/update.lock ] || [ -L /var/lib/vohive/update/update.lock ]; then
+release_uninstall_lock() {
+	[ "$LOCK_HELD" -eq 1 ] || return 0
+	[ -f "$LOCK_FILE" ] && [ ! -L "$LOCK_FILE" ] || return 1
+	locked_pid=$(sed -n 's/^pid=//p' "$LOCK_FILE" | sed -n '1p')
+	locked_boot_id=$(sed -n 's/^boot_id=//p' "$LOCK_FILE" | sed -n '1p')
+	locked_start_ticks=$(sed -n 's/^process_start_ticks=//p' "$LOCK_FILE" | sed -n '1p')
+	if [ "$locked_pid" != "$$" ] ||
+		[ "$locked_boot_id" != "$LOCK_BOOT_ID" ] ||
+		[ "$locked_start_ticks" != "$LOCK_PROCESS_START_TICKS" ]; then
+		return 1
+	fi
+	rm -f -- "$LOCK_FILE" || return 1
+	LOCK_HELD=0
+}
+
+cleanup_uninstall_lock() {
+	if ! release_uninstall_lock; then
+		warn "could not safely release $LOCK_FILE; inspect it before installing or updating"
+	fi
+}
+
+trap cleanup_uninstall_lock 0
+
+acquire_uninstall_lock() {
+	for directory in /var/lib/vohive /var/lib/vohive/update; do
+		if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
+			die "refusing unsafe update state directory: $directory"
+		fi
+	done
+	mkdir -p /var/lib/vohive/update
+	chmod 0700 /var/lib/vohive /var/lib/vohive/update
+
+	[ -r /proc/sys/kernel/random/boot_id ] && [ -r "/proc/$$/stat" ] ||
+		die 'Linux process identity files are unavailable'
+	LOCK_BOOT_ID=$(sed -n '1p' /proc/sys/kernel/random/boot_id)
+	LOCK_PROCESS_START_TICKS=$(sed 's/^[^)]*) //' "/proc/$$/stat" | awk '{print $20}')
+	case "$LOCK_BOOT_ID" in
+		''|*[!0-9A-Fa-f-]*) die 'invalid Linux boot identity' ;;
+	esac
+	case "$LOCK_PROCESS_START_TICKS" in
+		''|*[!0-9]*) die 'invalid uninstaller process start time' ;;
+	esac
+	started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	if ! (
+		set -C
+		printf 'pid=%s\nstarted=%s\nboot_id=%s\nprocess_start_ticks=%s\n' \
+			"$$" "$started_at" "$LOCK_BOOT_ID" "$LOCK_PROCESS_START_TICKS" >"$LOCK_FILE"
+	) 2>/dev/null; then
 		die 'an install or update transaction is unresolved; wait for it to finish, or reboot for boot recovery and then run vohivectl doctor'
 	fi
+	LOCK_HELD=1
 }
 
 stop_services() {
@@ -118,12 +170,11 @@ make_purge_backup() {
 }
 
 refuse_active_transaction_services
-refuse_unresolved_lock
-stop_services
-# Close the small preflight-to-stop race without ever killing a transaction
-# worker. A worker that started meanwhile keeps its files intact.
+acquire_uninstall_lock
+# A worker that appeared during lock acquisition is still detected before the
+# main service or any files are touched. New workers cannot pass this lock.
 refuse_active_transaction_services
-refuse_unresolved_lock
+stop_services
 
 if [ "$PURGE" -eq 1 ]; then
 	if [ "$ASSUME_YES" -ne 1 ]; then
@@ -152,6 +203,7 @@ if [ "$PURGE" -eq 1 ]; then
 		[ ! -e /opt/vohive/config ] || safe_remove_tree /opt/vohive/config
 	fi
 	[ ! -e /var/lib/vohive ] || safe_remove_tree /var/lib/vohive
+	LOCK_HELD=0
 	[ ! -e /opt/vohive/data ] || safe_remove_tree /opt/vohive/data
 	[ ! -e /opt/vohive/logs ] || safe_remove_tree /opt/vohive/logs
 fi
@@ -161,5 +213,7 @@ rmdir /opt/vohive/bin /opt/vohive 2>/dev/null || true
 if [ "$PURGE" -eq 1 ]; then
 	say 'VoHive programs and user data were removed. The recovery backup remains under /var/backups.'
 else
+	release_uninstall_lock ||
+		die "programs were removed, but $LOCK_FILE could not be safely released; inspect it before reinstalling"
 	say 'VoHive programs were removed. Configuration and user data were retained.'
 fi
