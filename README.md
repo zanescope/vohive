@@ -10,14 +10,24 @@ VoHive 把模组热插拔管理、SOCKS5/HTTP 代理编排、短信收发、VoWi
 
 ## 安装与部署
 
-从 `v1.6.0` 起，正式 GitHub Release 提供内置发布公钥的签名原生安装器：
+从 `v1.6.0` 起，正式 GitHub Release 提供内置发布公钥的签名原生安装器。首次安装先安装
+[GitHub CLI](https://cli.github.com/)，再验证固定信任基线的 GitHub 构建来源；只有验证成功才交给 root：
 
 ```sh
-curl -fsSLO https://github.com/zanescope/vohive/releases/latest/download/vohive-install.sh
+VOHIVE_BOOTSTRAP_VERSION=v1.6.0
+curl --proto '=https' --tlsv1.2 -fsSLO \
+  "https://github.com/zanescope/vohive/releases/download/${VOHIVE_BOOTSTRAP_VERSION}/vohive-install.sh"
+gh attestation verify vohive-install.sh \
+  --repo zanescope/vohive \
+  --signer-workflow zanescope/vohive/.github/workflows/binary-release.yml \
+  --source-ref "refs/tags/${VOHIVE_BOOTSTRAP_VERSION}" \
+  --deny-self-hosted-runners
 sudo sh vohive-install.sh
 ```
 
-安装器支持 `amd64`、`arm64`、`armv7`，保留用户配置，并使用事务更新、健康检查和失败回滚。`v1.5.x` 及更早版本需要先运行 `v1.6.0+` Release 中的安装器迁移，不能继续使用旧的文件热替换更新。
+这一步防止被替换的 Release 附件以 root 权限运行。固定的 `v1.6.0` 安装器只负责建立信任根，随后会从签名清单选择当前 stable/beta 目标。不要跳过 `gh attestation verify` 的成功结果。
+
+安装器支持 `amd64`、`arm64`、`armv7`，保留用户配置，并使用事务更新、健康检查和失败回滚。`v1.5.x` 及更早版本需要先运行这份已验证的 `v1.6.0` 安装器迁移，不能继续使用旧的文件热替换更新。
 
 详细规则见[《小白友好安装与更新方案》](DEPLOYMENT.zh-CN.md)。Docker 用户请按 [CONTAINER.md](CONTAINER.md) 使用 GHCR 镜像 digest；容器内自更新会 fail closed。
 

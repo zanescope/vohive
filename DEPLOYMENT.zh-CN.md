@@ -2,7 +2,7 @@
 
 ## 1. 目标与范围
 
-本文设计一套面向非开发者的 VoHive 交付方案。用户不需要安装 Go、Node.js、Git 或手动编辑源码，只需要会复制两行安装命令，日常更新可在 Web 页面点击按钮。
+本文设计一套面向非开发者的 VoHive 交付方案。用户不需要安装 Go、Node.js、Git 或手动编辑源码，只需复制一段带来源校验的安装命令，日常更新可在 Web 页面点击按钮。
 
 目标：
 
@@ -96,9 +96,20 @@
 项目首页只保留一个醒目的首选安装入口：
 
 ```sh
-curl -fsSLO https://github.com/zanescope/vohive/releases/latest/download/vohive-install.sh
+VOHIVE_BOOTSTRAP_VERSION=v1.6.0
+curl --proto '=https' --tlsv1.2 -fsSLO \
+  "https://github.com/zanescope/vohive/releases/download/${VOHIVE_BOOTSTRAP_VERSION}/vohive-install.sh"
+gh attestation verify vohive-install.sh \
+  --repo zanescope/vohive \
+  --signer-workflow zanescope/vohive/.github/workflows/binary-release.yml \
+  --source-ref "refs/tags/${VOHIVE_BOOTSTRAP_VERSION}" \
+  --deny-self-hosted-runners
 sudo sh vohive-install.sh
 ```
+
+运行前需要按 [GitHub CLI 官方说明](https://cli.github.com/)安装 `gh`；如果公共证明查询要求登录，先执行 `gh auth login`。验证必须同时匹配唯一仓库、固定发布工作流、`v1.6.0` tag ref，并拒绝 self-hosted runner。任何验证错误都应停止，不能继续执行安装器。
+
+这里固定下载 `v1.6.0` 是为了固定 bootstrap 信任基线，而不是把目标版本固定在 `v1.6.0`。验证后的安装器内置 Minisign 公钥和 bootstrap verifier 摘要，默认仍从签名清单安装最新 stable；`--channel beta` 会选择 beta。
 
 安装器必须同时支持非交互参数，方便高级用户和自动化：
 
@@ -106,7 +117,9 @@ sudo sh vohive-install.sh
 sudo sh vohive-install.sh --version v1.6.0 --channel stable
 ```
 
-不把 `curl | sh` 作为唯一方式。分两步下载后执行，用户可以先查看脚本，网络中断时也更容易重试。
+不提供 `curl | sh` 入口，也不允许把未验证的 `latest` 附件直接交给 root。分步下载、验证、执行让网络中断可重试，也让错误停在任何系统修改之前。
+
+默认安装只接受正在运行的 systemd 或 OpenWrt procd；检测不到受支持的服务管理器时会在下载和系统写入前失败。`--no-service` 是明确的高级模式，只适合已经准备好自行启动、监控和重启 VoHive 的用户；安装器不会再自动降级到未托管模式并报告普通安装成功。
 
 ### 5.2 安装器职责
 
