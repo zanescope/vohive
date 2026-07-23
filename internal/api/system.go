@@ -3,111 +3,156 @@ package api
 import (
 	"errors"
 	"net/http"
-	"os"
-	"os/exec"
+	"regexp"
+	"strings"
 	"time"
 
-	"github.com/zanescope/vohive/internal/config"
-	"github.com/zanescope/vohive/internal/updater"
-	"github.com/zanescope/vohive/pkg/logger"
 	"github.com/gin-gonic/gin"
+	"github.com/zanescope/vohive/internal/updater"
 )
 
-var errNotFound = errors.New("not found")
+var updateJobIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-// resolveUninstallTargets 计算自毁流程需要清理的数据目录和配置文件路径。
-// 配置文件路径必须来自运行时实际加载的路径（config.GetConfigPath()），
-// 不能假定其固定位于进程工作目录下的 "config" 子目录——
-// OpenWrt 部署通过 -c 显式传入 /etc/vohive/config.yaml，与工作目录无关，
-// 用硬编码相对路径删除会删错地方（实际等于什么都没删）。
-// configPath 为空（配置管理器未初始化）时不返回任何配置文件路径，避免误删。
-func resolveUninstallTargets(configPath string) (dataDir string, configFile string) {
-	return "data", configPath
+type updateCheckResponse struct {
+	Capabilities updater.Capabilities `json:"capabilities"`
+	Candidate    *updater.Candidate   `json:"candidate,omitempty"`
 }
 
-// detectServiceStopCommands 根据当前部署形态返回应执行的"停止 + 禁用自启"命令。
-// systemd 的 Restart=always 和 OpenWrt procd 的 respawn 都只在进程
-// "非主动" 退出时才会重新拉起；只要在自毁前显式请求服务管理器停止/禁用，
-// 即使后续删除可执行文件失败（例如只读 squashfs），也不会被重新拉起。
-// 仅靠"删掉自己导致 exec 失败"这种副作用来阻止重启是不可靠的。
-func detectServiceStopCommands(lookPath func(string) (string, error), statFile func(string) bool) [][]string {
-	var cmds [][]string
-	if statFile("/etc/init.d/vohive") {
-		cmds = append(cmds, []string{"/etc/init.d/vohive", "disable"})
-		cmds = append(cmds, []string{"/etc/init.d/vohive", "stop"})
-		return cmds
-	}
-	if _, err := lookPath("systemctl"); err == nil {
-		cmds = append(cmds, []string{"systemctl", "disable", "--now", "vohive"})
-	}
-	return cmds
+type startUpdateRequest struct {
+	Channel updater.Channel `json:"channel"`
+	Version string          `json:"version"`
 }
 
-// handleCheckUpdate 检查系统更新
-func (s *Server) handleCheckUpdate(c *gin.Context) {
-	info, err := updater.CheckUpdate()
+func newDefaultUpdateCoordinator() updater.Coordinator {
+	verifier, err := updater.DefaultSignatureVerifier()
 	if err != nil {
-		logger.Error("检查系统更新失败", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return updater.NewLocalCoordinator("", nil, nil)
+	}
+	resolver, err := updater.NewGitHubResolver(&http.Client{Timeout: 30 * time.Second}, verifier)
+	if err != nil {
+		return updater.NewLocalCoordinator("", nil, nil)
+	}
+	return updater.NewLocalCoordinator("", resolver, nil)
+}
+
+// SetUpdateCoordinator replaces the host update boundary. It is intended for
+// tests and embedding; production uses a signed GitHub resolver and an
+// independent system service worker.
+func (s *Server) SetUpdateCoordinator(coordinator updater.Coordinator) {
+	s.updates = coordinator
+}
+
+func (s *Server) updateCoordinator() updater.Coordinator {
+	if s.updates != nil {
+		return s.updates
+	}
+	return newDefaultUpdateCoordinator()
+}
+
+func (s *Server) handleUpdateCapabilities(c *gin.Context) {
+	capabilities, err := s.updateCoordinator().Capabilities(c.Request.Context())
+	if err != nil {
+		writeUpdateError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, info)
+	c.JSON(http.StatusOK, capabilities)
 }
 
-// handleApplyUpdate 应用系统更新
-func (s *Server) handleApplyUpdate(c *gin.Context) {
-	go func() {
-		if err := updater.ApplyUpdate(); err != nil {
-			logger.Error("应用更新失败", "err", err)
+func (s *Server) handleUpdateCheck(c *gin.Context) {
+	coordinator := s.updateCoordinator()
+	capabilities, err := coordinator.Capabilities(c.Request.Context())
+	if err != nil {
+		writeUpdateError(c, err)
+		return
+	}
+	response := updateCheckResponse{Capabilities: capabilities}
+	if !capabilities.CanCheck {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
+	var request updater.CheckRequest
+	if rawChannel := strings.TrimSpace(c.Query("channel")); rawChannel != "" {
+		channel, parseErr := updater.ParseChannel(rawChannel)
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "invalid_channel", "error": parseErr.Error()})
+			return
 		}
-	}()
-	c.JSON(http.StatusOK, gin.H{"message": "正在后台下载更新，系统稍后将自动重启..."})
+		request.Channel = channel
+	}
+	candidate, err := coordinator.Check(c.Request.Context(), request)
+	if err != nil {
+		writeUpdateError(c, err)
+		return
+	}
+	response.Candidate = &candidate
+	c.JSON(http.StatusOK, response)
 }
 
-// handleUninstall 自毁/卸载接口，用于用户拒绝免责声明时
-func (s *Server) handleUninstall(c *gin.Context) {
-	logger.Warn("用户拒绝了免责声明，正在触发自毁/卸载逻辑")
-	c.JSON(http.StatusOK, gin.H{"message": "正在卸载软件..."})
-
-	// 在后台异步执行自毁，以免请求无法返回
-	go func() {
-		time.Sleep(1 * time.Second)
-
-		// 先主动通知服务管理器停止 + 禁用自启，确保即使后面的文件删除
-		// 失败（只读文件系统等），systemd Restart=always / procd respawn
-		// 也不会把进程重新拉起来。命令异步触发(Start 不 Wait)，
-		// 避免对"停止自己"这条命令的等待造成死锁。
-		for _, args := range detectServiceStopCommands(exec.LookPath, fileExists) {
-			cmd := exec.Command(args[0], args[1:]...)
-			if err := cmd.Start(); err != nil {
-				logger.Warn("通知服务管理器停止失败", "cmd", args, "err", err)
-				continue
-			}
-			go cmd.Wait()
+func (s *Server) handleStartUpdateJob(c *gin.Context) {
+	var body startUpdateRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "invalid_request", "error": "channel and exact version must be valid JSON fields"})
+		return
+	}
+	if body.Channel != "" {
+		channel, err := updater.ParseChannel(string(body.Channel))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "invalid_channel", "error": err.Error()})
+			return
 		}
-
-		dataDir, configFile := resolveUninstallTargets(config.GetConfigPath())
-
-		if err := os.RemoveAll(dataDir); err != nil {
-			logger.Warn("清理数据目录失败", "dir", dataDir, "err", err)
-		}
-		if configFile != "" {
-			if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
-				logger.Warn("清理配置文件失败", "file", configFile, "err", err)
-			}
-		}
-		if executable, err := os.Executable(); err == nil {
-			if err := os.Remove(executable); err != nil {
-				logger.Warn("删除可执行文件失败", "file", executable, "err", err)
-			}
-		}
-
-		logger.Warn("自毁流程结束，退出进程")
-		os.Exit(0)
-	}()
+		body.Channel = channel
+	}
+	if strings.TrimSpace(body.Version) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "exact_version_required", "error": "an exact checked version is required"})
+		return
+	}
+	state, err := s.updateCoordinator().Start(c.Request.Context(), updater.UpdateRequest{
+		Schema:  1,
+		Channel: body.Channel,
+		Version: strings.TrimSpace(body.Version),
+	})
+	if err != nil {
+		writeUpdateError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, state)
 }
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+func (s *Server) handleUpdateJobState(c *gin.Context) {
+	jobID := strings.TrimSpace(c.Param("job_id"))
+	if len(jobID) == 0 || len(jobID) > 128 || !updateJobIDPattern.MatchString(jobID) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "invalid_job_id", "error": "invalid update job id"})
+		return
+	}
+	state, err := s.updateCoordinator().State(c.Request.Context(), jobID)
+	if err != nil {
+		writeUpdateError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, state)
+}
+
+func writeUpdateError(c *gin.Context, err error) {
+	status := http.StatusInternalServerError
+	code := "update_error"
+	switch {
+	case errors.Is(err, updater.ErrManualRecoveryRequired):
+		status, code = http.StatusConflict, "manual_recovery_required"
+	case errors.Is(err, updater.ErrUpdateLocked):
+		status, code = http.StatusConflict, "update_locked"
+	case errors.Is(err, updater.ErrJobNotFound):
+		status, code = http.StatusNotFound, "job_not_found"
+	case errors.Is(err, updater.ErrInvalidUpdateRequest):
+		status, code = http.StatusBadRequest, "invalid_update_request"
+	case errors.Is(err, updater.ErrTargetNotApplicable):
+		status, code = http.StatusConflict, "target_not_applicable"
+	case errors.Is(err, updater.ErrUpdateUnsupported), errors.Is(err, updater.ErrNonReleaseBuild), errors.Is(err, updater.ErrPortableUnsupported):
+		status, code = http.StatusUnprocessableEntity, "update_unsupported"
+	case errors.Is(err, updater.ErrSignatureUnavailable):
+		status, code = http.StatusUnprocessableEntity, "signature_unavailable"
+	case errors.Is(err, updater.ErrReleaseUpstream):
+		status, code = http.StatusBadGateway, "release_upstream_unavailable"
+	}
+	c.JSON(status, gin.H{"code": code, "error": err.Error()})
 }

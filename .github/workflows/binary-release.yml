@@ -6,39 +6,39 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version string (used when manually triggered)'
-        required: false
-        default: 'dev'
       enable_upx:
-        description: 'Enable UPX compression (true/false)'
+        description: Enable UPX compression
         required: false
-        default: 'true'
-      release_name:
-        description: 'Optional GitHub Release title for manual runs'
-        required: false
-        default: ''
-      release_notes:
-        description: 'Optional GitHub Release notes for manual runs'
-        required: false
-        default: ''
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: binary-release-${{ github.ref }}
+  group: binary-release-publish
   cancel-in-progress: false
+
+env:
+  EXPECTED_REPOSITORY: zanescope/vohive
+  RELEASE_POLICY: packaging/release-policy.json
 
 jobs:
   validate:
     name: Validate release gates
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
 
     steps:
+      - name: Enforce publishing identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "${EXPECTED_REPOSITORY}" ]]; then
+            echo "This workflow may publish only ${EXPECTED_REPOSITORY}; got ${GITHUB_REPOSITORY}." >&2
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -51,6 +51,9 @@ jobs:
             go.mod
             go.sum
 
+      - name: Test release manifest tooling
+        run: go test ./scripts/release-manifest
+
       - name: Run release gates
         run: ./scripts/ci.sh workflow-lint hygiene release-hygiene container-hygiene tidy test
 
@@ -58,6 +61,7 @@ jobs:
     name: Build frontend assets
     runs-on: ubuntu-latest
     needs: validate
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -66,7 +70,7 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: '24'
-          cache: 'npm'
+          cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Build frontend assets
@@ -111,37 +115,31 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Prepare build vars
+      - name: Prepare build variables
         id: vars
         shell: bash
         env:
-          INPUT_VERSION: ${{ github.event.inputs.version || 'dev' }}
-          INPUT_ENABLE_UPX: ${{ github.event.inputs.enable_upx || 'true' }}
+          ENABLE_UPX_INPUT: ${{ inputs.enable_upx }}
         run: |
+          set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME}"
+            version="${GITHUB_REF_NAME}"
           else
-            VERSION="${INPUT_VERSION}"
+            version="dev-${GITHUB_SHA::12}"
           fi
-          BUILDTIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          REVISION="${GITHUB_SHA}"
-
+          revision="$(git rev-parse HEAD)"
+          build_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          source_date_epoch="$(git show -s --format=%ct "${revision}")"
+          enable_upx="true"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            ENABLE_UPX_RAW="${INPUT_ENABLE_UPX}"
-          else
-            ENABLE_UPX_RAW="true"
+            enable_upx="${ENABLE_UPX_INPUT:-true}"
           fi
-
-          case "${ENABLE_UPX_RAW}" in
-            false|0|no|off) ENABLE_UPX=0 ;;
-            *) ENABLE_UPX=1 ;;
-          esac
-
           {
-            echo "version=${VERSION}"
-            echo "buildtime=${BUILDTIME}"
-            echo "revision=${REVISION}"
-            echo "enable_upx=${ENABLE_UPX}"
+            echo "version=${version}"
+            echo "revision=${revision}"
+            echo "build_time=${build_time}"
+            echo "source_date_epoch=${source_date_epoch}"
+            echo "enable_upx=${enable_upx}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Download frontend dist
@@ -156,168 +154,362 @@ jobs:
           rm -rf internal/web/dist
           cp -R web/dist internal/web/dist
 
-      - name: Build binary
+      - name: Build binaries
         shell: bash
+        env:
+          VOHIVE_MINISIGN_PUBLIC_KEYS: ${{ vars.VOHIVE_MINISIGN_PUBLIC_KEYS }}
         run: |
+          set -euo pipefail
+          public_key_pattern='^RW[A-Za-z0-9+/]{54}(;RW[A-Za-z0-9+/]{54})*$'
+          if [[ -z "${VOHIVE_MINISIGN_PUBLIC_KEYS}" ]] || ! [[ "${VOHIVE_MINISIGN_PUBLIC_KEYS}" =~ ${public_key_pattern} ]]; then
+            echo "VOHIVE_MINISIGN_PUBLIC_KEYS must contain one or more semicolon-separated minisign public keys." >&2
+            exit 1
+          fi
           mkdir -p dist
+          ldflags="-s -w -X 'github.com/zanescope/vohive/internal/global.Version=${{ steps.vars.outputs.version }}' -X 'github.com/zanescope/vohive/internal/global.BuildTime=${{ steps.vars.outputs.build_time }}' -X 'github.com/zanescope/vohive/internal/updater.UpdaterVersion=${{ steps.vars.outputs.version }}' -X 'github.com/zanescope/vohive/internal/updater.TrustedMinisignPublicKeys=${VOHIVE_MINISIGN_PUBLIC_KEYS}'"
           CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
-            go build -trimpath -buildvcs=false -tags "with_utls" \
-            -ldflags "-s -w -X 'github.com/zanescope/vohive/internal/global.Version=${{ steps.vars.outputs.version }}' -X 'github.com/zanescope/vohive/internal/global.BuildTime=${{ steps.vars.outputs.buildtime }}'" \
-            -o dist/vo-hive ./cmd/vohive
+            go build -trimpath -buildvcs=false -tags "with_utls nomsgpack" \
+            -ldflags "${ldflags}" -o dist/vohive ./cmd/vohive
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
+            go build -trimpath -buildvcs=false -tags "with_utls nomsgpack" \
+            -ldflags "${ldflags}" -o dist/vohivectl ./cmd/vohivectl
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
+            go build -trimpath -buildvcs=false -ldflags "-s -w" \
+            -o dist/vohive-verify ./cmd/vohive-verify
 
       - name: Install UPX
-        if: ${{ steps.vars.outputs.enable_upx == '1' }}
+        if: ${{ steps.vars.outputs.enable_upx == 'true' }}
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y upx-ucl || sudo apt-get install -y upx
 
-      - name: Compress with UPX
-        if: ${{ steps.vars.outputs.enable_upx == '1' }}
-        shell: bash
+      - name: Compress binaries
+        if: ${{ steps.vars.outputs.enable_upx == 'true' }}
         run: |
-          upx --best --lzma dist/vo-hive || upx -9 dist/vo-hive
+          upx --best --lzma dist/vohive || upx -9 dist/vohive
+          upx --best --lzma dist/vohivectl || upx -9 dist/vohivectl
 
-      - name: Package artifacts
+      - name: Package archive
         shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.vars.outputs.source_date_epoch }}
         run: |
-          OUT="vohive_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}"
-          mkdir -p out
-          cp dist/vo-hive "out/${OUT}"
+          set -euo pipefail
+          archive="vohive_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}.tar.gz"
+          verifier="vohive-verify_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}"
+          mkdir -p package out
+          install -m 0755 dist/vohive package/vohive
+          install -m 0755 dist/vohivectl package/vohivectl
+          install -m 0755 dist/vohive-verify "out/${verifier}"
+          install -m 0644 LICENSE package/LICENSE
+          tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+            -C package -cf - LICENSE vohive vohivectl | gzip -n -9 > "out/${archive}"
 
-      - name: Upload artifacts
+      - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.artifact_arch }}
           path: out/*
+          if-no-files-found: error
           retention-days: 3
 
-  release:
-    name: Publish Release Assets
+  bundle:
+    name: Build release bundle
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+    outputs:
+      version: ${{ steps.release_vars.outputs.version }}
+      channel: ${{ steps.release_vars.outputs.channel }}
+      advance_alias: ${{ steps.alias_gate.outputs.advance_alias }}
+      source_revision: ${{ steps.release_vars.outputs.source_revision }}
 
     steps:
-      - name: Prepare release vars
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version and channel
         id: release_vars
         shell: bash
-        env:
-          INPUT_VERSION: ${{ github.event.inputs.version || 'dev' }}
-          INPUT_RELEASE_NAME: ${{ github.event.inputs.release_name || '' }}
-          INPUT_RELEASE_NOTES: ${{ github.event.inputs.release_notes || '' }}
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            RELEASE_VERSION="${GITHUB_REF_NAME}"
-            RELEASE_NAME="${GITHUB_REF_NAME}"
-            RELEASE_BODY=""
+          set -euo pipefail
+          source_revision="$(git rev-parse HEAD)"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="dev-${source_revision:0:12}"
+            channel="dev"
+          elif [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            version="${GITHUB_REF_NAME}"
+            channel="stable"
+          elif [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.(0|[1-9][0-9]*)$ ]]; then
+            version="${GITHUB_REF_NAME}"
+            channel="beta"
           else
-            RELEASE_VERSION="${INPUT_VERSION}"
-            RELEASE_NAME="${INPUT_RELEASE_NAME}"
-            RELEASE_BODY="${INPUT_RELEASE_NOTES}"
-          fi
-          if [[ -z "${RELEASE_NAME}" ]]; then
-            RELEASE_NAME="${RELEASE_VERSION}"
+            echo "Tag ${GITHUB_REF_NAME} is neither a stable nor beta VoHive release." >&2
+            exit 1
           fi
           {
-            echo "release_version=${RELEASE_VERSION}"
-            echo "release_name=${RELEASE_NAME}"
-            echo "release_body<<EOF"
-            printf '%s\n' "${RELEASE_BODY}"
-            echo "EOF"
+            echo "version=${version}"
+            echo "channel=${channel}"
+            echo "source_revision=${source_revision}"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Download all artifacts
+      - name: Resolve moving Release alias
+        id: alias_gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tags_file="${RUNNER_TEMP}/release-alias-tags"
+          gh api --paginate "repos/${EXPECTED_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name' > "${tags_file}"
+          gate_output="$(go run ./scripts/release-manifest alias-gate \
+            --channel "${{ steps.release_vars.outputs.channel }}" \
+            --candidate "${{ steps.release_vars.outputs.version }}" \
+            --existing-file "${tags_file}")"
+          printf '%s\n' "${gate_output}" >> "${GITHUB_OUTPUT}"
+          advance="$(printf '%s\n' "${gate_output}" | awk -F= '$1 == "advance_alias" { print $2 }')"
+          current="$(printf '%s\n' "${gate_output}" | awk -F= '$1 == "current_alias_version" { print $2 }')"
+          if [[ "${advance}" == "true" ]]; then
+            if [[ -z "${current}" ]]; then
+              echo "::notice::No existing ${{ steps.release_vars.outputs.channel }} Release; the moving alias may start at ${{ steps.release_vars.outputs.version }}."
+            else
+              echo "::notice::Moving alias may advance from ${current} to ${{ steps.release_vars.outputs.version }}."
+            fi
+          else
+            echo "::notice::Exact Release ${{ steps.release_vars.outputs.version }} may publish, but the moving alias remains at ${current}."
+          fi
+
+      - name: Download binary archives
         uses: actions/download-artifact@v4
         with:
           pattern: binaries-*
           merge-multiple: true
           path: dist
 
-      - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release_vars.outputs.release_version }}
-          name: ${{ steps.release_vars.outputs.release_name }}
-          body: ${{ steps.release_vars.outputs.release_body }}
-          files: dist/*
-          fail_on_unmatched_files: true
-          overwrite_files: true
-
-      - name: Load current release metadata
-        id: current_release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Add trusted bootstrap assets
         shell: bash
+        env:
+          VOHIVE_MINISIGN_PUBLIC_KEYS: ${{ vars.VOHIVE_MINISIGN_PUBLIC_KEYS }}
         run: |
           set -euo pipefail
-          RELEASE_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${{ steps.release_vars.outputs.release_version }}"
-
-          release_json="$(curl -fsSL \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${RELEASE_API}")"
-
-          release_name="$(printf '%s' "${release_json}" | jq -r '.name // ""')"
-          release_body="$(printf '%s' "${release_json}" | jq -r '.body // ""')"
-
-          {
-            echo "release_name<<EOF"
-            printf '%s\n' "${release_name}"
-            echo "EOF"
-            echo "release_body<<EOF"
-            printf '%s\n' "${release_body}"
-            echo "EOF"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Upload assets to Telegram channel
-        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHANNEL_ID != '' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_BODY: ${{ steps.current_release.outputs.release_body }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-
-          MESSAGE_HEADER="vohive release ${{ steps.release_vars.outputs.release_version }} assets"
-          if [[ -n "${RELEASE_BODY}" ]]; then
-            FULL_MESSAGE="${MESSAGE_HEADER}"$'\n\n'"Release notes:"$'\n'"${RELEASE_BODY}"
-          else
-            FULL_MESSAGE="${MESSAGE_HEADER}"
+          public_key_pattern='^RW[A-Za-z0-9+/]{54}(;RW[A-Za-z0-9+/]{54})*$'
+          if [[ -z "${VOHIVE_MINISIGN_PUBLIC_KEYS}" ]] || ! [[ "${VOHIVE_MINISIGN_PUBLIC_KEYS}" =~ ${public_key_pattern} ]]; then
+            echo "VOHIVE_MINISIGN_PUBLIC_KEYS must contain one or more semicolon-separated minisign public keys." >&2
+            exit 1
           fi
-
-          shopt -s nullglob
-          FILES=(dist/*)
-
-          if [[ ${#FILES[@]} -eq 0 ]]; then
-            MESSAGE="${FULL_MESSAGE:0:3800}"
-            curl -fsSL -X POST "${API}/sendMessage" \
-              -d "chat_id=${TELEGRAM_CHANNEL_ID}" \
-              --data-urlencode "text=${MESSAGE}"
-            exit 0
+          version="${{ steps.release_vars.outputs.version }}"
+          for arch in amd64 arm64 armv7; do
+            verifier="dist/vohive-verify_${version}_linux_${arch}"
+            test -s "${verifier}"
+            chmod 0755 "${verifier}"
+            digest="$(sha256sum "${verifier}" | awk '{print $1}')"
+            if ! [[ "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid verifier SHA-256 for ${arch}." >&2
+              exit 1
+            fi
+            eval "verify_sha_${arch}=${digest}"
+          done
+          verify_hashes="amd64=${verify_sha_amd64};arm64=${verify_sha_arm64};armv7=${verify_sha_armv7}"
+          verify_hash_pattern='^amd64=[0-9a-f]{64};arm64=[0-9a-f]{64};armv7=[0-9a-f]{64}$'
+          if ! [[ "${verify_hashes}" =~ ${verify_hash_pattern} ]]; then
+            echo "Invalid verifier hash map." >&2
+            exit 1
           fi
-
-          # sendMediaGroup 里首个文档携带说明；caption 上限 1024。
-          CAPTION="${FULL_MESSAGE:0:1000}"
-          CAPTION_JSON="$(jq -Rn --arg s "${CAPTION}" '$s')"
-
-          MEDIA_ITEMS=()
-          for i in "${!FILES[@]}"; do
-            if [[ "${i}" -eq 0 ]]; then
-              MEDIA_ITEMS+=("{\"type\":\"document\",\"media\":\"attach://file${i}\",\"caption\":${CAPTION_JSON}}")
-            else
-              MEDIA_ITEMS+=("{\"type\":\"document\",\"media\":\"attach://file${i}\"}")
+          install -m 0755 packaging/install.sh dist/vohive-install.sh
+          install -m 0755 packaging/uninstall.sh dist/vohive-uninstall.sh
+          keys_placeholder='@VOHIVE_MINISIGN_PUBLIC_KEYS@'
+          hashes_placeholder='@VOHIVE_VERIFY_SHA256@'
+          bootstrap_placeholder='@VOHIVE_BOOTSTRAP_VERSION@'
+          grep -qF "${keys_placeholder}" dist/vohive-install.sh
+          grep -qF "${hashes_placeholder}" dist/vohive-install.sh
+          grep -qF "${bootstrap_placeholder}" dist/vohive-install.sh
+          escaped_keys="${VOHIVE_MINISIGN_PUBLIC_KEYS//&/\\&}"
+          sed -i "s|${keys_placeholder}|${escaped_keys}|g" dist/vohive-install.sh
+          sed -i "s|${hashes_placeholder}|${verify_hashes}|g" dist/vohive-install.sh
+          sed -i "s|${bootstrap_placeholder}|${version}|g" dist/vohive-install.sh
+          for placeholder in "${keys_placeholder}" "${hashes_placeholder}" "${bootstrap_placeholder}"; do
+            if grep -qF "${placeholder}" dist/vohive-install.sh; then
+              echo "Failed to render release trust data into installer: ${placeholder}." >&2
+              exit 1
             fi
           done
-          MEDIA_JSON="[$(IFS=,; echo "${MEDIA_ITEMS[*]}")]"
 
-          echo "Uploading ${#FILES[@]} binary file(s) to Telegram as one media group..."
-          CURL_ARGS=(-fsSL -X POST "${API}/sendMediaGroup" -F "chat_id=${TELEGRAM_CHANNEL_ID}" -F "media=${MEDIA_JSON}")
-          for i in "${!FILES[@]}"; do
-            CURL_ARGS+=(-F "file${i}=@${FILES[$i]}")
-          done
-          curl "${CURL_ARGS[@]}"
+      - name: Generate and verify release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./scripts/release-manifest generate \
+            --policy "${RELEASE_POLICY}" \
+            --version "${{ steps.release_vars.outputs.version }}" \
+            --channel "${{ steps.release_vars.outputs.channel }}" \
+            --revision "${{ steps.release_vars.outputs.source_revision }}" \
+            --assets-dir dist \
+            --output dist/release-manifest.json
+          go run ./scripts/release-manifest verify \
+            --policy "${RELEASE_POLICY}" \
+            --manifest dist/release-manifest.json \
+            --assets-dir dist
+          (
+            cd dist
+            sha256sum vohive-* vohive_* release-manifest.json | LC_ALL=C sort -k 2
+          ) > dist/SHA256SUMS
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: Publish immutable GitHub Release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: release
+    needs: bundle
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+
+      - name: Refuse an existing GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.bundle.outputs.version }}
+        run: |
+          set -euo pipefail
+          releases_file="${RUNNER_TEMP}/release-tags"
+          gh api --paginate "repos/${EXPECTED_REPOSITORY}/releases?per_page=100" \
+            --jq '.[].tag_name' > "${releases_file}"
+          if grep -Fxq "${RELEASE_VERSION}" "${releases_file}"; then
+            echo "Release ${RELEASE_VERSION} already exists (published or draft); exact releases are never overwritten." >&2
+            echo "If a previous upload failed, inspect and explicitly delete its private draft before retrying." >&2
+            exit 1
+          fi
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Sign manifest and checksums
+        shell: bash
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          VOHIVE_MINISIGN_PUBLIC_KEYS: ${{ vars.VOHIVE_MINISIGN_PUBLIC_KEYS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MINISIGN_PRIVATE_KEY}" ]]; then
+            echo "MINISIGN_PRIVATE_KEY must be configured before publishing a release." >&2
+            exit 1
+          fi
+          umask 077
+          key_file="${RUNNER_TEMP}/vohive-minisign.key"
+          cleanup_key() {
+            rm -f "${key_file}"
+          }
+          trap cleanup_key EXIT
+          printf '%s' "${MINISIGN_PRIVATE_KEY}" > "${key_file}"
+          printf '%s\n' "${MINISIGN_PASSWORD}" | minisign -Sm dist/release-manifest.json -s "${key_file}" \
+            -x dist/release-manifest.json.minisig \
+            -t "VoHive ${{ needs.bundle.outputs.version }} release manifest"
+          printf '%s\n' "${MINISIGN_PASSWORD}" | minisign -Sm dist/SHA256SUMS -s "${key_file}" \
+            -x dist/SHA256SUMS.minisig \
+            -t "VoHive ${{ needs.bundle.outputs.version }} checksums"
+          test -s dist/release-manifest.json.minisig
+          test -s dist/SHA256SUMS.minisig
+          IFS=';' read -r -a trusted_keys <<< "${VOHIVE_MINISIGN_PUBLIC_KEYS}"
+          verify_with_trusted_key() {
+            local message="$1" signature="$2" key
+            for key in "${trusted_keys[@]}"; do
+              if minisign -Vm "${message}" -x "${signature}" -P "${key}" >/dev/null; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          verify_with_trusted_key dist/release-manifest.json dist/release-manifest.json.minisig
+          verify_with_trusted_key dist/SHA256SUMS dist/SHA256SUMS.minisig
+          cleanup_key
+          trap - EXIT
+
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*
+
+      - name: Publish to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.bundle.outputs.version }}
+          RELEASE_CHANNEL: ${{ needs.bundle.outputs.channel }}
+          ADVANCE_ALIAS: ${{ needs.bundle.outputs.advance_alias }}
+          SOURCE_REVISION: ${{ needs.bundle.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*)
+          if (( ${#assets[@]} == 0 )); then
+            echo "Release bundle is empty." >&2
+            exit 1
+          fi
+
+          release_args=(
+            --repo "${EXPECTED_REPOSITORY}"
+            --verify-tag
+            --title "${RELEASE_VERSION}"
+            --generate-notes
+            --latest=false
+          )
+          if [[ "${RELEASE_CHANNEL}" == "beta" ]]; then
+            release_args+=(--prerelease)
+          elif [[ "${RELEASE_CHANNEL}" == "stable" && "${ADVANCE_ALIAS}" == "true" ]]; then
+            release_args[${#release_args[@]}-1]=--latest
+          fi
+
+          if ! [[ "${SOURCE_REVISION}" =~ ^[0-9a-f]{40,64}$ ]]; then
+            echo "Invalid source revision passed from the signed bundle: ${SOURCE_REVISION}." >&2
+            exit 1
+          fi
+          remote_revision="$(gh api "repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_VERSION}" --jq '.sha')"
+          if [[ "${remote_revision}" != "${SOURCE_REVISION}" ]]; then
+            echo "Tag ${RELEASE_VERSION} moved: bundle=${SOURCE_REVISION}, remote=${remote_revision}. Refusing to publish." >&2
+            exit 1
+          fi
+
+          # gh creates a draft, uploads every asset, then publishes. GitHub only
+          # makes the release immutable at that final publish transition.
+          gh release create "${RELEASE_VERSION}" "${assets[@]}" "${release_args[@]}"
+
+          state="$(gh release view "${RELEASE_VERSION}" --repo "${EXPECTED_REPOSITORY}" \
+            --json tagName,isDraft,isImmutable)"
+          if [[ "$(jq -r '.tagName' <<< "${state}")" != "${RELEASE_VERSION}" ]] || \
+             [[ "$(jq -r '.isDraft' <<< "${state}")" != "false" ]]; then
+            echo "Published Release state does not match ${RELEASE_VERSION}." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.isImmutable' <<< "${state}")" != "true" ]]; then
+            echo "::error::GitHub Release immutability is not enabled for ${EXPECTED_REPOSITORY}. Enable it in Settings before publishing."
+            echo "Deleting the mutable Release created by this run; the source tag is preserved." >&2
+            gh release delete "${RELEASE_VERSION}" --repo "${EXPECTED_REPOSITORY}" --yes
+            exit 1
+          fi

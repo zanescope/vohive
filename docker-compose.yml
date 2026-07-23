@@ -1,18 +1,23 @@
+name: vohive
+
 services:
   vohive:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: vohive:latest
+    image: "${VOHIVE_IMAGE:?Set VOHIVE_IMAGE to ghcr.io/zanescope/vohive@sha256:<digest>}"
     container_name: vohive
     restart: unless-stopped
-    network_mode: "host" # 推荐使用 Host 模式以便管理 4G 网卡接口
-    privileged: true     # 需要访问 USB 设备、网络管理能力与 /dev/net/tun
-    volumes:
-      - ./config:/app/config
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - /dev:/dev
+    network_mode: host
+    privileged: true
     environment:
-      - TZ=Asia/Shanghai
-      - HTTPS_PROXY=http://10.10.10.10:6152
+      TZ: "${TZ:-UTC}"
+      CONFIG_PATH: /app/config/config.yaml
+    volumes:
+      - "${VOHIVE_CONFIG_DIR:-./config}:/app/config"
+      - "${VOHIVE_DATA_DIR:-./data}:/app/data"
+      - "${VOHIVE_LOG_DIR:-./logs}:/app/logs"
+      - /dev:/dev
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:7575/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

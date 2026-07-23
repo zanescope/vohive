@@ -7,22 +7,44 @@ on:
   workflow_dispatch:
     inputs:
       enable_upx:
-        description: enable UPX compression (true/false)
+        description: Enable UPX compression
         required: false
-        default: "true"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
 
 env:
-  CONTAINER_IMAGE: ghcr.io/${{ github.repository }}
+  EXPECTED_REPOSITORY: zanescope/vohive
+  CONTAINER_IMAGE: ghcr.io/zanescope/vohive
+  SOURCE_URL: https://github.com/zanescope/vohive
+  RELEASE_POLICY: packaging/release-policy.json
 
 jobs:
   validate:
     name: Validate container release gates
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
+    timeout-minutes: 45
+    outputs:
+      advance_alias: ${{ steps.alias_gate.outputs.advance_alias }}
+      current_alias_version: ${{ steps.alias_gate.outputs.current_alias_version }}
 
     steps:
+      - name: Enforce publishing identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "${EXPECTED_REPOSITORY}" ]]; then
+            echo "This workflow may publish only ${EXPECTED_REPOSITORY}; got ${GITHUB_REPOSITORY}." >&2
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -35,86 +57,251 @@ jobs:
             go.mod
             go.sum
 
+      - name: Resolve moving container alias
+        id: alias_gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VOHIVE_MINISIGN_PUBLIC_KEYS: ${{ vars.VOHIVE_MINISIGN_PUBLIC_KEYS }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            {
+              echo 'advance_alias=false'
+              echo 'current_alias_version='
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            channel='stable'
+          elif [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.(0|[1-9][0-9]*)$ ]]; then
+            channel='beta'
+          else
+            echo "Tag ${GITHUB_REF_NAME} is neither a stable nor beta VoHive release." >&2
+            exit 1
+          fi
+          release_file="${RUNNER_TEMP}/github-release-response.json"
+          release_error="${RUNNER_TEMP}/github-release-response.error"
+          release_ready=false
+          for ((attempt = 1; attempt <= 180; attempt++)); do
+            status="$(curl --proto '=https' --tlsv1.2 -sS -o "${release_file}" -w '%{http_code}' \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "https://api.github.com/repos/${EXPECTED_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+              2> "${release_error}")"
+            case "${status}" in
+              200)
+                if [[ "$(jq -r '.draft' "${release_file}")" == "true" ]]; then
+                  sleep 10
+                  continue
+                fi
+                if [[ "$(jq -r '.immutable' "${release_file}")" != "true" ]]; then
+                  echo "Release ${GITHUB_REF_NAME} is published but not immutable; refusing container publication." >&2
+                  exit 1
+                fi
+                release_ready=true
+                break
+                ;;
+              404) sleep 10 ;;
+              *)
+                cat "${release_error}" >&2
+                cat "${release_file}" >&2
+                echo "GitHub Release dependency check returned HTTP ${status}." >&2
+                exit 1
+                ;;
+            esac
+          done
+          if [[ "${release_ready}" != "true" ]]; then
+            echo "Timed out waiting for immutable signed Release ${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
+
+          release_dir="${RUNNER_TEMP}/vohive-signed-release"
+          mkdir -p "${release_dir}"
+          gh release download "${GITHUB_REF_NAME}" --repo "${EXPECTED_REPOSITORY}" \
+            --dir "${release_dir}" \
+            --pattern release-manifest.json \
+            --pattern release-manifest.json.minisig
+          go run ./cmd/vohive-verify \
+            -public-keys "${VOHIVE_MINISIGN_PUBLIC_KEYS}" \
+            -file "${release_dir}/release-manifest.json" \
+            -signature "${release_dir}/release-manifest.json.minisig"
+          go run ./scripts/release-manifest verify \
+            --policy "${RELEASE_POLICY}" \
+            --manifest "${release_dir}/release-manifest.json"
+
+          revision="$(git rev-parse HEAD)"
+          manifest_version="$(jq -er '.version' "${release_dir}/release-manifest.json")"
+          manifest_channel="$(jq -er '.channel' "${release_dir}/release-manifest.json")"
+          manifest_revision="$(jq -er '.source_revision' "${release_dir}/release-manifest.json")"
+          if [[ "${manifest_version}" != "${GITHUB_REF_NAME}" ]] || \
+             [[ "${manifest_channel}" != "${channel}" ]] || \
+             [[ "${manifest_revision}" != "${revision}" ]]; then
+            echo "Signed Release manifest does not match tag, channel, and checked-out revision." >&2
+            exit 1
+          fi
+          owner_type="$(gh api "repos/${EXPECTED_REPOSITORY}" --jq '.owner.type')"
+          case "${owner_type}" in
+            User) owner_scope='users' ;;
+            Organization) owner_scope='orgs' ;;
+            *) echo "Unsupported GitHub package owner type: ${owner_type}" >&2; exit 1 ;;
+          esac
+          tags_file="${RUNNER_TEMP}/vohive-container-tags"
+          error_file="${RUNNER_TEMP}/vohive-container-tags.error"
+          endpoint="${owner_scope}/zanescope/packages/container/vohive/versions?per_page=100"
+          if ! gh api --paginate "${endpoint}" --jq '.[] | .metadata.container.tags[]?' > "${tags_file}" 2> "${error_file}"; then
+            if grep -Fq '(HTTP 404)' "${error_file}"; then
+              : > "${tags_file}"
+            else
+              cat "${error_file}" >&2
+              exit 1
+            fi
+          fi
+          exact_tag="${GITHUB_REF_NAME#v}"
+          if grep -Fxq "${GITHUB_REF_NAME}" "${tags_file}" || \
+             grep -Fxq "${exact_tag}" "${tags_file}"; then
+            echo "Container tags ${GITHUB_REF_NAME}/${exact_tag} already exist and are immutable release identities." >&2
+            echo "Refusing to overwrite an exact version tag; publish a new SemVer instead." >&2
+            exit 1
+          fi
+
+          gate_output="$(go run ./scripts/release-manifest alias-gate \
+            --channel "${channel}" \
+            --candidate "${GITHUB_REF_NAME}" \
+            --existing-file "${tags_file}")"
+          printf '%s\n' "${gate_output}" >> "${GITHUB_OUTPUT}"
+          advance="$(printf '%s\n' "${gate_output}" | awk -F= '$1 == "advance_alias" { print $2 }')"
+          current="$(printf '%s\n' "${gate_output}" | awk -F= '$1 == "current_alias_version" { print $2 }')"
+          if [[ "${advance}" == "true" ]]; then
+            echo "::notice::The ${channel} container alias may advance from ${current:-<none>} to ${GITHUB_REF_NAME}."
+          else
+            echo "::notice::Only exact tags will publish; the ${channel} container alias remains at ${current}."
+          fi
+
       - name: Run container release gates
         run: ./scripts/ci.sh workflow-lint hygiene release-hygiene container-hygiene tidy test
 
   build:
+    name: Build and publish multi-architecture image
     runs-on: ubuntu-latest
+    environment: release
     needs: validate
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Resolve channel, version, and tags
+        id: vars
+        shell: bash
+        env:
+          ENABLE_UPX_INPUT: ${{ inputs.enable_upx }}
+          VOHIVE_MINISIGN_PUBLIC_KEYS: ${{ vars.VOHIVE_MINISIGN_PUBLIC_KEYS }}
+          ADVANCE_ALIAS: ${{ needs.validate.outputs.advance_alias }}
+          CURRENT_ALIAS_VERSION: ${{ needs.validate.outputs.current_alias_version }}
+        run: |
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          public_key_pattern='^RW[A-Za-z0-9+/]{54}(;RW[A-Za-z0-9+/]{54})*$'
+          if [[ -z "${VOHIVE_MINISIGN_PUBLIC_KEYS}" ]] || ! [[ "${VOHIVE_MINISIGN_PUBLIC_KEYS}" =~ ${public_key_pattern} ]]; then
+            echo "VOHIVE_MINISIGN_PUBLIC_KEYS must contain one or more semicolon-separated minisign public keys." >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="dev-${revision:0:12}"
+            channel="dev"
+            tags="${CONTAINER_IMAGE}:edge-${revision:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          elif [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            version="${GITHUB_REF_NAME}"
+            channel="stable"
+            tags="${CONTAINER_IMAGE}:${version}"$'\n'"${CONTAINER_IMAGE}:${version#v}"
+            if [[ "${ADVANCE_ALIAS}" == "true" ]]; then
+              tags+=$'\n'"${CONTAINER_IMAGE}:latest"
+            else
+              echo "::notice::Publishing exact tags only; latest remains at ${CURRENT_ALIAS_VERSION}."
+            fi
+          elif [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.(0|[1-9][0-9]*)$ ]]; then
+            version="${GITHUB_REF_NAME}"
+            channel="beta"
+            tags="${CONTAINER_IMAGE}:${version}"$'\n'"${CONTAINER_IMAGE}:${version#v}"
+            if [[ "${ADVANCE_ALIAS}" == "true" ]]; then
+              tags+=$'\n'"${CONTAINER_IMAGE}:beta"
+            else
+              echo "::notice::Publishing exact tags only; beta remains at ${CURRENT_ALIAS_VERSION}."
+            fi
+          else
+            echo "Tag ${GITHUB_REF_NAME} is neither a stable nor beta VoHive release." >&2
+            exit 1
+          fi
+          build_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          enable_upx="true"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            enable_upx="${ENABLE_UPX_INPUT:-true}"
+          fi
+          {
+            echo "version=${version}"
+            echo "channel=${channel}"
+            echo "revision=${revision}"
+            echo "build_time=${build_time}"
+            echo "enable_upx=${enable_upx}"
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.CONTAINER_IMAGE }}
-          tags: |
-            # 总是打上 latest 标签
-            type=raw,value=latest,enable=true
-            # 保留 Git tag 标签 (例如 v1.0.0)
-            type=ref,event=tag
-            # 语义化精确版本标签 (例如 v1.0.0 会被转换为 1.0.0)
-            type=semver,pattern={{version}}
-
-      - name: Prepare build args
-        id: vars
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME}"
-          else
-            VERSION="sha-${GITHUB_SHA::7}"
-          fi
-          BUILDTIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          REVISION="${GITHUB_SHA}"
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            ENABLE_UPX_RAW="${{ github.event.inputs.enable_upx }}"
-          else
-            ENABLE_UPX_RAW="true"
-          fi
-          case "${ENABLE_UPX_RAW}" in
-            false|0|no|off) ENABLE_UPX=0 ;;
-            *) ENABLE_UPX=1 ;;
-          esac
-          {
-            echo "version=${VERSION}"
-            echo "buildtime=${BUILDTIME}"
-            echo "revision=${REVISION}"
-            echo "enable_upx=${ENABLE_UPX}"
-          } >> "${GITHUB_OUTPUT}"
-
       - name: Build and push
-        uses: docker/build-push-action@v5
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.github
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          push: true
+          tags: ${{ steps.vars.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
           build-args: |
             VERSION=${{ steps.vars.outputs.version }}
-            BUILDTIME=${{ steps.vars.outputs.buildtime }}
+            BUILDTIME=${{ steps.vars.outputs.build_time }}
             REVISION=${{ steps.vars.outputs.revision }}
+            SOURCE_URL=${{ env.SOURCE_URL }}
             ENABLE_UPX=${{ steps.vars.outputs.enable_upx }}
+            VOHIVE_MINISIGN_PUBLIC_KEYS=${{ vars.VOHIVE_MINISIGN_PUBLIC_KEYS }}
+
+      - name: Attest pushed image
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.CONTAINER_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record immutable image reference
+        shell: bash
+        run: echo "${CONTAINER_IMAGE}@${{ steps.build.outputs.digest }}" >> "${GITHUB_STEP_SUMMARY}"

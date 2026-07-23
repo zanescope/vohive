@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+
+STOP=11
+USE_PROCD=1
+
+UPDATER=/opt/vohive/control/vohivectl
+REQUEST=/var/lib/vohive/update/request.json
+WORKDIR=/var/lib/vohive
+
+start_service() {
+	[ -x "$UPDATER" ] || return 1
+	[ -f "$REQUEST" ] || return 0
+	procd_open_instance
+	procd_set_param command "$UPDATER" update --request "$REQUEST"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param cwd "$WORKDIR"
+	procd_set_param limits core="0"
+	procd_close_instance
+}

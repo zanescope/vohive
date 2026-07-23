@@ -3,8 +3,6 @@ package config
 import (
 	"fmt"
 	"strings"
-
-	"github.com/spf13/viper"
 )
 
 const (
@@ -91,8 +89,9 @@ func ResolveIPFamily(in string) (enableV4 bool, enableV6 bool, err error) {
 }
 
 type Config struct {
-	Server          ServerConfig   `mapstructure:"server"`
+	ConfigSchema    int            `mapstructure:"config_schema"`
 	FreeDeviceLimit int            `mapstructure:"free_device_limit"` // 0 means unlimited
+	Server          ServerConfig   `mapstructure:"server"`
 	Devices         []DeviceConfig `mapstructure:"devices"`
 	Telegram        TelegramConfig `mapstructure:"telegram"`
 	Feishu          FeishuConfig   `mapstructure:"feishu"`
@@ -386,71 +385,5 @@ type PushplusConfig struct {
 }
 
 func Load(path string) (*Config, error) {
-	if err := migrateLegacyManagedNetworkField(path); err != nil {
-		return nil, err
-	}
-	if err := migrateDeprecatedRuntimePathFields(path); err != nil {
-		return nil, err
-	}
-
-	viper.SetConfigFile(path)
-	viper.SetConfigType("yaml")
-
-	// 默认值设置
-	viper.SetDefault("free_device_limit", DefaultFreeDeviceLimit)
-	viper.SetDefault("server.port", 7575)
-	viper.SetDefault("webhook.timeout_ms", 5000)
-	viper.SetDefault("webhook.retry_max", 3)
-	viper.SetDefault("webhook.text_template", DefaultWebhookTextTemplate)
-
-	viper.SetDefault("bark.enabled", false)
-	viper.SetDefault("bark.group", "vohive")
-	viper.SetDefault("bark.level", "active")
-	viper.SetDefault("email.enabled", false)
-	viper.SetDefault("email.use_ssl", false)
-	viper.SetDefault("pushplus.enabled", false)
-	viper.SetDefault("web.username", "admin")
-	viper.SetDefault("web.password", "admin")
-	viper.SetDefault("vowifi.enabled", false)
-	viper.SetDefault("vowifi.mode", "vowifi")
-	viper.SetDefault("imscore.use_sipgo_udp", false)
-
-	// 官方默认推送秘钥与用户 (留空则不执行 Push)
-	viper.SetDefault("vowifi.voice_gateway.linphone_push.linphone_user", "")
-	viper.SetDefault("vowifi.voice_gateway.linphone_push.linphone_password", "")
-
-	// 环境变量覆盖支持 (例如 PROXY_DEVICES_0_APN)
-	viper.SetEnvPrefix("PROXY")
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	viper.AutomaticEnv()
-
-	if err := viper.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("读取配置文件失败: %w", err)
-	}
-
-	var cfg Config
-	if err := viper.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("解析配置文件失败: %w", err)
-	}
-	if cfg.FreeDeviceLimit < 0 {
-		return nil, fmt.Errorf("free_device_limit 不能小于 0（0 表示无限制）")
-	}
-
-	publicIPProbe, err := loadPublicIPProbeFromYAML(path)
-	if err != nil {
-		return nil, fmt.Errorf("public_ip_probe: %w", err)
-	}
-	cfg.PublicIPProbe = publicIPProbe
-
-	// 兼容旧版单值配置: feishu.chat_id
-	if len(cfg.Feishu.ChatIDs) == 0 && strings.TrimSpace(cfg.Feishu.ChatID) != "" {
-		cfg.Feishu.ChatIDs = []string{strings.TrimSpace(cfg.Feishu.ChatID)}
-	}
-
-	// 兼容 server.port 格式 (例如: 7575 和 :7575)
-	if cfg.Server.Port != "" && !strings.Contains(cfg.Server.Port, ":") {
-		cfg.Server.Port = ":" + cfg.Server.Port
-	}
-
-	return &cfg, nil
+	return loadCurrent(path)
 }

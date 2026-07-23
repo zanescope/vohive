@@ -1,32 +1,48 @@
-name: docker-build
+name: Build Development Container
 
 on:
   workflow_dispatch:
     inputs:
-      platforms:
-        description: build platforms
-        required: false
-        default: linux/amd64,linux/arm64
       push:
-        description: push image
+        description: Push immutable edge tag to GHCR
         required: false
-        default: "false"
+        type: boolean
+        default: false
       enable_upx:
-        description: enable UPX compression (true/false)
+        description: Enable UPX compression
         required: false
-        default: "true"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_REPOSITORY: zanescope/vohive
+  CONTAINER_IMAGE: ghcr.io/zanescope/vohive
+  SOURCE_URL: https://github.com/zanescope/vohive
 
 jobs:
   validate:
     name: Validate manual container gates
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v6
+    steps:
+      - name: Enforce publishing identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "${EXPECTED_REPOSITORY}" ]]; then
+            echo "This workflow may build only for ${EXPECTED_REPOSITORY}; got ${GITHUB_REPOSITORY}." >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -38,60 +54,84 @@ jobs:
         run: ./scripts/ci.sh workflow-lint hygiene release-hygiene container-hygiene tidy test
 
   build:
+    name: Build edge image
     needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - uses: docker/setup-qemu-action@v3
-        if: ${{ contains(inputs.platforms, 'arm') || contains(inputs.platforms, 'ppc') || contains(inputs.platforms, 's390') || contains(inputs.platforms, 'riscv') }}
+      - name: Prepare build variables
+        id: vars
+        shell: bash
+        env:
+          VOHIVE_MINISIGN_PUBLIC_KEYS: ${{ vars.VOHIVE_MINISIGN_PUBLIC_KEYS }}
+        run: |
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          public_key_pattern='^RW[A-Za-z0-9+/]{54}(;RW[A-Za-z0-9+/]{54})*$'
+          if [[ -z "${VOHIVE_MINISIGN_PUBLIC_KEYS}" ]] || ! [[ "${VOHIVE_MINISIGN_PUBLIC_KEYS}" =~ ${public_key_pattern} ]]; then
+            echo "VOHIVE_MINISIGN_PUBLIC_KEYS must contain one or more semicolon-separated minisign public keys." >&2
+            exit 1
+          fi
+          {
+            echo "version=dev-${revision:0:12}"
+            echo "revision=${revision}"
+            echo "build_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "tag=${CONTAINER_IMAGE}:edge-${revision:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
         with:
-          platforms: all
+          platforms: arm64
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - uses: docker/login-action@v3
-        if: ${{ inputs.push == 'true' }}
+      - name: Login to GHCR
+        if: inputs.push
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare build args
-        id: vars
-        shell: bash
-        run: |
-          VERSION="dev-${GITHUB_SHA::7}"
-          BUILDTIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          REVISION="${GITHUB_SHA}"
-          ENABLE_UPX_RAW="${{ inputs.enable_upx }}"
-          case "${ENABLE_UPX_RAW}" in
-            false|0|no|off) ENABLE_UPX=0 ;;
-            *) ENABLE_UPX=1 ;;
-          esac
-          {
-            echo "version=${VERSION}"
-            echo "buildtime=${BUILDTIME}"
-            echo "revision=${REVISION}"
-            echo "enable_upx=${ENABLE_UPX}"
-          } >> "${GITHUB_OUTPUT}"
-
-      - uses: docker/build-push-action@v6
+      - name: Build development image
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.github
-          platforms: ${{ inputs.platforms }}
-          push: ${{ inputs.push == 'true' }}
-          tags: ghcr.io/${{ github.repository }}:dev
-          provenance: false
-          sbom: false
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push }}
+          tags: ${{ steps.vars.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ steps.vars.outputs.version }}
-            BUILDTIME=${{ steps.vars.outputs.buildtime }}
+            BUILDTIME=${{ steps.vars.outputs.build_time }}
             REVISION=${{ steps.vars.outputs.revision }}
-            ENABLE_UPX=${{ steps.vars.outputs.enable_upx }}
+            SOURCE_URL=${{ env.SOURCE_URL }}
+            ENABLE_UPX=${{ inputs.enable_upx }}
+            VOHIVE_MINISIGN_PUBLIC_KEYS=${{ vars.VOHIVE_MINISIGN_PUBLIC_KEYS }}
+
+      - name: Attest pushed image
+        if: inputs.push
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.CONTAINER_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

@@ -1,0 +1,19 @@
+[Unit]
+Description=VoHive transactional update
+Documentation=https://github.com/zanescope/vohive
+Wants=network-online.target
+After=network-online.target vohive.service
+ConditionPathExists=/var/lib/vohive/update/request.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/var/lib/vohive
+ExecStart=/opt/vohive/control/vohivectl update --request /var/lib/vohive/update/request.json
+TimeoutStartSec=30min
+UMask=0077
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/vohive /etc/vohive /var/lib/vohive

@@ -7,14 +7,62 @@ export type DocsLinks = {
   openapi_json: string
 }
 
-export type UpdateInfo = {
+export type UpdateChannel = 'stable' | 'beta' | 'pinned'
+
+export type UpdateCapabilities = {
+  channel: 'stable' | 'beta' | 'pinned'
+  install_type: 'systemd' | 'openwrt' | 'portable'
+  layout: 'v1' | 'v2'
+  can_check: boolean
+  can_update: boolean
+  can_rollback: boolean
+  reason?: string
+}
+
+export type UpdateCandidate = {
   has_update: boolean
   current_version: string
   latest_version: string
   release_note: string
-  is_docker: boolean
+  manifest: {
+    version: string
+    channel: 'stable' | 'beta'
+  }
 }
 
+export type UpdateCheckResponse = {
+  capabilities: UpdateCapabilities
+  candidate?: UpdateCandidate
+}
+
+export type UpdatePhase =
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
+  | 'waiting_for_quiesce'
+  | 'backing_up'
+  | 'stopping'
+  | 'switching'
+  | 'starting'
+  | 'verifying_service'
+  | 'completed'
+  | 'rolling_back'
+  | 'rolled_back'
+  | 'failed'
+  | 'manual_recovery_required'
+
+export type UpdateTransaction = {
+  schema: number
+  id: string
+  operation: string
+  phase: UpdatePhase
+  current_version?: string
+  target_version?: string
+  error?: string
+  rollback_error?: string
+  started_at: string
+  updated_at: string
+}
 export type SystemInfo = {
   version: string
   build_time: string
@@ -245,15 +293,29 @@ export const systemService = {
       return res.data
     })
   },
-  checkUpdate() {
+  getUpdateCapabilities() {
     return callService(async () => {
-      const res = await api.get<UpdateInfo>('/system/update/check')
+      const res = await api.get<UpdateCapabilities>('/system/update/capabilities')
       return res.data
     })
   },
-  applyUpdate() {
+  checkUpdate(channel?: 'stable' | 'beta') {
     return callService(async () => {
-      const res = await api.post<{ message: string }>('/system/update/apply', {})
+      const res = await api.get<UpdateCheckResponse>('/system/update/check', {
+        params: channel ? { channel } : undefined
+      })
+      return res.data
+    })
+  },
+  startUpdate(payload: { channel: UpdateChannel; version: string }) {
+    return callService(async () => {
+      const res = await api.post<UpdateTransaction>('/system/update/jobs', payload)
+      return res.data
+    })
+  },
+  getUpdateJob(jobID: string) {
+    return callService(async () => {
+      const res = await api.get<UpdateTransaction>(`/system/update/jobs/${encodeURIComponent(jobID)}`)
       return res.data
     })
   }

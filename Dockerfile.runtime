@@ -1,8 +1,23 @@
-FROM alpine:latest AS certificates
-RUN apk add --no-cache ca-certificates
-
-FROM scratch
+ARG ALPINE_VERSION=3.23
+FROM alpine:${ALPINE_VERSION}
+ARG VERSION=unknown
+ARG BUILDTIME=unknown
+ARG REVISION=unknown
+ARG SOURCE_URL=https://github.com/zanescope/vohive
+LABEL org.opencontainers.image.title="VoHive" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${BUILDTIME}" \
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
+RUN apk add --no-cache ca-certificates tzdata && \
+    mkdir -p /app/config /app/data /app/logs
+COPY .runtime/vohive /usr/local/bin/vohive
 WORKDIR /app
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY .runtime/vohive /app/vohive
-ENTRYPOINT ["/app/vohive"]
+ENV CONFIG_PATH=/app/config/config.yaml
+EXPOSE 7575
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -q -T 5 -O /dev/null http://127.0.0.1:7575/healthz || exit 1
+ENTRYPOINT ["/usr/local/bin/vohive"]
+CMD ["-c", "/app/config/config.yaml"]

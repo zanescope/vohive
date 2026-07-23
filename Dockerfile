@@ -1,65 +1,67 @@
-# 构建阶段 1: 前端构建 (Frontend)
-FROM node:20-alpine AS frontend-builder
-WORKDIR /app/web
+# syntax=docker/dockerfile:1.7
+
+ARG ALPINE_VERSION=3.23
+ARG NODE_VERSION=24
+ARG GO_VERSION=1.26
+
+FROM node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS frontend-builder
+WORKDIR /src/web
 COPY web/package*.json ./
-RUN npm ci
-COPY web/ .
+RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
+COPY web/ ./
 RUN npm run build
 
-# 构建阶段 2: 后端构建 (Backend)
-FROM golang:1.26-alpine AS backend-builder
-WORKDIR /app
-
-# 启用 Go 工具链自动下载
+FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS backend-builder
+ARG VERSION=unknown
+ARG BUILDTIME=unknown
+ARG REVISION=unknown
+ARG ENABLE_UPX=0
+ARG VOHIVE_MINISIGN_PUBLIC_KEYS=unconfigured
 ENV GOTOOLCHAIN=auto
 ENV GOWORK=off
-
-# 安装构建依赖
+WORKDIR /src
 RUN apk add --no-cache git
-
-# 复制 go mod 文件
 COPY go.mod go.sum ./
-RUN go mod download
-
-# 复制源代码 (不包含 internal/web/dist，这将在下一步从前端构建阶段复制)
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 COPY pkg ./pkg
-COPY engine ./engine
+COPY --from=frontend-builder /src/web/dist ./internal/web/dist
+RUN --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    go mod verify && \
+    mkdir -p /out && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -tags "with_utls nomsgpack" \
+      -ldflags "-s -w -X 'github.com/zanescope/vohive/internal/global.Version=${VERSION}' -X 'github.com/zanescope/vohive/internal/global.BuildTime=${BUILDTIME}' -X 'github.com/zanescope/vohive/internal/updater.UpdaterVersion=${VERSION}' -X 'github.com/zanescope/vohive/internal/updater.TrustedMinisignPublicKeys=${VOHIVE_MINISIGN_PUBLIC_KEYS}'" \
+      -o /out/vohive ./cmd/vohive && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -tags "with_utls nomsgpack" \
+      -ldflags "-s -w -X 'github.com/zanescope/vohive/internal/global.Version=${VERSION}' -X 'github.com/zanescope/vohive/internal/global.BuildTime=${BUILDTIME}' -X 'github.com/zanescope/vohive/internal/updater.UpdaterVersion=${VERSION}' -X 'github.com/zanescope/vohive/internal/updater.TrustedMinisignPublicKeys=${VOHIVE_MINISIGN_PUBLIC_KEYS}'" \
+      -o /out/vohivectl ./cmd/vohivectl && \
+    if [ "${ENABLE_UPX}" = "1" ] || [ "${ENABLE_UPX}" = "true" ]; then \
+      (apk add --no-cache upx >/dev/null 2>&1 || apk add --no-cache upx-ucl >/dev/null 2>&1 || true); \
+      if command -v upx >/dev/null 2>&1; then upx --best --lzma /out/vohive /out/vohivectl; fi; \
+    fi
 
-# 复制构建好的前端资源到 internal/web/dist 以便嵌入
-# 必须在 go build 之前完成
-COPY --from=frontend-builder /app/web/dist ./internal/web/dist/
-
-# 验证前端资源已复制
-RUN ls -la internal/web/dist/ && echo "Frontend assets copied successfully"
-
-# 验证依赖并编译二进制；依赖整理必须在提交前由 CI 的 tidy gate 完成。
-RUN go mod verify
-RUN VERSION=$(git describe --tags --always --dirty || echo "unknown") && \
-    BUILD_TIME=$(date "+%Y-%m-%d %H:%M:%S") && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -tags "with_utls nomsgpack" -ldflags "-s -w -X 'github.com/zanescope/vohive/internal/global.Version=${VERSION}' -X 'github.com/zanescope/vohive/internal/global.BuildTime=${BUILD_TIME}'" -o /app/vo-hive ./cmd/vohive
-
-# 运行阶段 (Runtime)
-FROM alpine:latest
+FROM alpine:${ALPINE_VERSION} AS runtime
+ARG VERSION=unknown
+ARG BUILDTIME=unknown
+ARG REVISION=unknown
+ARG SOURCE_URL=https://github.com/zanescope/vohive
+LABEL org.opencontainers.image.title="VoHive" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${BUILDTIME}" \
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
+RUN apk add --no-cache ca-certificates tzdata && \
+    mkdir -p /app/config /app/data /app/logs
+COPY --from=backend-builder /out/vohive /usr/local/bin/vohive
+COPY --from=backend-builder /out/vohivectl /usr/local/bin/vohivectl
 WORKDIR /app
-
-# 安装运行时依赖
-# - ca-certificates / tzdata: 基础 HTTPS 与时区支持
-RUN apk add --no-cache ca-certificates tzdata
-
-# 复制二进制文件
-COPY --from=backend-builder /app/vo-hive .
-
-# 创建配置和数据目录
-RUN mkdir -p config data logs
-
-# 暴露端口 (API)
-EXPOSE 7575
-
-# 默认配置路径环境变量
 ENV CONFIG_PATH=/app/config/config.yaml
-
-# 入口点
-ENTRYPOINT ["./vo-hive"]
+EXPOSE 7575
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -q -T 5 -O /dev/null http://127.0.0.1:7575/healthz || exit 1
+ENTRYPOINT ["/usr/local/bin/vohive"]
 CMD ["-c", "/app/config/config.yaml"]

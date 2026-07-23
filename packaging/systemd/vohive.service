@@ -1,0 +1,28 @@
+[Unit]
+Description=VoHive cellular modem manager
+Documentation=https://github.com/zanescope/vohive
+Wants=network-online.target
+After=network-online.target vohive-recover.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/vohive
+ExecStartPre=/opt/vohive/control/vohivectl guard-start
+ExecStart=/opt/vohive/current/vohive -c /etc/vohive/config.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+UMask=0077
+RuntimeDirectory=vohive
+RuntimeDirectoryMode=0700
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/etc/vohive /var/lib/vohive
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,37 +1,15 @@
 package updater
 
 import (
-	"encoding/json"
-	"fmt"
+	"context"
+	"errors"
 	"net/http"
 	"os"
 	"runtime"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/zanescope/vohive/internal/global"
-	"github.com/zanescope/vohive/pkg/logger"
-	"github.com/minio/selfupdate"
-	"golang.org/x/mod/semver"
 )
-
-const (
-	repoOwner = "zanescope"
-	repoName  = "vohive"
-)
-
-type Release struct {
-	TagName string  `json:"tag_name"`
-	Name    string  `json:"name"`
-	Body    string  `json:"body"`
-	Assets  []Asset `json:"assets"`
-}
-
-type Asset struct {
-	Name               string `json:"name"`
-	BrowserDownloadURL string `json:"browser_download_url"`
-}
 
 type UpdateInfo struct {
 	HasUpdate   bool   `json:"has_update"`
@@ -41,141 +19,77 @@ type UpdateInfo struct {
 	IsDocker    bool   `json:"is_docker"`
 }
 
-// CheckUpdate 检查是否有新版本
+// CheckUpdate is the compatibility wrapper for the legacy API. Candidate
+// metadata and artifact hashes are accepted only after manifest signature
+// verification. Non-SemVer development builds deliberately report no update.
 func CheckUpdate() (*UpdateInfo, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	deployment, err := DiscoverDeployment(DefaultDeploymentPath)
 	if err != nil {
-		return nil, fmt.Errorf("create request failed: %w", err)
+		return nil, err
 	}
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-
-	resp, err := client.Do(req)
+	currentVersion := deployment.CurrentVersion
+	if currentVersion == "" {
+		currentVersion = global.Version
+	}
+	verifier, err := DefaultSignatureVerifier()
 	if err != nil {
-		return nil, fmt.Errorf("request github api failed: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("github api returned status: %d", resp.StatusCode)
+	resolver, err := NewGitHubResolver(&http.Client{Timeout: 30 * time.Second}, verifier)
+	if err != nil {
+		return nil, err
 	}
-
-	var release Release
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return nil, fmt.Errorf("decode response failed: %w", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	candidate, err := resolver.Check(ctx, CheckRequest{
+		Channel: deployment.Channel, CurrentVersion: currentVersion,
+		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	currentVersion := global.Version
-	if !strings.HasPrefix(currentVersion, "v") {
-		currentVersion = "v" + currentVersion
-	}
-	latestVersion := release.TagName
-	if !strings.HasPrefix(latestVersion, "v") {
-		latestVersion = "v" + latestVersion
-	}
-
-	// 使用 semver 比较版本
-	hasUpdate := false
-	if semver.IsValid(currentVersion) && semver.IsValid(latestVersion) {
-		if semver.Compare(currentVersion, latestVersion) < 0 {
-			hasUpdate = true
-		}
-	} else {
-		// 如果本地或线上不是标准 semver (比如 unknown, dev 等)，可以尝试直接不等即提示更新
-		if currentVersion != latestVersion {
-			hasUpdate = true
-		}
-	}
-
-	isDocker := false
-	if _, err := os.Stat("/.dockerenv"); err == nil {
-		isDocker = true
-	}
-
+	_, dockerErr := os.Stat("/.dockerenv")
 	return &UpdateInfo{
-		HasUpdate:   hasUpdate,
-		CurrentVer:  currentVersion,
-		LatestVer:   latestVersion,
-		ReleaseNote: release.Body,
-		IsDocker:    isDocker,
+		HasUpdate: candidate.HasUpdate, CurrentVer: candidate.CurrentVer,
+		LatestVer: candidate.LatestVer, ReleaseNote: candidate.ReleaseNote,
+		IsDocker: dockerErr == nil,
 	}, nil
 }
 
-// ApplyUpdate 获取最新 release 并下载对应架构的二进制进行自我替换
+// ApplyUpdate preserves the old handler entry point but dispatches the signed,
+// exact target to the independent update unit. It never overwrites or signals
+// the running VoHive process.
 func ApplyUpdate() error {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName)
-	client := &http.Client{Timeout: 15 * time.Second}
-
-	resp, err := client.Get(apiURL)
-	if err != nil {
-		return fmt.Errorf("failed to fetch release info: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var release Release
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return fmt.Errorf("failed to decode release info: %w", err)
-	}
-
-	// 拼接对应的 asset name。例如: vohive_v1.0.0_linux_amd64
-	targetGoos := runtime.GOOS
-	targetGoarch := runtime.GOARCH
-	if targetGoarch == "arm" {
-		targetGoarch = "armv7" // 根据 Makefile 中的定义，vohive 编的 arm 是 armv7
-	}
-
-	binaryName := "vohive"
-	assetPrefix := fmt.Sprintf("%s_%s_%s_%s", binaryName, release.TagName, targetGoos, targetGoarch)
-
-	var downloadURL string
-	for _, asset := range release.Assets {
-		if strings.HasPrefix(asset.Name, assetPrefix) {
-			downloadURL = asset.BrowserDownloadURL
-			break
+	if _, err := os.Stat(DefaultDeploymentPath); err != nil {
+		if os.IsNotExist(err) {
+			return errors.New("transactional update metadata is missing; run the signed installer with --repair")
 		}
+		return err
 	}
-
-	if downloadURL == "" {
-		return fmt.Errorf("no matching asset found for architecture %s_%s", targetGoos, targetGoarch)
-	}
-
-	logger.Info("开始下载更新", "url", downloadURL)
-
-	// 下载二进制
-	dlResp, err := http.Get(downloadURL)
+	deployment, err := LoadDeployment(DefaultDeploymentPath)
 	if err != nil {
-		return fmt.Errorf("failed to download update: %w", err)
+		return err
 	}
-	defer dlResp.Body.Close()
-
-	if dlResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status %d", dlResp.StatusCode)
-	}
-
-	// 执行替换
-	err = selfupdate.Apply(dlResp.Body, selfupdate.Options{})
+	verifier, err := DefaultSignatureVerifier()
 	if err != nil {
-		// 回滚
-		if rerr := selfupdate.RollbackError(err); rerr != nil {
-			return fmt.Errorf("update failed and rollback failed: %v, original error: %w", rerr, err)
-		}
-		return fmt.Errorf("update failed: %w", err)
+		return err
 	}
-
-	logger.Info("应用更新成功，正在准备重启...")
-
-	// 延迟退出以便接口能返回成功响应
-	go func() {
-		time.Sleep(2 * time.Second)
-		logger.Info("进程发出关闭信号以应用更新")
-		if process, err := os.FindProcess(os.Getpid()); err == nil {
-			process.Signal(syscall.SIGTERM)
-		} else {
-			os.Exit(0)
-		}
-	}()
-
-	return nil
+	resolver, err := NewGitHubResolver(&http.Client{Timeout: 30 * time.Second}, verifier)
+	if err != nil {
+		return err
+	}
+	coordinator := NewLocalCoordinator(DefaultDeploymentPath, resolver, ServiceJobLauncher{})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	candidate, err := coordinator.Check(ctx, CheckRequest{Channel: deployment.Channel})
+	if err != nil {
+		return err
+	}
+	if !candidate.HasUpdate {
+		return errors.New("no applicable signed update is available")
+	}
+	_, err = coordinator.Start(ctx, UpdateRequest{
+		Schema: 1, Channel: deployment.Channel, Version: candidate.LatestVer,
+	})
+	return err
 }

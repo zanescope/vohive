@@ -2,31 +2,25 @@ package config
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 
 	yaml "go.yaml.in/yaml/v3"
 )
-
-var deviceFileMu sync.Mutex
 
 type DeviceLimitError struct {
 	Limit int
 }
 
 func (e *DeviceLimitError) Error() string {
-	return fmt.Sprintf("设备数量已达到上限: %d", e.Limit)
+	return fmt.Sprintf("device count has reached the limit: %d", e.Limit)
 }
 
 func AddDeviceInFile(path string, device DeviceConfig) error {
 	return addDeviceInFile(path, device, 0)
 }
 
-// AddDeviceInFileWithLimit checks and updates the persisted device list while
-// holding deviceFileMu, preventing concurrent add requests from exceeding limit.
-// A limit of 0 means unlimited.
+// AddDeviceInFileWithLimit serializes the limit check and write through the
+// shared atomic config mutation. A limit of 0 means unlimited.
 func AddDeviceInFileWithLimit(path string, device DeviceConfig, limit int) error {
 	return addDeviceInFile(path, device, limit)
 }
@@ -125,58 +119,8 @@ func DeleteDeviceInFile(path string, deviceID string) error {
 }
 
 func updateDevicesInFile(path string, mutate func(*yaml.Node) (*yaml.Node, error)) error {
-	deviceFileMu.Lock()
-	defer deviceFileMu.Unlock()
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("读取配置文件失败: %w", err)
-	}
-
-	var doc yaml.Node
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return fmt.Errorf("解析配置文件失败: %w", err)
-	}
-
-	if len(doc.Content) == 0 {
-		return fmt.Errorf("配置文件为空")
-	}
-
-	root := doc.Content[0]
-	if root.Kind != yaml.MappingNode {
-		return fmt.Errorf("配置文件结构错误")
-	}
-
-	devices := getMapValue(root, "devices")
-	if devices == nil || devices.Kind != yaml.SequenceNode {
-		devices = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
-		setMapNode(root, "devices", devices)
-	}
-
-	if _, err := mutate(devices); err != nil {
-		return err
-	}
-
-	out, err := yaml.Marshal(&doc)
-	if err != nil {
-		return fmt.Errorf("序列化配置文件失败: %w", err)
-	}
-
-	tmp := path + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("创建配置目录失败: %w", err)
-	}
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return fmt.Errorf("写入临时配置文件失败: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("替换配置文件失败: %w", err)
-	}
-
-	_ = ReloadFromFile() // 触发配置重载到内存
-	return nil
+	return updateDevicesAST(path, mutate)
 }
-
 func findDeviceNodeByID(devices *yaml.Node, id string) *yaml.Node {
 	for _, item := range devices.Content {
 		if item == nil || item.Kind != yaml.MappingNode {
@@ -249,6 +193,18 @@ func setMapNode(m *yaml.Node, key string, val *yaml.Node) {
 	for i := 0; i < len(m.Content); i += 2 {
 		k := m.Content[i]
 		if k != nil && k.Value == key {
+			previous := m.Content[i+1]
+			if previous != nil {
+				if val.HeadComment == "" {
+					val.HeadComment = previous.HeadComment
+				}
+				if val.LineComment == "" {
+					val.LineComment = previous.LineComment
+				}
+				if val.FootComment == "" {
+					val.FootComment = previous.FootComment
+				}
+			}
 			m.Content[i+1] = val
 			return
 		}
