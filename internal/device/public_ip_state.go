@@ -19,6 +19,7 @@ import (
 var (
 	publicIPRetryBase         = 2 * time.Second
 	publicIPRetryMax          = 5 * time.Minute
+	publicIPRetryLimit        = 6
 	publicIPRecheckInterval   = 10 * time.Minute
 	publicIPProbeCycleTimeout = 15 * time.Second
 )
@@ -781,7 +782,17 @@ func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
 	launchProbe := false
 	if !expectedV4 && !expectedV6 {
 		state.noAddressTries++
-		p.schedulePublicIPTimerLocked(worker, state, retryDelay(state.noAddressTries), false)
+		if state.noAddressTries < publicIPRetryLimit {
+			state.retrying = true
+			p.schedulePublicIPTimerLocked(worker, state, retryDelay(state.noAddressTries), false)
+		} else {
+			state.retrying = false
+			if state.retryTimer != nil {
+				state.retryTimer.Stop()
+				state.retryTimer = nil
+			}
+			p.schedulePublicIPTimerLocked(worker, state, publicIPRecheckInterval, true)
+		}
 	} else if checkPublic || newEpoch {
 		if state.inFlight {
 			if checkPublic {
@@ -925,16 +936,27 @@ func (p *Pool) runPublicIPProbe(ctx context.Context, worker *Worker, nc NetworkC
 	} else {
 		state.retryAttemptV6++
 	}
+	retryScheduled := false
 	if v4Resolved && v6Resolved {
 		state.retrying = false
 		p.schedulePublicIPTimerLocked(worker, state, publicIPRecheckInterval, true)
 	} else {
-		state.retrying = true
 		attempt := state.retryAttemptV4
 		if attempt == 0 || (state.retryAttemptV6 > 0 && state.retryAttemptV6 < attempt) {
 			attempt = state.retryAttemptV6
 		}
-		p.schedulePublicIPTimerLocked(worker, state, retryDelay(attempt), false)
+		if attempt < publicIPRetryLimit {
+			state.retrying = true
+			retryScheduled = true
+			p.schedulePublicIPTimerLocked(worker, state, retryDelay(attempt), false)
+		} else {
+			state.retrying = false
+			if state.retryTimer != nil {
+				state.retryTimer.Stop()
+				state.retryTimer = nil
+			}
+			p.schedulePublicIPTimerLocked(worker, state, publicIPRecheckInterval, true)
+		}
 	}
 
 	displayV4, displayV6 := publicV4, publicV6
@@ -965,8 +987,14 @@ func (p *Pool) runPublicIPProbe(ctx context.Context, worker *Worker, nc NetworkC
 		p.triggerPublicIPMOBIKE(worker)
 	}
 	if !v4Resolved || !v6Resolved {
-		logger.Warn(fmt.Sprintf("[%s] 公网 IP 未完整获取，已安排重试", worker.ID),
-			"ipv4_resolved", v4Resolved, "ipv6_resolved", v6Resolved)
+		if retryScheduled {
+			logger.Warn(fmt.Sprintf("[%s] 公网 IP 未完整获取，已安排重试", worker.ID),
+				"ipv4_resolved", v4Resolved, "ipv6_resolved", v6Resolved)
+		} else {
+			logger.Warn(fmt.Sprintf("[%s] 公网 IP 连续获取失败，已暂停快速重试", worker.ID),
+				"ipv4_resolved", v4Resolved, "ipv6_resolved", v6Resolved,
+				"retry_limit", publicIPRetryLimit, "next_check", publicIPRecheckInterval.String())
+		}
 	}
 	if pending {
 		p.refreshIPs(worker, true)

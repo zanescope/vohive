@@ -350,6 +350,7 @@ func (s *Server) newRouter() *gin.Engine {
 		// ===== 日志 =====
 		api.GET("/logs/stream", s.handleLogStream)   // SSE 实时日志流
 		api.GET("/logs/history", s.handleLogHistory) // 获取历史日志
+		api.DELETE("/logs", s.handleClearLogs)       // 清空当前及轮转日志
 	}
 	return r
 }
@@ -628,8 +629,8 @@ func (s *Server) handleLogHistory(c *gin.Context) {
 		}
 	}
 
-	// 日志文件路径（使用 logger 的默认路径）
-	logFile := "logs/app.log"
+	// 使用 logger 的实际配置路径，确保历史读取与清空指向同一文件。
+	logFile := logger.LogFilename()
 
 	recentLines, err := readLastLines(logFile, lines, 1<<20)
 	if err != nil {

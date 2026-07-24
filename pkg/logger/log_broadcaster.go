@@ -66,6 +66,22 @@ func (b *Broadcaster) Broadcast(entry LogEntry) {
 	}
 }
 
+// ClearBuffered 丢弃日志清空请求之前尚未发送的缓冲条目。
+func (b *Broadcaster) ClearBuffered() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ch := range b.clients {
+		for {
+			select {
+			case <-ch:
+				continue
+			default:
+			}
+			break
+		}
+	}
+}
+
 // ClientCount 返回当前订阅客户端数量
 func (b *Broadcaster) ClientCount() int {
 	b.mu.RLock()

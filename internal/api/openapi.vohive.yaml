@@ -1603,6 +1603,27 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /logs:
+    delete:
+      tags: [logs]
+      summary: 清空全部日志
+      description: 截断当前日志文件、删除全部轮转历史，并清空尚未发送的实时日志缓冲。运行中产生的新日志会继续记录。
+      responses:
+        '200':
+          description: 日志已清空
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cleared]
+                properties:
+                  cleared:
+                    type: boolean
+                    enum: [true]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
 components:
   securitySchemes:
     BearerAuth:
