@@ -32,6 +32,20 @@ export const useLogsStore = defineStore('logs', () => {
     logs.value = []
   }
 
+  async function clearAll() {
+    loading.value = true
+    error.value = null
+    const result = await logsService.clearAll()
+    if (result.ok && result.data) {
+      clear()
+      lastOkAt.value = Date.now()
+    } else if (!result.ok) {
+      error.value = result.error
+    }
+    loading.value = false
+    return result
+  }
+
   return {
     logs,
     loading,
@@ -39,6 +53,7 @@ export const useLogsStore = defineStore('logs', () => {
     error,
     append,
     fetchHistory,
-    clear
+    clear,
+    clearAll
   }
 })

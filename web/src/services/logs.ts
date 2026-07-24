@@ -15,5 +15,11 @@ export const logsService = {
       const res = await api.get('/logs/history', { params: { lines } })
       return (res.data?.logs || []) as LogEntry[]
     })
+  },
+  clearAll() {
+    return callService(async () => {
+      const res = await api.delete('/logs')
+      return res.data?.cleared === true
+    })
   }
 }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import PageHeader from '../components/PageHeader.vue'
 import { ArrowDownload24Regular, Delete24Regular, Pause24Regular, Play24Regular } from '@vicons/fluent'
 import { useLogsStore } from '../stores/logs'
@@ -91,8 +91,31 @@ function togglePause() {
 }
 
 // 清空日志
-function clearLogs() {
-  logsStore.clear()
+async function clearLogs() {
+  try {
+    await ElMessageBox.confirm(
+      '将删除当前日志及所有轮转历史，且无法恢复。运行中产生的新日志会继续显示。',
+      '确认清空全部日志？',
+      {
+        confirmButtonText: '全部清空',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }
+    )
+  } catch {
+    return
+  }
+
+  const shouldReconnect = !paused.value
+  disconnect()
+  const result = await logsStore.clearAll()
+  if (!result.ok || !result.data) {
+    ElMessage.error(result.ok ? '清空日志失败' : result.error.message)
+    if (shouldReconnect) connect()
+    return
+  }
+  ElMessage.success('全部历史日志已清空')
+  if (shouldReconnect) connect()
 }
 
 // 导出日志
@@ -176,7 +199,7 @@ watch(levelFilter, () => {
             <el-icon><component :is="paused ? Play24Regular : Pause24Regular" /></el-icon>
             {{ paused ? '继续' : '暂停' }}
           </el-button>
-          <el-button @click="clearLogs" class="!border-0">
+          <el-button @click="clearLogs" :loading="logsStore.loading" class="!border-0">
             <el-icon><Delete24Regular /></el-icon>
             清空
           </el-button>

@@ -1192,3 +1192,73 @@ func TestStopNetworkClearsMOBIKEBaseline(t *testing.T) {
 			state.mobikeBaseV4, state.mobikeBaseV6)
 	}
 }
+
+func TestPublicIPProbeFallsBackToPeriodicChecksAfterRetryLimit(t *testing.T) {
+	previousLimit := publicIPRetryLimit
+	previousInterval := publicIPRecheckInterval
+	publicIPRetryLimit = 2
+	publicIPRecheckInterval = time.Hour
+	t.Cleanup(func() {
+		publicIPRetryLimit = previousLimit
+		publicIPRecheckInterval = previousInterval
+	})
+
+	p, worker, controller := newPublicIPStateHarness(t)
+	controller.setPrivate("10.0.0.2", "")
+	controller.setPublic("", "")
+
+	p.refreshIPs(worker, true)
+	waitPublicIPTest(t, time.Second, func() bool {
+		state := &worker.publicIP
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		return controller.probeCalls.Load() >= 1 && state.retryAttemptV4 == 1 && state.retryTimer != nil
+	})
+
+	p.refreshIPs(worker, true)
+	waitPublicIPTest(t, time.Second, func() bool {
+		state := &worker.publicIP
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		return controller.probeCalls.Load() >= 2 && state.retryAttemptV4 == 2 &&
+			!state.retrying && state.retryTimer == nil && state.periodicTimer != nil
+	})
+
+	controller.setPublic("8.8.8.8", "")
+	p.refreshIPs(worker, true)
+	waitPublicIPTest(t, time.Second, func() bool {
+		v4, _ := publicIPTestCached(worker)
+		return v4 == "8.8.8.8"
+	})
+	state := &worker.publicIP
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retryAttemptV4 != 0 || state.retrying || state.retryTimer != nil || state.periodicTimer == nil {
+		t.Fatalf("recovered state attempts=%d retrying=%t retry=%v periodic=%v",
+			state.retryAttemptV4, state.retrying, state.retryTimer != nil, state.periodicTimer != nil)
+	}
+}
+
+func TestPublicIPMissingBearerAddressStopsRapidRetries(t *testing.T) {
+	previousLimit := publicIPRetryLimit
+	previousInterval := publicIPRecheckInterval
+	publicIPRetryLimit = 2
+	publicIPRecheckInterval = time.Hour
+	t.Cleanup(func() {
+		publicIPRetryLimit = previousLimit
+		publicIPRecheckInterval = previousInterval
+	})
+
+	p, worker, controller := newPublicIPStateHarness(t)
+	controller.setPrivate("", "")
+	p.refreshIPs(worker, true)
+	p.refreshIPs(worker, true)
+
+	state := &worker.publicIP
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.noAddressTries != 2 || state.retrying || state.retryTimer != nil || state.periodicTimer == nil {
+		t.Fatalf("missing-address state attempts=%d retrying=%t retry=%v periodic=%v",
+			state.noAddressTries, state.retrying, state.retryTimer != nil, state.periodicTimer != nil)
+	}
+}

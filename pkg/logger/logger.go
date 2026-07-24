@@ -13,9 +13,10 @@ import (
 )
 
 var (
-	logMu sync.RWMutex
-	Log   = zap.NewNop()
-	Sugar = Log.Sugar()
+	logMu          sync.RWMutex
+	Log            = zap.NewNop()
+	Sugar          = Log.Sugar()
+	activeFileSink *managedFileSink
 )
 
 func ZapLogger() *zap.Logger {
@@ -283,13 +284,14 @@ func Setup(cfg LogConfig) {
 	} else {
 		fileWriter = zapcore.AddSync(rl)
 	}
+	fileSink := newManagedFileSink(cfg.Filename, fileWriter)
 
 	// 控制台输出
 	consoleWriter := zapcore.AddSync(os.Stdout)
 
 	level := getLogLevel(cfg.Debug)
 	consoleCore := zapcore.NewCore(zapcore.NewConsoleEncoder(consoleEncoderConfig), consoleWriter, level)
-	fileCore := zapcore.NewCore(zapcore.NewConsoleEncoder(fileEncoderConfig), fileWriter, level)
+	fileCore := zapcore.NewCore(zapcore.NewConsoleEncoder(fileEncoderConfig), fileSink, level)
 
 	// SSE 日志推送核心（用于前端实时日志）
 	sseCore := NewSSECore(GlobalBroadcaster, level)
@@ -301,6 +303,7 @@ func Setup(cfg LogConfig) {
 	logMu.Lock()
 	Log = log
 	Sugar = sugar
+	activeFileSink = fileSink
 	logMu.Unlock()
 }
 
