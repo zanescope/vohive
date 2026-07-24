@@ -81,56 +81,6 @@ func (p *Pool) healthCheckWorkerSnapshot() []*Worker {
 	return workers
 }
 
-const (
-	missingWorkerRecoveryBase = time.Minute
-	missingWorkerRecoveryMax  = 5 * time.Minute
-)
-
-type missingWorkerRecoveryBackoff struct {
-	attempts int
-	next     time.Time
-}
-
-func (backoff *missingWorkerRecoveryBackoff) allow(now time.Time) (bool, time.Duration) {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	if !backoff.next.IsZero() && now.Before(backoff.next) {
-		return false, backoff.next.Sub(now)
-	}
-	backoff.attempts++
-	shift := backoff.attempts - 1
-	if shift > 3 {
-		shift = 3
-	}
-	delay := missingWorkerRecoveryBase * time.Duration(1<<shift)
-	if delay > missingWorkerRecoveryMax {
-		delay = missingWorkerRecoveryMax
-	}
-	backoff.next = now.Add(delay)
-	return true, delay
-}
-
-func (backoff *missingWorkerRecoveryBackoff) reset() {
-	backoff.attempts = 0
-	backoff.next = time.Time{}
-}
-
-func (p *Pool) allowMissingWorkerRecovery(now time.Time) (bool, time.Duration) {
-	p.missingWorkerRecoveryMu.Lock()
-	defer p.missingWorkerRecoveryMu.Unlock()
-	return p.missingWorkerRecovery.allow(now)
-}
-
-func (p *Pool) resetMissingWorkerRecovery() {
-	if p == nil {
-		return
-	}
-	p.missingWorkerRecoveryMu.Lock()
-	p.missingWorkerRecovery.reset()
-	p.missingWorkerRecoveryMu.Unlock()
-}
-
 func (p *Pool) runHealthCheckTick() bool {
 	workers := p.healthCheckWorkerSnapshot()
 	needRescan := false
@@ -217,69 +167,9 @@ func (p *Pool) runHealthCheckTick() bool {
 		needRescan = true
 	}
 	workerCount := len(workers)
-	missingWorkerDetected := false
 
 	if !needRescan {
-		if managed := config.ListDevices(); true {
-			for _, md := range managed {
-				p.mu.RLock()
-				isRebuilding := p.rebuilding[md.ID]
-				isRebootRecovering := p.modemRebootRecovering[md.ID]
-				hasWorker := p.workers[md.ID] != nil
-				p.mu.RUnlock()
-
-				if md.ModemIMEI != "" && !hasWorker {
-					missingWorkerDetected = true
-					if isRebuilding || isRebootRecovering {
-						continue
-					}
-					if allowed, _ := p.allowMissingWorkerRecovery(time.Now()); !allowed {
-						break
-					}
-					isQMIConf := strings.ToLower(strings.TrimSpace(md.DeviceBackend)) == "qmi" ||
-						(strings.TrimSpace(md.DeviceBackend) == "" && strings.TrimSpace(md.ControlDevice) != "")
-
-					if isQMIConf && strings.TrimSpace(md.ControlDevice) != "" && strings.TrimSpace(md.Interface) != "" {
-						live := QMIDevice{}
-						discoveryAvailable := false
-						if qmiList, err := discoverQMIDevicesFn(); err == nil {
-							discoveryAvailable = true
-							for _, candidate := range qmiList {
-								if strings.TrimSpace(candidate.ControlPath) == strings.TrimSpace(md.ControlDevice) ||
-									strings.TrimSpace(candidate.NetInterface) == strings.TrimSpace(md.Interface) ||
-									strings.TrimSpace(candidate.USBPath) == strings.TrimSpace(md.USBPath) {
-									live = candidate
-									break
-								}
-							}
-						}
-						if !shouldFastStartMissingQMIWorker(md, live, discoveryAvailable) {
-							logger.Info("定时检查发现 QMI 静态路径已变化，改为全量重扫", "device", md.ID)
-							needRescan = true
-							break
-						}
-
-						logger.Info("定时检查发现免扫类型节点缺少 Worker，直接尝试初始化拉起", "device", md.ID)
-						go func(c config.DeviceConfig) {
-							if _, err := p.AddWorkerFromConfig(c); err != nil {
-								logger.Warn("快速拉起节点失败，可能为底层掉线或冲突，下个周期重试", "device", c.ID, "err", err)
-							}
-						}(md)
-						continue
-					}
-
-					logger.Info("定时检查发现已配置设备缺少 Worker，将触发重连扫描",
-						"device", md.ID, "imei", md.ModemIMEI,
-						"active_workers", workerCount)
-					needRescan = true
-					break
-				}
-			}
-		}
-	}
-
-	if !missingWorkerDetected {
-		p.resetMissingWorkerRecovery()
+		needRescan = p.recoverMissingConfiguredWorkers(workerCount)
 	}
 
 	return needRescan
