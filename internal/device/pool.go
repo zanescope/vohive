@@ -113,6 +113,7 @@ type Worker struct {
 	CSCallMgr        *cscall.Manager
 	stop             chan struct{}
 	stopOnce         sync.Once
+	resourceStopOnce sync.Once
 
 	cachedIP            string
 	cachedPublicIPv6    string
@@ -145,6 +146,7 @@ type Worker struct {
 	healthConsecutiveFailures int
 	healthGraceUntil          time.Time
 	healthSnapshot            HealthSnapshot
+	healthSyncInFlight        atomic.Bool
 
 	streamSubs          atomic.Int32 // 单设备的流订阅计数器
 	uimIndicationsReady atomic.Bool  // worker 完成启动注册后才处理 UIM 事件触发的重扫/重载
@@ -174,6 +176,9 @@ type Pool struct {
 	cancel                    context.CancelFunc
 	dataConnectHandlersMu     sync.RWMutex
 	dataConnectHandlers       []func(deviceID string)
+	rescanMu                  sync.Mutex
+	missingWorkerRetryMu      sync.Mutex
+	missingWorkerRetries      map[string]missingWorkerRetryState
 	rescanAndReconnectForTest func() error
 
 	// SIP 注册器 (用于 CS 域语音桥接查路由)
@@ -202,6 +207,7 @@ type Pool struct {
 	vowifiUSSDSubs map[string]map[uint64]chan VoWiFiUSSDEvent
 
 	// 热插拔监听
+	udevWatcherMu  sync.Mutex
 	udevWatcher    *UdevWatcher
 	startOnce      sync.Once
 	policyResolver cardpolicy.Resolver
@@ -1095,34 +1101,8 @@ func (p *Pool) RemoveWorker(deviceID string) error {
 		logger.Info("设备移除时强制关闭并清理残留的 VoWiFi 实例", "device", deviceID)
 	}
 
-	worker.stopOnce.Do(func() {
-		if worker.stop != nil {
-			close(worker.stop)
-		}
-	})
-
+	p.stopWorkerResources(worker)
 	p.invalidateRemovedPublicIPState(worker)
-
-	if worker.Proxy != nil {
-		worker.Proxy.Shutdown()
-	}
-	if worker.ESIMQMITransport != nil {
-		_ = worker.ESIMQMITransport.Stop()
-	}
-	if worker.QMICore != nil {
-		worker.QMICore.Stop()
-	}
-	if worker.MBIMCore != nil {
-		_ = worker.MBIMCore.Close()
-	}
-	if worker.Backend != nil {
-		_ = worker.Backend.Close()
-	}
-	if worker.Modem != nil {
-		if !worker.Modem.StopAndWait(2 * time.Second) {
-			logger.Warn("设备移除时等待 AT 管理器退出超时", "device", deviceID)
-		}
-	}
 	if p.lifecycle != nil {
 		snap := p.lifecycle.GetSnapshot(deviceID)
 		if !snap.Recovering && snap.Phase != LifecyclePhaseEvicting {
@@ -1386,8 +1366,7 @@ func (p *Pool) startPoolBackgroundServicesOnce() {
 		go p.startVoWiFiDesiredReconcileLoop()
 		p.startInitialDesiredVoWiFiAutoStart(5 * time.Second)
 
-		p.udevWatcher = NewUdevWatcher(p)
-		p.udevWatcher.Start()
+		p.startUdevWatcher()
 	})
 }
 
@@ -1876,8 +1855,7 @@ func (p *Pool) startAllSynchronousLegacy() error {
 	p.startInitialDesiredVoWiFiAutoStart(5 * time.Second)
 
 	// 启动 udev 热插拔监听器
-	p.udevWatcher = NewUdevWatcher(p)
-	p.udevWatcher.Start()
+	p.startUdevWatcher()
 
 	return firstErr
 }
@@ -1985,6 +1963,24 @@ func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex Wor
 			}
 		} else {
 			raw, imei = resolveDiscoveredQMIDeviceFn(raw, 1600*time.Millisecond, true)
+			if config.NormalizeIMEI(imei) == "" {
+				resolved, atIMEI := ResolveQMIDeviceATPort(raw, 1600*time.Millisecond)
+				if config.NormalizeIMEI(atIMEI) != "" {
+					raw = resolved
+					imei = atIMEI
+					logger.InfoRate("rescan_at_identity:"+strings.TrimSpace(raw.ControlPath), 30*time.Minute,
+						"QMI 身份探测失败后已通过设备自有 AT 端口确认身份",
+						"control_path", strings.TrimSpace(raw.ControlPath),
+						"interface", strings.TrimSpace(raw.NetInterface),
+						"at_port", strings.TrimSpace(raw.ATPort))
+				} else {
+					logger.WarnRate("rescan_identity_unresolved:"+strings.TrimSpace(raw.ControlPath), 10*time.Minute,
+						"重扫无法确认未注册 QMI 设备身份，设备保持 degraded",
+						"control_path", strings.TrimSpace(raw.ControlPath),
+						"interface", strings.TrimSpace(raw.NetInterface),
+						"at_port_count", len(raw.ATPorts))
+				}
+			}
 		}
 		hardware = append(hardware, CompatibleModem{
 			IMEI:          imei,
@@ -2023,6 +2019,12 @@ func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex Wor
 }
 
 func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
+	// Hardware discovery mutates Worker registrations. Serialize every caller
+	// (udev, health checks, manual rescans and recovery loops) so an older scan
+	// cannot remove a Worker that a concurrent scan has just rebuilt.
+	p.rescanMu.Lock()
+	defer p.rescanMu.Unlock()
+
 	discovered, err := discoverQMIDevicesFn()
 	if err != nil {
 		logger.Warn("QMI 硬件扫描失败，将继续使用兼容扫描", "err", err)
@@ -2231,6 +2233,9 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 				p.lifecycle.BeginRecovery(md.ID, LifecyclePhaseUSBWait, "rescan_device_missing", qmiLifecycleRecoveryTTL)
 			}
 			_ = p.RemoveWorker(md.ID)
+			if p.lifecycle != nil {
+				p.lifecycle.MarkOffline(md.ID, "rescan_device_missing")
+			}
 		}
 	}
 
@@ -2752,47 +2757,26 @@ func (p *Pool) Shutdown() error {
 		_ = p.stopVoWiFiAppForTeardown(context.Background(), devID, "shutdown")
 	}
 
+	p.stopUdevWatcher()
 	p.cancel()
-	var wg sync.WaitGroup
+
 	p.mu.RLock()
+	workers := make([]*Worker, 0, len(p.workers))
 	for _, w := range p.workers {
-		p.stopPublicIPState(w)
-		wg.Add(1)
-		go func(worker *Worker) {
-			defer wg.Done()
-			if worker.Proxy != nil {
-				logger.Info(fmt.Sprintf("[%s] 正在关闭代理服务器", worker.ID))
-				worker.Proxy.Shutdown()
-			}
-		}(w)
-
-		// 停止 QMI Core
-		wg.Add(1)
-		go func(worker *Worker) {
-			defer wg.Done()
-			if worker.QMICore != nil {
-				worker.QMICore.Stop()
-			}
-		}(w)
-
-		wg.Add(1)
-		go func(worker *Worker) {
-			defer wg.Done()
-			if worker.MBIMCore != nil {
-				_ = worker.MBIMCore.Close()
-			}
-		}(w)
-
-		// 停止独立 QMI UIM transport（若存在）
-		wg.Add(1)
-		go func(worker *Worker) {
-			defer wg.Done()
-			if worker.ESIMQMITransport != nil {
-				_ = worker.ESIMQMITransport.Stop()
-			}
-		}(w)
+		if w != nil {
+			workers = append(workers, w)
+		}
 	}
 	p.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, worker := range workers {
+		wg.Add(1)
+		go func(worker *Worker) {
+			defer wg.Done()
+			p.stopWorkerResources(worker)
+		}(worker)
+	}
 
 	// 等待 5 秒强制退出
 	c := make(chan struct{})

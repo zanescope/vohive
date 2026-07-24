@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -333,5 +334,29 @@ func TestBuildWorkerDiscoveryIndexIncludesRuntimeStatus(t *testing.T) {
 	}
 	if info.USBNetMode == nil || *info.USBNetMode != 0 {
 		t.Fatalf("USBNetMode=%v want pointer to 0", info.USBNetMode)
+	}
+}
+
+func TestEnrichDiscoveredQMIDevicePreservesProbeError(t *testing.T) {
+	original := probeIMEIViaQMIFn
+	t.Cleanup(func() { probeIMEIViaQMIFn = original })
+
+	probeErr := errors.New("DMS request timed out")
+	probeIMEIViaQMIFn = func(string, qmiq.ClientOptions) (string, error) {
+		return "", probeErr
+	}
+
+	_, imei, err := EnrichDiscoveredQMIDeviceWithDiagnostics(QMIDevice{
+		ControlPath: "/dev/cdc-wdm6",
+	}, QMIDeviceEnrichOptions{
+		EnableQMIIMEIProbe: true,
+		QMIClientOptions:   qmiq.DefaultClientOptions(),
+	})
+
+	if imei != "" {
+		t.Fatalf("IMEI = %q, want empty", imei)
+	}
+	if !errors.Is(err, probeErr) {
+		t.Fatalf("error = %v, want %v", err, probeErr)
 	}
 }

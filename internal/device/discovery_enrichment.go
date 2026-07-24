@@ -1,6 +1,7 @@
 package device
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -28,6 +29,13 @@ type CompatibleModemEnrichOptions struct {
 // EnrichDiscoveredQMIDevice 按调用方策略补全单台静态发现到的 QMI 设备信息。
 // 该流程只会在本设备 ATPorts 范围内做 AT 口探测；QMI IMEI 补读作为最后手段单独开关控制。
 func EnrichDiscoveredQMIDevice(dev QMIDevice, opts QMIDeviceEnrichOptions) (QMIDevice, string) {
+	dev, imei, _ := EnrichDiscoveredQMIDeviceWithDiagnostics(dev, opts)
+	return dev, imei
+}
+
+// EnrichDiscoveredQMIDeviceWithDiagnostics 保留 QMI 身份探测错误，
+// 供恢复扫描说明设备为何只能进入 degraded 状态。
+func EnrichDiscoveredQMIDeviceWithDiagnostics(dev QMIDevice, opts QMIDeviceEnrichOptions) (QMIDevice, string, error) {
 	imei := ""
 
 	if opts.EnableATProbe {
@@ -39,11 +47,16 @@ func EnrichDiscoveredQMIDevice(dev QMIDevice, opts QMIDeviceEnrichOptions) (QMID
 	}
 
 	if imei == "" && opts.EnableQMIIMEIProbe && strings.TrimSpace(dev.ControlPath) != "" {
-		if qmiIMEI, err := probeIMEIViaQMIFn(dev.ControlPath, opts.QMIClientOptions); err == nil && qmiIMEI != "" {
-			imei = qmiIMEI
+		qmiIMEI, err := probeIMEIViaQMIFn(dev.ControlPath, opts.QMIClientOptions)
+		if err != nil {
+			return dev, "", err
 		}
+		if strings.TrimSpace(qmiIMEI) == "" {
+			return dev, "", fmt.Errorf("QMI DMS returned an empty IMEI")
+		}
+		imei = qmiIMEI
 	}
-	return dev, imei
+	return dev, imei, nil
 }
 
 // EnrichDiscoveredCompatibleModem 按调用方策略补全兼容发现结果。

@@ -35,6 +35,11 @@ func NewUdevWatcher(pool *Pool) *UdevWatcher {
 
 // Start 启动 udev 事件监听
 func (w *UdevWatcher) Start() {
+	select {
+	case <-w.stop:
+		return
+	default:
+	}
 	go w.loop()
 }
 
@@ -46,6 +51,8 @@ func (w *UdevWatcher) Stop() {
 		if w.timer != nil {
 			w.timer.Stop()
 		}
+		w.timer = nil
+		w.pending = false
 		w.pendingMu.Unlock()
 	})
 }
@@ -133,6 +140,11 @@ func (w *UdevWatcher) isModemEvent(data []byte) bool {
 // scheduleRescan 防抖：延迟执行扫描
 // 采用"重置计时器"模式：每次事件都重置倒计时，确保最终一次事件（设备完成枚举）生效
 func (w *UdevWatcher) scheduleRescan() {
+	select {
+	case <-w.stop:
+		return
+	default:
+	}
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
 
@@ -144,17 +156,28 @@ func (w *UdevWatcher) scheduleRescan() {
 
 	w.pending = true
 	w.timer = time.AfterFunc(w.debounce, func() {
+		select {
+		case <-w.stop:
+			return
+		default:
+		}
 		w.pendingMu.Lock()
 		w.pending = false
 		w.timer = nil
 		w.pendingMu.Unlock()
+		select {
+		case <-w.stop:
+			return
+		default:
+		}
 
 		logger.Info("udev 检测到设备变化，执行重新扫描")
-		if w.pool != nil {
-			if woken := w.pool.WakeModemRebootRecoveries("udev_modem_event"); woken > 0 {
-				logger.Debug("udev 事件已唤醒模组重启恢复流程", "recoveries", woken)
-				return
-			}
+		if w.pool == nil {
+			return
+		}
+		if woken := w.pool.WakeModemRebootRecoveries("udev_modem_event"); woken > 0 {
+			logger.Debug("udev 事件已唤醒模组重启恢复流程", "recoveries", woken)
+			return
 		}
 		if err := w.pool.RescanAndReconnect(); err != nil {
 			logger.Warn("设备重新扫描失败", "err", err)

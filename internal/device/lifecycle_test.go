@@ -33,6 +33,26 @@ func TestLifecycleCoordinatorAllowsEvictionAfterDeadline(t *testing.T) {
 	}
 }
 
+func TestLifecycleCoordinatorExpiresRecoverySnapshot(t *testing.T) {
+	lc := newLifecycleCoordinator()
+	now := time.Date(2026, 5, 4, 23, 0, 0, 0, time.UTC)
+	lc.BeginRecoveryAt("dev1", LifecyclePhaseUSBWait, "device_missing", now, time.Minute)
+
+	snap := lc.getSnapshotAt("dev1", now.Add(time.Minute+time.Second))
+	if snap.Phase != LifecyclePhaseOffline {
+		t.Fatalf("phase=%q want %q", snap.Phase, LifecyclePhaseOffline)
+	}
+	if snap.Recovering {
+		t.Fatal("Recovering=true, want false after recovery deadline")
+	}
+	if !strings.Contains(snap.Reason, "recovery_deadline_expired") {
+		t.Fatalf("reason=%q want recovery_deadline_expired", snap.Reason)
+	}
+	if !snap.Deadline.IsZero() || !snap.CanEvictAfter.IsZero() {
+		t.Fatalf("expired snapshot retained deadline: %+v", snap)
+	}
+}
+
 func TestLifecycleCoordinatorFinishOnlineClearsRecovery(t *testing.T) {
 	lc := newLifecycleCoordinator()
 	now := time.Date(2026, 5, 4, 23, 0, 0, 0, time.UTC)

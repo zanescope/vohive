@@ -169,55 +169,7 @@ func (p *Pool) runHealthCheckTick() bool {
 	workerCount := len(workers)
 
 	if !needRescan {
-		if managed := config.ListDevices(); true {
-			for _, md := range managed {
-				p.mu.RLock()
-				isRebuilding := p.rebuilding[md.ID]
-				isRebootRecovering := p.modemRebootRecovering[md.ID]
-				hasWorker := p.workers[md.ID] != nil
-				p.mu.RUnlock()
-
-				if md.ModemIMEI != "" && !hasWorker && !isRebuilding && !isRebootRecovering {
-					isQMIConf := strings.ToLower(strings.TrimSpace(md.DeviceBackend)) == "qmi" ||
-						(strings.TrimSpace(md.DeviceBackend) == "" && strings.TrimSpace(md.ControlDevice) != "")
-
-					if isQMIConf && strings.TrimSpace(md.ControlDevice) != "" && strings.TrimSpace(md.Interface) != "" {
-						live := QMIDevice{}
-						discoveryAvailable := false
-						if qmiList, err := discoverQMIDevicesFn(); err == nil {
-							discoveryAvailable = true
-							for _, candidate := range qmiList {
-								if strings.TrimSpace(candidate.ControlPath) == strings.TrimSpace(md.ControlDevice) ||
-									strings.TrimSpace(candidate.NetInterface) == strings.TrimSpace(md.Interface) ||
-									strings.TrimSpace(candidate.USBPath) == strings.TrimSpace(md.USBPath) {
-									live = candidate
-									break
-								}
-							}
-						}
-						if !shouldFastStartMissingQMIWorker(md, live, discoveryAvailable) {
-							logger.Info("定时检查发现 QMI 静态路径已变化，改为全量重扫", "device", md.ID)
-							needRescan = true
-							break
-						}
-
-						logger.Info("定时检查发现免扫类型节点缺少 Worker，直接尝试初始化拉起", "device", md.ID)
-						go func(c config.DeviceConfig) {
-							if _, err := p.AddWorkerFromConfig(c); err != nil {
-								logger.Warn("快速拉起节点失败，可能为底层掉线或冲突，下个周期重试", "device", c.ID, "err", err)
-							}
-						}(md)
-						continue
-					}
-
-					logger.Info("定时检查发现已配置设备缺少 Worker，将触发重连扫描",
-						"device", md.ID, "imei", md.ModemIMEI,
-						"active_workers", workerCount)
-					needRescan = true
-					break
-				}
-			}
-		}
+		needRescan = p.recoverMissingConfiguredWorkers(workerCount)
 	}
 
 	return needRescan
@@ -269,12 +221,30 @@ func (p *Pool) healthCheckLoop() {
 				if worker == nil {
 					continue
 				}
-				sem <- struct{}{}
+				if !worker.tryBeginHealthSync() {
+					continue
+				}
+				select {
+				case sem <- struct{}{}:
+				case <-p.ctx.Done():
+					worker.endHealthSync()
+					return
+				}
 				go func() {
 					defer func() { <-sem }()
 
 					done := make(chan struct{})
 					go func() {
+						defer close(done)
+						defer worker.endHealthSync()
+						ctx, cancel := context.WithTimeout(p.ctx, 20*time.Second)
+						defer cancel()
+						select {
+						case <-worker.stop:
+							return
+						default:
+						}
+
 						isATMode := worker.Backend == nil || worker.Backend.Mode() == "at"
 						if isATMode && worker.Modem != nil {
 							worker.Modem.RefreshStatus(
@@ -290,13 +260,21 @@ func (p *Pool) healthCheckLoop() {
 								},
 							)
 						}
-						_ = worker.RefreshRuntime(nil, "health_sync")
-						p.PersistRuntimeState(worker)
-						close(done)
+						_ = worker.RefreshRuntime(ctx, "health_sync")
+						select {
+						case <-worker.stop:
+							return
+						default:
+						}
+						if p.GetWorker(worker.ID) == worker {
+							p.PersistRuntimeState(worker)
+						}
 					}()
 
 					select {
 					case <-done:
+					case <-p.ctx.Done():
+					case <-worker.stop:
 					case <-time.After(20 * time.Second):
 						logger.Warn("设备状态同步超时", "device", worker.ID)
 					}
