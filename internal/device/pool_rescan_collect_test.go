@@ -114,3 +114,49 @@ func TestCollectRescanHardwarePopulatesNonQMIIMEIAndPaths(t *testing.T) {
 		t.Errorf("expected TransportType mbim, got %q", hw.TransportType)
 	}
 }
+
+func TestCollectRescanHardwareFallsBackToDeviceScopedATIdentity(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("devices:\n- id: wwan6\n  device_backend: qmi\n  modem_imei: \"866069053194211\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := config.InitGlobalManager(configPath); err != nil {
+		t.Fatalf("InitGlobalManager() error = %v", err)
+	}
+
+	originalResolve := resolveDiscoveredQMIDeviceFn
+	originalATProbe := probeIMEICachedFn
+	t.Cleanup(func() {
+		resolveDiscoveredQMIDeviceFn = originalResolve
+		probeIMEICachedFn = originalATProbe
+	})
+
+	resolveDiscoveredQMIDeviceFn = func(dev QMIDevice, _ time.Duration, _ bool) (QMIDevice, string) {
+		return dev, ""
+	}
+	var probedPorts []string
+	probeIMEICachedFn = func(port string, _ time.Duration) (string, error) {
+		probedPorts = append(probedPorts, port)
+		if port == "/dev/ttyUSB6" {
+			return "866069053194211", nil
+		}
+		return "", os.ErrNotExist
+	}
+
+	discovered := []QMIDevice{{
+		ControlPath:  "/dev/cdc-wdm6",
+		NetInterface: "wwan6",
+		ATPorts:      []string{"/dev/ttyUSB7", "/dev/ttyUSB6"},
+	}}
+	hardware := (&Pool{}).collectRescanHardware(discovered, BuildWorkerDiscoveryIndex(nil, false))
+
+	if len(hardware) != 1 {
+		t.Fatalf("hardware count = %d, want 1", len(hardware))
+	}
+	if hardware[0].IMEI != "866069053194211" || hardware[0].ATPort != "/dev/ttyUSB6" {
+		t.Fatalf("fallback identity = %+v", hardware[0])
+	}
+	if len(probedPorts) != 1 || probedPorts[0] != "/dev/ttyUSB6" {
+		t.Fatalf("probed ports = %v, want only device-scoped /dev/ttyUSB6", probedPorts)
+	}
+}

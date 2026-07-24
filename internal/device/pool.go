@@ -1963,6 +1963,24 @@ func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex Wor
 			}
 		} else {
 			raw, imei = resolveDiscoveredQMIDeviceFn(raw, 1600*time.Millisecond, true)
+			if config.NormalizeIMEI(imei) == "" {
+				resolved, atIMEI := ResolveQMIDeviceATPort(raw, 1600*time.Millisecond)
+				if config.NormalizeIMEI(atIMEI) != "" {
+					raw = resolved
+					imei = atIMEI
+					logger.InfoRate("rescan_at_identity:"+strings.TrimSpace(raw.ControlPath), 30*time.Minute,
+						"QMI 身份探测失败后已通过设备自有 AT 端口确认身份",
+						"control_path", strings.TrimSpace(raw.ControlPath),
+						"interface", strings.TrimSpace(raw.NetInterface),
+						"at_port", strings.TrimSpace(raw.ATPort))
+				} else {
+					logger.WarnRate("rescan_identity_unresolved:"+strings.TrimSpace(raw.ControlPath), 10*time.Minute,
+						"重扫无法确认未注册 QMI 设备身份，设备保持 degraded",
+						"control_path", strings.TrimSpace(raw.ControlPath),
+						"interface", strings.TrimSpace(raw.NetInterface),
+						"at_port_count", len(raw.ATPorts))
+				}
+			}
 		}
 		hardware = append(hardware, CompatibleModem{
 			IMEI:          imei,

@@ -94,12 +94,24 @@ func requiresMBIMCore(cfg config.DeviceConfig) bool {
 
 func resolveDiscoveredQMIDevice(dev QMIDevice, timeout time.Duration, allowQMIIMEIProbe bool) (QMIDevice, string) {
 	qmiClientOptions, allowQMIProbe := qmicore.DiscoveryClientOptionsForControlDevice(dev.ControlPath)
-	return EnrichDiscoveredQMIDevice(dev, QMIDeviceEnrichOptions{
+	resolved, imei, probeErr := EnrichDiscoveredQMIDeviceWithDiagnostics(dev, QMIDeviceEnrichOptions{
 		EnableATProbe:      false,
 		ATProbeTimeout:     timeout,
 		EnableQMIIMEIProbe: allowQMIIMEIProbe && allowQMIProbe,
 		QMIClientOptions:   qmiClientOptions,
 	})
+	if allowQMIIMEIProbe && !allowQMIProbe {
+		probeErr = fmt.Errorf("QMI control path is held by a non-proxy process")
+	}
+	if probeErr != nil {
+		logger.WarnRate("qmi_discovery_imei:"+strings.TrimSpace(dev.ControlPath), 10*time.Minute,
+			"QMI 设备身份探测失败",
+			"control_path", strings.TrimSpace(dev.ControlPath),
+			"interface", strings.TrimSpace(dev.NetInterface),
+			"at_port_count", len(dev.ATPorts),
+			"err", probeErr)
+	}
+	return resolved, imei
 }
 
 var resolveDiscoveredQMIDeviceFn = resolveDiscoveredQMIDevice
