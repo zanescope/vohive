@@ -2,6 +2,7 @@ package notify
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -98,6 +99,162 @@ func waitUntil(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Fatalf("condition not met within %s", timeout)
 }
 
+func TestFormatSMSNotificationIncludesLocalPhone(t *testing.T) {
+	ts := time.Date(2026, 4, 13, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		source     string
+		localPhone string
+		want       string
+	}{
+		{
+			name:       "cellular known number",
+			source:     "蜂窝",
+			localPhone: " +8613900000000 ",
+			want:       "收到新短信 / 蜂窝\n设备  wwan0\n本机  +8613900000000\n号码  +8613800000000\n时间  2026-04-13 12:00:00\n内容  hello",
+		},
+		{
+			name:   "vowifi unknown number",
+			source: "VoWiFi",
+			want:   "收到新短信 / VoWiFi\n设备  wwan0\n本机  --\n号码  +8613800000000\n时间  2026-04-13 12:00:00\n内容  hello",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatSMSNotification("wwan0", tt.localPhone, "+8613800000000", "hello", tt.source, ts)
+			if got != tt.want {
+				t.Fatalf("formatSMSNotification()=%q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNotificationDeviceDisplayNamePrefersNameAndFallsBackToID(t *testing.T) {
+	tests := []struct {
+		name       string
+		deviceID   string
+		deviceName string
+		want       string
+	}{
+		{name: "configured name", deviceID: "wwan0", deviceName: " Living Room SIM ", want: "Living Room SIM"},
+		{name: "missing name", deviceID: " wwan0 ", want: "wwan0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := notificationDeviceDisplayName(tt.deviceID, tt.deviceName); got != tt.want {
+				t.Fatalf("notificationDeviceDisplayName()=%q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveNotificationLocalPhoneUsesCoherentIdentityKeys(t *testing.T) {
+	tests := []struct {
+		name      string
+		imsi      string
+		iccid     string
+		wantIMSI  string
+		wantICCID string
+	}{
+		{
+			name:      "imsi and iccid",
+			imsi:      " 460001234567890 ",
+			iccid:     " 8986000000000000001 ",
+			wantIMSI:  "460001234567890",
+			wantICCID: "8986000000000000001",
+		},
+		{
+			name:      "iccid only",
+			iccid:     " 8986000000000000002 ",
+			wantICCID: "8986000000000000002",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			got, err := resolveNotificationLocalPhone(tt.imsi, tt.iccid, true, func(imsi, iccid string) (string, error) {
+				calls++
+				if imsi != tt.wantIMSI || iccid != tt.wantICCID {
+					t.Fatalf("lookup identity=(%q,%q), want (%q,%q)", imsi, iccid, tt.wantIMSI, tt.wantICCID)
+				}
+				return " +8613900000000 ", nil
+			})
+			if err != nil {
+				t.Fatalf("resolveNotificationLocalPhone() error=%v", err)
+			}
+			if got != "+8613900000000" {
+				t.Fatalf("resolveNotificationLocalPhone()=%q, want +8613900000000", got)
+			}
+			if calls != 1 {
+				t.Fatalf("lookup calls=%d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestResolveNotificationLocalPhoneFallbacksWithoutBlocking(t *testing.T) {
+	lookupErr := errors.New("database unavailable")
+	tests := []struct {
+		name           string
+		imsi           string
+		iccid          string
+		identityUsable bool
+		lookupPhone    string
+		lookupErr      error
+		wantCalls      int
+		wantLookupErr  bool
+	}{
+		{
+			name:      "identity unusable",
+			imsi:      "460001234567890",
+			iccid:     "8986000000000000001",
+			wantCalls: 0,
+		},
+		{
+			name:           "identity unavailable",
+			identityUsable: true,
+			wantCalls:      0,
+		},
+		{
+			name:           "number unavailable",
+			imsi:           "460001234567890",
+			identityUsable: true,
+			lookupPhone:    "  ",
+			wantCalls:      1,
+		},
+		{
+			name:           "database error",
+			imsi:           "460001234567890",
+			identityUsable: true,
+			lookupErr:      lookupErr,
+			wantCalls:      1,
+			wantLookupErr:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			got, err := resolveNotificationLocalPhone(tt.imsi, tt.iccid, tt.identityUsable, func(_, _ string) (string, error) {
+				calls++
+				return tt.lookupPhone, tt.lookupErr
+			})
+			if got != unknownNotificationLocalPhone {
+				t.Fatalf("resolveNotificationLocalPhone()=%q, want %q", got, unknownNotificationLocalPhone)
+			}
+			if tt.wantLookupErr {
+				if !errors.Is(err, lookupErr) {
+					t.Fatalf("resolveNotificationLocalPhone() error=%v, want %v", err, lookupErr)
+				}
+			} else if err != nil {
+				t.Fatalf("resolveNotificationLocalPhone() error=%v", err)
+			}
+			if calls != tt.wantCalls {
+				t.Fatalf("lookup calls=%d, want %d", calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
 func TestManagerNotifyEventsToWebhookWithTemplate(t *testing.T) {
 	var mu sync.Mutex
 	var payloads []webhookPayload
@@ -139,7 +296,7 @@ func TestManagerNotifyEventsToWebhookWithTemplate(t *testing.T) {
 	for _, payload := range payloads {
 		byEvent[payload.Event] = payload
 	}
-	if got := byEvent["sms_received"].Text; got != "[wwan0] 收到新短信 / 蜂窝\n设备  wwan0\n号码  +8613800000000\n时间  2026-04-13 12:00:00\n内容  hello" {
+	if got := byEvent["sms_received"].Text; got != "[wwan0] 收到新短信 / 蜂窝\n设备  wwan0\n本机  --\n号码  +8613800000000\n时间  2026-04-13 12:00:00\n内容  hello" {
 		t.Fatalf("sms text=%q", got)
 	}
 	if got := byEvent["ip_rotated"].Meta.DeviceID; got != "wwan0" {
@@ -221,7 +378,7 @@ func TestManagerNotifySMSWithSourceUsesProvidedSourceLabel(t *testing.T) {
 	notifier.NotifySMSWithSource("wwan0", "+8613800000000", "hello", "VoWiFi", ts)
 
 	waitUntil(t, time.Second, func() bool { return capture.Last() != "" })
-	want := "收到新短信 / VoWiFi\n设备  wwan0\n号码  +8613800000000\n时间  2026-04-13 12:00:00\n内容  hello"
+	want := "收到新短信 / VoWiFi\n设备  wwan0\n本机  --\n号码  +8613800000000\n时间  2026-04-13 12:00:00\n内容  hello"
 	if got := capture.Last(); got != want {
 		t.Fatalf("text=%q, want %q", got, want)
 	}
