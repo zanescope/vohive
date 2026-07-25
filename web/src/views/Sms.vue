@@ -763,11 +763,11 @@ async function confirmDeleteThread(thread: SmsThread) {
       </div>
 
       <div class="sms-main-layout">
-        <div v-if="showDeviceSidebar" class="flex flex-col border-r border-gray-100 dark:border-white/10">
+        <div v-if="showDeviceSidebar" class="flex flex-col min-h-0 min-w-0 border-r border-gray-100 dark:border-white/10">
           <div class="p-4 border-b border-gray-100 dark:border-white/10">
             <div class="text-xs font-bold text-gray-500 uppercase tracking-wider">设备</div>
           </div>
-          <div class="p-3 space-y-1 overflow-auto">
+          <div class="flex-1 min-h-0 p-3 space-y-1 overflow-y-auto">
             <button
               v-for="d in deviceSidebarItems"
               :key="d.id"

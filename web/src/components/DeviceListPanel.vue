@@ -78,7 +78,7 @@ const secondaryStatus = (d: DeviceMgmtListItem) => {
 <template>
   <div class="ui-card p-5">
     <div class="flex items-center gap-3 mb-4">
-      <el-input v-model="modelQuery" placeholder="搜索设备 / ICCID / IMEI / 网卡" />
+      <el-input v-model="modelQuery" placeholder="搜索设备 ID / 名称 / 本机号码 / ICCID / IMEI / 网卡" />
     </div>
 
     <div class="grid grid-cols-2 gap-2 mb-4">

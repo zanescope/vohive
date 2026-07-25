@@ -458,6 +458,7 @@ func (s *Server) handleListDevices(c *gin.Context) {
 	type DeviceStatus struct {
 		ID               string            `json:"id"`
 		Name             string            `json:"name"`
+		LocalPhone       string            `json:"local_phone,omitempty"`
 		Interface        string            `json:"interface"`
 		ProxyPort        int               `json:"proxy_port"`
 		PublicIP         string            `json:"public_ip"`
@@ -473,6 +474,11 @@ func (s *Server) handleListDevices(c *gin.Context) {
 		NetworkConnected bool              `json:"network_connected"`
 	}
 
+	imsiPhone := make(map[string]string)
+	if phones, err := db.GetSIMPhoneNumbersByIMSI(); err == nil {
+		imsiPhone = phones
+	}
+
 	list := make([]DeviceStatus, 0, len(workers))
 	for _, w := range workers {
 		status := w.GetCachedDeviceStatus() // 仓表盘列表读缓存，0 IPC
@@ -484,6 +490,7 @@ func (s *Server) handleListDevices(c *gin.Context) {
 		item := DeviceStatus{
 			ID:               cfg.ID,
 			Name:             cfg.Name,
+			LocalPhone:       imsiPhone[effectiveOverviewIMSI(w, status)],
 			Interface:        cfg.Interface,
 			ProxyPort:        cfg.ProxyPort,
 			PublicIP:         network.PublicIPv4,

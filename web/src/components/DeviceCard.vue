@@ -9,6 +9,7 @@ import {
   CellularData124Regular,
   Wifi124Regular, 
   Globe24Regular,
+  Phone24Regular,
   Sim24Regular
 } from '@vicons/fluent'
 
@@ -88,26 +89,29 @@ function getSignalBars(dbm: number | null | undefined) {
   >
     <div class="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-blue-500/10 to-purple-500/10 rounded-bl-full -mr-8 -mt-8 transition-transform group-hover:scale-150" />
 
-    <div class="p-6 relative z-10">
-      <div class="flex justify-between items-start mb-6">
-        <div class="flex items-center gap-3">
-          <div class="w-10 h-10 rounded-xl bg-gray-50 dark:bg-white/5 flex items-center justify-center text-blue-600 dark:text-blue-400 shadow-inner">
-            <el-icon size="20"><Sim24Regular /></el-icon>
+    <div class="p-5 relative z-10">
+      <div class="flex justify-between items-start gap-3 mb-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="w-9 h-9 shrink-0 rounded-xl bg-gray-50 dark:bg-white/5 flex items-center justify-center text-blue-600 dark:text-blue-400 shadow-inner">
+            <el-icon size="18"><Sim24Regular /></el-icon>
           </div>
-          <div>
-            <h3 class="font-bold text-base text-gray-800 dark:text-gray-100">{{ device.name || device.id }}</h3>
-            <div class="flex items-center gap-1.5 mt-0.5">
-              <StatusLight :tone="device.healthy ? 'success' : 'danger'" size="md" :animated="device.healthy" />
-              <span class="text-xs font-medium" :class="device.healthy ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'">
-                {{ device.healthy ? '在线' : '离线' }}
-              </span>
+          <div class="min-w-0">
+            <h3 class="font-bold text-base text-gray-800 dark:text-gray-100 truncate" :title="device.id">{{ device.id }}</h3>
+            <div class="text-xs text-gray-400 mt-0.5 truncate" :title="device.name || '未命名设备'">
+              {{ device.name || '未命名设备' }}
             </div>
           </div>
         </div>
+        <div class="flex items-center gap-1.5 shrink-0 mt-1">
+          <StatusLight :tone="device.healthy ? 'success' : 'danger'" size="md" :animated="device.healthy" />
+          <span class="text-xs font-medium" :class="device.healthy ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'">
+            {{ device.healthy ? '在线' : '离线' }}
+          </span>
+        </div>
       </div>
 
-      <div class="space-y-4">
-        <div class="flex items-center justify-between p-3 bg-gray-50/50 dark:bg-white/5 rounded-xl border border-gray-100 dark:border-white/5">
+      <div class="space-y-2.5">
+        <div class="flex items-center justify-between px-3 py-2 bg-gray-50/50 dark:bg-white/5 rounded-xl border border-gray-100 dark:border-white/5">
           <div class="flex items-center gap-2 min-w-0">
             <div class="flex items-center gap-1.5 opacity-80">
               <el-icon :class="networkColor" size="18">
@@ -139,9 +143,16 @@ function getSignalBars(dbm: number | null | undefined) {
           </div>
         </div>
 
-        <div class="space-y-2">
-          <div class="flex justify-between items-center text-sm">
-            <span class="text-gray-400 flex items-center gap-1.5"><el-icon><Globe24Regular /></el-icon> 公网 IP</span>
+        <div class="space-y-1.5">
+          <div class="flex justify-between items-center gap-3 text-xs">
+            <span class="text-gray-400 flex items-center gap-1.5 shrink-0"><el-icon><Phone24Regular /></el-icon> 本机号码</span>
+            <span
+              class="min-w-0 truncate text-right font-mono font-semibold text-gray-700 dark:text-gray-300"
+              :title="device.local_phone || '---'"
+            >{{ device.local_phone || '---' }}</span>
+          </div>
+          <div class="flex justify-between items-center gap-3 text-xs">
+            <span class="text-gray-400 flex items-center gap-1.5 shrink-0"><el-icon><Globe24Regular /></el-icon> 公网 IP</span>
             <span
               class="min-w-0 max-w-[70%] truncate text-right font-mono font-bold text-blue-600 dark:text-blue-400"
               :title="device.public_ip || device.public_ipv6 || '---'"

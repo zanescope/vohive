@@ -135,7 +135,7 @@ const filteredDevices = computed<DeviceMgmtListItem[]>(() => {
 
   if (q) {
     list = list.filter(d => {
-      const hay = `${d?.id || ''} ${d?.name || ''} ${d?.modem?.iccid || ''} ${d?.modem?.imei || ''} ${d?.interface || ''}`.toLowerCase()
+      const hay = `${d?.id || ''} ${d?.name || ''} ${d?.local_phone || ''} ${d?.modem?.iccid || ''} ${d?.modem?.imei || ''} ${d?.interface || ''}`.toLowerCase()
       return hay.includes(q)
     })
   }
