@@ -1,18 +1,12 @@
 package updater
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestInstallerUsesManagedDynamicReadinessProbe(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
+	text := readPackagingScript(t, "install.sh")
 	for _, required := range []string{
 		"write_readiness_key()",
 		`mv -f "$tmp_key" "$STATE_ROOT/readiness.key"`,

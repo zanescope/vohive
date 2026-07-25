@@ -2,17 +2,12 @@ package updater
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestInstallerGuardsEveryUnresolvedTransactionBeforeInstalledEarlyExit(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
+	text := readPackagingScript(t, "install.sh")
 	guard := strings.Index(text, `existing_phase=$(extract_json_string phase "$STATE_ROOT/state.json")`)
 	record := strings.LastIndex(text, "record_existing_deployment\n")
 	if guard < 0 || record < 0 || guard > record {
@@ -43,11 +38,7 @@ func TestInstallerBootRecoveryCancelsPendingSystemdStartWithoutBlocking(t *testi
 }
 
 func TestUninstallerNeverStopsAnActiveTransactionWorker(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "uninstall.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
+	text := readPackagingScript(t, "uninstall.sh")
 	for _, required := range []string{
 		"refuse_active_transaction_services()",
 		"vohive-update.service vohive-recover.service",

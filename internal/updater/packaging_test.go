@@ -36,11 +36,7 @@ func TestPackagingShellSyntax(t *testing.T) {
 }
 
 func TestBootstrapTrustAndRepositoryAreFixed(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
+	text := readPackagingScript(t, "install.sh")
 	for _, required := range []string{
 		"REPOSITORY='zanescope/vohive'",
 		"BOOTSTRAP_VERSION='@VOHIVE_BOOTSTRAP_VERSION@'",
@@ -115,11 +111,7 @@ func TestDocumentedInstallerBootstrapPaths(t *testing.T) {
 }
 
 func TestInstallerRequiresExplicitNoServiceMode(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
+	text := readPackagingScript(t, "install.sh")
 	for _, required := range []string{
 		`if [ "$NO_SERVICE" -eq 1 ]; then SERVICE_TYPE='portable'`,
 		"no supported service manager detected",

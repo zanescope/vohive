@@ -1,18 +1,12 @@
 package updater
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestInstallerBindsVerifierToBootstrapRelease(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
+	text := readPackagingScript(t, "install.sh")
 	for _, required := range []string{
 		"BOOTSTRAP_VERSION='@VOHIVE_BOOTSTRAP_VERSION@'",
 		"vohive-verify_${BOOTSTRAP_VERSION}_linux_${ARCH}",
@@ -28,11 +22,7 @@ func TestInstallerBindsVerifierToBootstrapRelease(t *testing.T) {
 }
 
 func TestInstallerStagesBeforeStoppingAndHasTransactionTrap(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
+	text := readPackagingScript(t, "install.sh")
 	stage := strings.Index(text, "STAGING_DIR=\"$INSTALL_ROOT/releases/.staging-")
 	stop := strings.LastIndex(text, "stop_service_best_effort || die")
 	activate := strings.Index(text, "TRANSACTION_ACTIVE=1")
@@ -47,11 +37,7 @@ func TestInstallerStagesBeforeStoppingAndHasTransactionTrap(t *testing.T) {
 }
 
 func TestInstallerValidatesAllVerifierHashes(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
+	text := readPackagingScript(t, "install.sh")
 	if !strings.Contains(text, "for wanted_arch in amd64 arm64 armv7") {
 		t.Fatal("installer does not validate the complete verifier hash map")
 	}
