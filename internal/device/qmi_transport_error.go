@@ -3,6 +3,7 @@ package device
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/zanescope/vohive/pkg/logger"
 )
@@ -30,6 +31,60 @@ func qmiErrorIndicatesTransportDown(message string) bool {
 		}
 	}
 	return false
+}
+
+func (w *Worker) requestQMICoreRecovery(reason string) bool {
+	if w == nil {
+		return false
+	}
+	requester := w.qmiRecoveryRequester
+	if requester == nil && w.QMICore != nil {
+		requester = w.QMICore
+	}
+	if requester == nil {
+		return false
+	}
+	return requester.RequestCoreRecovery(strings.TrimSpace(reason))
+}
+
+// requestQMICoreRecoveryForTransportFailure gives the live QMI core one bounded
+// chance to discard its broken client/proxy connection and reopen it in place.
+// The manager's exhausted callback remains responsible for escalating to a full
+// Worker rebuild when this cheaper recovery cannot converge.
+func (p *Pool) requestQMICoreRecoveryForTransportFailure(worker *Worker, reason string, err error) bool {
+	if p == nil || worker == nil || err == nil || !p.isCurrentWorker(worker) {
+		return false
+	}
+	if !qmiErrorIndicatesTransportDown(err.Error()) {
+		return false
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "qmi_transport_down"
+	}
+	if !worker.requestQMICoreRecovery(reason) {
+		return false
+	}
+
+	recoveryUntil := time.Now().Add(qmiHealthGraceAfterReset)
+	worker.markHealthRecoveryWindow(qmiHealthGraceAfterReset)
+	worker.RecordWatchdogEvent(WatchdogEvent{
+		Layer:         HealthLayerQMI,
+		State:         HealthStateRecovering,
+		EventType:     reason,
+		Reason:        reason,
+		Err:           err,
+		RecoveryUntil: recoveryUntil,
+	})
+	if p.lifecycle != nil {
+		p.lifecycle.BeginRecovery(worker.ID, LifecyclePhaseRecovering, reason, qmiLifecycleRecoveryTTL)
+	}
+	logger.Info("QMI transport is down; requesting in-place core recovery first",
+		"device", worker.ID,
+		"reason", reason,
+		"recovery_window", qmiHealthGraceAfterReset.String(),
+		"err", err)
+	return true
 }
 
 // handleTransportRecoveryExhausted 是唯一的传输层 exhausted 事件驱动重建入口：

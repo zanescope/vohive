@@ -740,6 +740,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 					if worker.QMICore != nil {
 						if err := worker.CheckAllSMSQMI(); err != nil {
 							logger.Warn(fmt.Sprintf("[%s] QMI 轮询短信失败", worker.ID), "err", err)
+							p.requestQMICoreRecoveryForTransportFailure(worker, "qmi_sms_poll_transport_down", err)
 						}
 					}
 				case smsModeMBIM:

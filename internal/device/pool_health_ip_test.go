@@ -8,6 +8,16 @@ import (
 	"github.com/zanescope/vohive/internal/config"
 )
 
+type qmiCoreRecoveryRequesterStub struct {
+	accepted bool
+	calls    []string
+}
+
+func (s *qmiCoreRecoveryRequesterStub) RequestCoreRecovery(reason string) bool {
+	s.calls = append(s.calls, reason)
+	return s.accepted
+}
+
 func TestHealthCheckSkipsDeviceUnderRebootRecovery(t *testing.T) {
 	// 当设备处于 modemRebootRecovering 中时，
 	// healthCheckLoop 不应尝试快速拉起或重扫，而应完全委托给恢复循环。
@@ -80,6 +90,49 @@ func TestRunHealthCheckTickSkipsObservationWindowOnTransportDownError(t *testing
 	}
 	if snapshot.Reason != "qmi_transport_down" {
 		t.Fatalf("reason=%q want qmi_transport_down", snapshot.Reason)
+	}
+}
+
+func TestRunHealthCheckTickRequestsInPlaceCoreRecoveryBeforeWorkerRebuild(t *testing.T) {
+	p := NewPool(&config.Config{})
+	defer p.cancel()
+
+	requester := &qmiCoreRecoveryRequesterStub{accepted: true}
+	worker := &Worker{
+		ID: "dev1",
+		Config: config.DeviceConfig{
+			ID:            "dev1",
+			DeviceBackend: backend.BackendQMI,
+			ControlDevice: "/dev/cdc-wdm0",
+		},
+		Backend: &workerStatusBackendStub{
+			mode:      backend.BackendQMI,
+			opModeErr: errors.New("write failed: write unix @->@qmi-proxy: write: broken pipe"),
+		},
+		qmiRecoveryRequester: requester,
+	}
+	p.workers["dev1"] = worker
+
+	p.runHealthCheckTick()
+
+	if len(requester.calls) != 1 || requester.calls[0] != "qmi_transport_down" {
+		t.Fatalf("core recovery calls=%v want [qmi_transport_down]", requester.calls)
+	}
+	snapshot := worker.HealthSnapshot()
+	if snapshot.State != HealthStateRecovering {
+		t.Fatalf("state=%s want %s", snapshot.State, HealthStateRecovering)
+	}
+	if snapshot.Layer != HealthLayerQMI {
+		t.Fatalf("layer=%s want %s", snapshot.Layer, HealthLayerQMI)
+	}
+	if snapshot.RecoveryUntil.IsZero() {
+		t.Fatal("RecoveryUntil is zero")
+	}
+	p.mu.RLock()
+	rebuilding := p.modemRebootRecovering[worker.ID]
+	p.mu.RUnlock()
+	if rebuilding {
+		t.Fatal("worker rebuild started before QMI core recovery was exhausted")
 	}
 }
 

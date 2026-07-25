@@ -69,6 +69,10 @@ type liveSIMMetadataReader interface {
 	GetSIMMetadataLive(ctx context.Context) (*backend.SIMMetadata, error)
 }
 
+type qmiCoreRecoveryRequester interface {
+	RequestCoreRecovery(reason string) bool
+}
+
 var publicIPLookupWait = 6 * time.Second
 
 const (
@@ -102,8 +106,10 @@ type Worker struct {
 	QMICore     *qmicore.Manager
 	MBIMCore    *mbimcore.Manager
 	netOverride NetworkController
-	APDUArbiter *apduarbiter.Arbiter
-	qmiSMS      qmiSMSCore
+	// qmiRecoveryRequester is a test seam; production workers use QMICore.
+	qmiRecoveryRequester qmiCoreRecoveryRequester
+	APDUArbiter          *apduarbiter.Arbiter
+	qmiSMS               qmiSMSCore
 	// ESIMQMITransport 仅在未创建共享 QMI Core、但 eSIM 仍需走 QMI transport 时使用。
 	// 复用 QMICore/QMI Core 场景下为 nil。
 	ESIMQMITransport esim.QMIAPDUTransportLifecycle
