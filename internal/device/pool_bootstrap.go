@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -152,21 +153,68 @@ func configuredDevicesNeedCompatibleATDiscovery(devices []config.DeviceConfig) b
 }
 
 type qmiBootstrapDiscoveryCache struct {
-	loaded bool
-	list   []QMIDevice
-	err    error
+	mu         sync.Mutex
+	loaded     bool
+	list       []QMIDevice
+	err        error
+	identities map[string]string
 }
 
 func (c *qmiBootstrapDiscoveryCache) Get() ([]QMIDevice, error) {
 	if c == nil {
 		return discoverQMIDevicesFn()
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.loaded {
-		return c.list, c.err
+		return append([]QMIDevice(nil), c.list...), c.err
 	}
 	c.loaded = true
 	c.list, c.err = discoverQMIDevicesFn()
-	return c.list, c.err
+	return append([]QMIDevice(nil), c.list...), c.err
+}
+
+func qmiBootstrapIdentityKey(dev QMIDevice) string {
+	if key := strings.TrimSpace(dev.ControlPath); key != "" {
+		return "control:" + key
+	}
+	if key := strings.TrimSpace(dev.USBPath); key != "" {
+		return "usb:" + key
+	}
+	if key := strings.TrimSpace(dev.NetInterface); key != "" {
+		return "interface:" + key
+	}
+	return ""
+}
+
+func (c *qmiBootstrapDiscoveryCache) RememberIdentity(dev QMIDevice, imei string) {
+	if c == nil {
+		return
+	}
+	key := qmiBootstrapIdentityKey(dev)
+	if key == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.identities == nil {
+		c.identities = make(map[string]string)
+	}
+	c.identities[key] = strings.TrimSpace(imei)
+	c.mu.Unlock()
+}
+
+func (c *qmiBootstrapDiscoveryCache) Identity(dev QMIDevice) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	key := qmiBootstrapIdentityKey(dev)
+	if key == "" {
+		return "", false
+	}
+	c.mu.Lock()
+	imei, ok := c.identities[key]
+	c.mu.Unlock()
+	return imei, ok
 }
 
 func buildESIMQMITransport(cfg config.DeviceConfig, qmiCore *qmicore.Manager) (esim.QMIAPDUTransport, esim.QMIAPDUTransportLifecycle, error) {
@@ -208,6 +256,10 @@ type apduArbiterAwareTransport interface {
 }
 
 func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) {
+	return p.addWorkerFromConfig(devCfg, nil)
+}
+
+func (p *Pool) addWorkerFromConfig(devCfg config.DeviceConfig, discoveryCache *qmiBootstrapDiscoveryCache) (*Worker, error) {
 	p.mu.Lock()
 	if _, exists := p.workers[devCfg.ID]; exists {
 		p.mu.Unlock()
@@ -264,7 +316,9 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 	}
 
 	var matched *QMIDevice
-	discoveryCache := &qmiBootstrapDiscoveryCache{}
+	if discoveryCache == nil {
+		discoveryCache = &qmiBootstrapDiscoveryCache{}
+	}
 	liveWorkerIndex := BuildWorkerDiscoveryIndex(p.GetAllWorkers(), false)
 	configuredIndex := BuildConfiguredDeviceIndex(config.ListDevices())
 	if !needsQMICore {
@@ -339,7 +393,12 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 					continue
 				}
 				allowQMIIMEIProbe := configuredID == ""
-				d, got := resolveDiscoveredQMIDeviceWithConfig(list[i], 1600*time.Millisecond, allowQMIIMEIProbe, devCfg)
+				d := list[i]
+				got, identityKnown := discoveryCache.Identity(d)
+				if !identityKnown {
+					d, got = resolveDiscoveredQMIDeviceWithConfig(d, 1600*time.Millisecond, allowQMIIMEIProbe, devCfg)
+					discoveryCache.RememberIdentity(d, got)
+				}
 				if got == "" || !config.IMEIMatches(got, imei) {
 					continue
 				}

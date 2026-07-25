@@ -1411,10 +1411,10 @@ func (p *Pool) StartAll() error {
 	if p == nil || p.cfg == nil {
 		return nil
 	}
-	p.startPoolBackgroundServicesOnce()
 
 	devices := append([]config.DeviceConfig(nil), p.cfg.Devices...)
 	limit := p.FreeDeviceLimit()
+	eligible := make([]config.DeviceConfig, 0, len(devices))
 	for i := range devices {
 		devCfg := devices[i]
 		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID, limit) {
@@ -1423,8 +1423,9 @@ func (p *Pool) StartAll() error {
 				"limit", limit)
 			continue
 		}
-		go p.startConfiguredDeviceBootstrap(devCfg, "start_all")
+		eligible = append(eligible, devCfg)
 	}
+	go p.startConfiguredDeviceBootstrapBatch(eligible)
 	return nil
 }
 
@@ -1443,6 +1444,10 @@ func (p *Pool) startPoolBackgroundServicesOnce() {
 }
 
 func (p *Pool) startConfiguredDeviceBootstrap(devCfg config.DeviceConfig, reason string) {
+	p.startConfiguredDeviceBootstrapWithDiscovery(devCfg, reason, nil)
+}
+
+func (p *Pool) startConfiguredDeviceBootstrapWithDiscovery(devCfg config.DeviceConfig, reason string, discoveryCache *qmiBootstrapDiscoveryCache) {
 	if p == nil {
 		return
 	}
@@ -1451,7 +1456,7 @@ func (p *Pool) startConfiguredDeviceBootstrap(devCfg config.DeviceConfig, reason
 		return
 	default:
 	}
-	if _, err := p.AddWorkerFromConfig(devCfg); err != nil {
+	if _, err := p.addWorkerFromConfig(devCfg, discoveryCache); err != nil {
 		logger.Warn("配置设备异步启动失败，等待健康检查或重扫恢复",
 			"device", devCfg.ID,
 			"reason", reason,
@@ -2120,6 +2125,10 @@ func (p *Pool) runScheduledRescans() {
 }
 
 func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex WorkerDiscoveryIndex) []CompatibleModem {
+	return p.collectRescanHardwareForDevices(discovered, liveWorkerIndex, config.ListDevices(), nil)
+}
+
+func (p *Pool) collectRescanHardwareForDevices(discovered []QMIDevice, liveWorkerIndex WorkerDiscoveryIndex, managed []config.DeviceConfig, discoveryCache *qmiBootstrapDiscoveryCache) []CompatibleModem {
 	var hardware []CompatibleModem
 	for i := range discovered {
 		raw := discovered[i]
@@ -2155,6 +2164,10 @@ func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex Wor
 				}
 			}
 		}
+		discovered[i] = raw
+		if discoveryCache != nil {
+			discoveryCache.RememberIdentity(raw, imei)
+		}
 		hardware = append(hardware, CompatibleModem{
 			IMEI:          imei,
 			ControlPath:   raw.ControlPath,
@@ -2166,7 +2179,6 @@ func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex Wor
 		})
 	}
 
-	managed := config.ListDevices()
 	if configuredDevicesNeedCompatibleATDiscovery(managed) {
 		if compatList, err := DiscoverCompatibleModemsFromQMI(discovered); err == nil {
 			seen := map[string]bool{}
