@@ -1,16 +1,17 @@
-# VoHive 小白友好安装与更新方案
+# VoHive 部署、配置与更新指南
 
 ## 1. 目标与范围
 
-本文设计一套面向非开发者的 VoHive 交付方案。用户不需要安装 Go、Node.js、Git 或手动编辑源码，只需复制一段带来源校验的安装命令，日常更新可在 Web 页面点击按钮。
+本文面向 VoHive 部署者，说明原生 Linux、Docker Compose 和 OpenWrt 的安装边界，以及配置、更新、备份、回滚和发布安全规则。普通用户不需要安装 Go、Node.js、Git 或手动编辑源码；默认原生安装只需下载并运行安装器，日常更新可使用 `vohivectl` 或 Web 页面。
 
-目标：
+本文覆盖：
 
-- 首次安装只需下载并运行安装器，脚本自动识别 `amd64`、`arm64` 或 `armv7`。
+- 默认快速安装与可选的严格来源验证，脚本自动识别 `amd64`、`arm64` 或 `armv7`。
 - 安装完成后给出本机访问地址；仅首次创建配置时显示一次随机初始账号密码。
 - 日常更新只需要执行 `vohivectl update` 或在 Web 页面点击“更新”。
 - 更新前自动备份，更新后自动健康检查，失败时自动回滚。
 - 配置、数据库和日志与程序版本分离，升级和回滚不会误删用户数据。
+- `config.yaml` 的字段、默认值、生效方式和敏感信息保护要求。
 - 同时覆盖普通 Linux、Docker Compose 和 OpenWrt，但文档只向普通用户推荐一种首选路径。
 
 本文默认 VoHive 运行在连接 4G/5G USB 模组的 Linux 主机上。由于程序需要访问 `/dev`、TUN 和主机网络，**普通 Linux 原生安装是首选方案**；Docker 和 OpenWrt 是按环境选择的替代方案。
@@ -25,7 +26,7 @@
 - Web 设置页已经可以检查 Release，并对非容器环境发起二进制自更新。
 - 程序数据位于 `data/`，配置由 `-c` 指定，适合做版本与数据分离。
 
-本方案在本次改造后的状态与剩余边界：
+当前实现状态与剩余边界：
 
 | 环节 | 已落地状态 | 剩余边界 |
 | --- | --- | --- |
@@ -44,7 +45,7 @@
 | --- | --- | --- | --- |
 | Debian、Ubuntu、树莓派 OS 等 systemd Linux | **原生安装，默认推荐** | Release 的 `vohive-install.sh` | `vohivectl update` 或 Web |
 | 已经使用 Docker 的 NAS/服务器 | Docker Compose | `docker-compose.yml` + `.env` | 当前按 `CONTAINER.md` 手工切换 digest |
-| OpenWrt 路由器 | `.ipk`/`.apk` 软件包 | `opkg install`/`apk add` | `opkg upgrade`/`apk upgrade` |
+| OpenWrt 路由器 | 原生安装器（当前）；`.ipk`/`.apk` 软件包（规划） | `vohive-install.sh` | `vohivectl update` |
 | 开发者 | 源码构建 | Makefile/CI | Git 工作流 |
 
 不建议把 Docker 作为默认教程。VoHive 需要主机网络和较高的设备权限，容器部署仍然要使用 `network_mode: host`、设备映射或 `privileged`，对新手并没有明显降低理解成本。
@@ -89,11 +90,22 @@
 - 配置目录权限为 `0700`，配置文件权限为 `0600`。
 - 当前程序需要直接控制模组、网络和可能占用串口的进程，第一阶段服务仍以 root 运行；后续再根据真实设备矩阵收敛 capability，不能先假设一组过窄权限。
 
-## 5. 一键安装体验
+## 5. 原生安装
 
-### 5.1 用户看到的入口
+### 5.1 快速安装
 
-项目首页只保留一个醒目的首选安装入口：
+README 面向普通用户保留两条快速安装命令：
+
+```sh
+curl -fsSLO https://github.com/zanescope/vohive/releases/latest/download/vohive-install.sh
+sudo sh vohive-install.sh
+```
+
+该方式通过 HTTPS 从 VoHive 官方 GitHub Release 下载当前安装器，适合个人使用和受信任环境。安装脚本将以 root 权限运行；生产环境、共享主机或需要确认构建来源时，应使用下一节的严格验证安装。
+
+### 5.2 严格验证安装
+
+严格模式固定下载 `v1.6.0` 信任基线，并在交给 root 前验证 GitHub 构建来源：
 
 ```sh
 VOHIVE_BOOTSTRAP_VERSION=v1.6.0
@@ -107,21 +119,21 @@ gh attestation verify vohive-install.sh \
 sudo sh vohive-install.sh
 ```
 
-运行前需要按 [GitHub CLI 官方说明](https://cli.github.com/)安装 `gh`；如果公共证明查询要求登录，先执行 `gh auth login`。验证必须同时匹配唯一仓库、固定发布工作流、`v1.6.0` tag ref，并拒绝 self-hosted runner。任何验证错误都应停止，不能继续执行安装器。
+运行前需要按 [GitHub CLI 官方说明](https://cli.github.com/)安装 `gh`；如果公共证明查询要求登录，先执行 `gh auth login`。验证同时匹配唯一仓库、固定发布工作流、`v1.6.0` tag ref，并拒绝 self-hosted runner。任何验证错误都应停止，不能继续执行安装器。
 
 这里固定下载 `v1.6.0` 是为了固定 bootstrap 信任基线，而不是把目标版本固定在 `v1.6.0`。验证后的安装器内置 Minisign 公钥和 bootstrap verifier 摘要，默认仍从签名清单安装最新 stable；`--channel beta` 会选择 beta。
 
-安装器必须同时支持非交互参数，方便高级用户和自动化：
+安装器支持非交互参数，方便高级用户和自动化：
 
 ```sh
 sudo sh vohive-install.sh --version v1.6.0 --channel stable
 ```
 
-不提供 `curl | sh` 入口，也不允许把未验证的 `latest` 附件直接交给 root。分步下载、验证、执行让网络中断可重试，也让错误停在任何系统修改之前。
+严格模式不使用 `curl | sh`，并把下载、验证、执行分开，让网络中断可重试，也让验证错误停在任何系统修改之前。
 
-默认安装只接受正在运行的 systemd 或 OpenWrt procd；检测不到受支持的服务管理器时会在下载和系统写入前失败。`--no-service` 是明确的高级模式，只适合已经准备好自行启动、监控和重启 VoHive 的用户；安装器不会再自动降级到未托管模式并报告普通安装成功。
+默认安装只接受正在运行的 systemd 或 OpenWrt procd；检测不到受支持的服务管理器时会在下载和系统写入前失败。`--no-service` 是明确的高级模式，只适合已经准备好自行启动、监控和重启 VoHive 的用户；安装器不会自动降级到未托管模式并报告普通安装成功。
 
-### 5.2 安装器职责
+### 5.3 安装器职责
 
 安装器应按以下顺序执行：
 
@@ -139,7 +151,7 @@ sudo sh vohive-install.sh --version v1.6.0 --channel stable
 
 安装器继承标准 `HTTPS_PROXY` 环境变量。当前尚未提供 `--from` 离线目录或 `--download-base` 镜像覆盖参数；在这些入口完成相同的签名校验与事务测试前，文档不把它们列为可用能力。
 
-### 5.3 systemd 服务
+### 5.4 systemd 服务
 
 正式 unit 的恢复与启动顺序如下；完整权限配置以 `packaging/systemd/` 为准：
 
@@ -179,7 +191,198 @@ WantedBy=multi-user.target
 
 `vohive-recover.service` 在开机时先恢复被中断的事务，主服务的 `guard-start` 再阻止半切换或需人工恢复的状态启动。两者都不能省略。不要使用 `Restart=always`；正常停止、卸载或维护时不应被立即拉起，异常退出仍由 `on-failure` 恢复。
 
-## 6. `vohivectl`：原生更新与诊断入口
+## 6. `config.yaml` 配置参考
+
+### 6.1 文件位置与修改方式
+
+原生安装和 OpenWrt 默认读取 `/etc/vohive/config.yaml`；Docker 读取容器内 `/app/config/config.yaml`，对应宿主机 `${VOHIVE_CONFIG_DIR:-./config}/config.yaml`。安装器首次创建配置时使用 `0600` 权限并生成随机管理员密码，不会在重复安装或升级时覆盖现有文件。
+
+配置文件包含管理员密码、通知密钥和代理凭据，不能上传到公开仓库或直接粘贴到工单。手工修改前建议运行 `sudo vohivectl backup`。设备、代理、通知和登录凭据优先通过 Web 页面修改；直接修改 YAML 后应重启服务：
+
+```sh
+sudo systemctl restart vohive.service
+sudo vohivectl doctor
+```
+
+安装器生成的最小配置类似下面内容；密码仅作结构示意，实际值由安装器随机生成：
+
+```yaml
+config_schema: 1
+server:
+  port: 7575
+  debug: false
+web:
+  username: admin
+  password: "由安装器生成的随机密码"
+free_device_limit: 5
+vowifi:
+  enabled: false
+```
+
+根节点字段如下：
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `config_schema` | `1` | 配置结构版本，由程序迁移器维护，不要手工降级或提前修改。 |
+| `server` | 见下文 | Web/API 监听设置。 |
+| `web` | 首次安装生成 | 管理后台账号和密码；当前 schema 不允许留空。 |
+| `free_device_limit` | `5` | 可配置设备数量上限；`0` 表示不限制，负数会拒绝启动。 |
+| `devices` | `[]` | 设备身份和后端设置，建议通过设备管理页面维护。 |
+| `proxy.instances` | `[]` | SOCKS5/HTTP 代理实例，建议通过代理管理页面维护。 |
+| `vowifi` | `enabled: false` | VoWiFi 和可选 SIP 语音网关设置。 |
+| `public_ip_probe` | 内置双栈源 | 公网 IP 探测源；只从 YAML 读取，修改后必须重启。 |
+| `telegram`、`feishu`、`qq`、`webhook`、`bark`、`email`、`pushplus` | 均关闭 | 通知渠道配置，启用前必须填写对应凭据和目标。 |
+
+### 6.2 服务与管理员参数
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `server.port` | `7575` | Web/API 监听端口；`7575` 和 `:7575` 都可使用。 |
+| `server.debug` | `false` | Gin 调试模式；常规部署保持关闭。 |
+| `web.username` | 首次安装为 `admin` | 管理后台用户名，不能为空。 |
+| `web.password` | 随机生成 | 管理后台密码，不能为空；首次登录后应立即修改。 |
+| `free_device_limit` | `5` | 新增设备时执行并发安全的数量检查；`0` 表示不限制。 |
+
+`config_schema` 是更新器和二进制之间的兼容契约。当前版本会把旧的 schema `0` 迁移到 `1`；配置版本高于当前二进制或低于最低支持版本时会拒绝启动，防止旧版本误读新配置。不要通过手工改数字绕过兼容检查。
+
+### 6.3 公网 IP 探测参数
+
+前端展示的公网 IPv4/IPv6 由服务端经对应模组网卡探测，避免浏览器出口与模组数据承载不一致：
+
+```yaml
+public_ip_probe:
+  ipv4_urls:
+    - https://your-ipv4-endpoint.example
+  ipv6_urls:
+    - https://your-ipv6-endpoint.example
+```
+
+| 字段 | 内置默认值 | 约束 |
+| --- | --- | --- |
+| `public_ip_probe.ipv4_urls` | `https://api.ipify.org`、`https://4.ident.me` | 最多 4 个，只接受返回单一公网 IPv4 文本的绝对 HTTPS URL。 |
+| `public_ip_probe.ipv6_urls` | `https://api6.ipify.org`、`https://6.ident.me` | 最多 4 个，只接受返回单一公网 IPv6 文本的绝对 HTTPS URL。 |
+
+同一地址族的端点按顺序回退；非空列表会完整替换该地址族的内置默认源，字段缺失或空列表继续使用默认源。URL 不允许用户信息和片段，禁止重定向；域名解析结果和响应内容都不能是私网、回环、链路本地或其他特殊用途地址。该节故意不支持 `VOHIVE_` 环境变量覆盖，修改 YAML 后需要重启服务。
+
+HTTP 请求与 DNS 查询都绑定设备网卡。单个承载连续探测失败时先指数退避，最多进行 6 次快速尝试；之后改为每 10 分钟低频检查，避免 SIM 欠费或网络不可用时持续请求和刷屏。数据承载重连、地址变化或手动刷新会立即重新探测。
+
+中国大陆网络可能无法稳定访问内置国际探测源，可把受信任的境内双栈 HTTPS 回显端点放在各自列表首位。HTTPS 探测依赖系统 CA 根证书；官方容器镜像已内置证书，OpenWrt 或直接运行发布二进制时需安装 `ca-bundle` 或系统等价的 `ca-certificates`，不能关闭 TLS 校验规避错误。
+
+### 6.4 设备参数
+
+设备项建议由 Web 页面创建和更新。下面示例展示 YAML 结构，不代表所有设备都需要这些字段：
+
+```yaml
+devices:
+  - id: modem-1
+    name: 主卡
+    modem_imei: "866069053194211"
+    device_backend: qmi
+    module_vendor: quectel
+    qmi_use_proxy: true
+    proxy_port: 1080
+    esim_switch:
+      event_gated_converge: false
+      reinit_window_ms: 0
+      radio_cycle: false
+      nas_attach_timeout_ms: 0
+```
+
+| 字段 | 默认值/可选值 | 说明 |
+| --- | --- | --- |
+| `id` | 无 | 配置内唯一的设备 ID。 |
+| `name` | 空 | Web 页面显示名称。 |
+| `modem_imei` | 自动探测 | 稳定硬件身份，用于设备拔插后的重新绑定。 |
+| `device_backend` | `at`；可选 `at`、`qmi`、`mbim` | 设备控制后端。 |
+| `module_vendor` | `quectel`；可选 `quectel`、`simcom` | AT 指令方言。 |
+| `proxy_port` | `0` | 兼容的设备代理端口；新代理实例优先配置在 `proxy.instances`。 |
+| `mbim_transport` | `auto`；可选 `auto`、`proxy`、`direct` | MBIM 控制通道打开方式。 |
+| `qmi_use_proxy` | `false` | 是否通过 libqmi `qmi-proxy` 打开 QMI 控制口。 |
+| `qmi_proxy_path` | 空 | 自定义 qmi-proxy abstract socket 名称。 |
+| `qmi_proxy_executable` | 空 | 自定义 qmi-proxy 可执行文件路径。 |
+| `esim_transport` | `at`；可选 `at`、`qmi`、`mbim` | 兼容字段；设置 `device_backend` 时会优先从后端推导。 |
+| `usbnet_mode` | 空 | 兼容字段；当前主要依赖自动发现，通常不要手工设置。 |
+| `operator_selection_mode` | 空/自动；可选 `automatic`、`manual` | 驻网方式；手动模式必须同时提供 PLMN。 |
+| `operator_selection_plmn` | 空 | 手动驻网的 5 或 6 位 MCC+MNC。 |
+| `operator_selection_rat` | 空；可选 `gsm`、`wcdma`、`lte`、`nr5g` | 手动驻网希望使用的无线制式。 |
+| `baud_rate`、`data_bits`、`stop_bits`、`parity` | 设备管理页面设置 | AT 串口参数；`parity` 使用 `N`、`O` 或 `E`。 |
+
+`usb_path`、`at_port`、`manage_port`、`interface`、`qmi_device`、`control_device` 和 `audio_device` 是运行时发现结果，不会从配置文件加载，也不应手工持久化。APN、IP 版本、网络开关、飞行模式、VoWiFi 和短信策略当前按 ICCID 保存在数据库的卡策略中，不再从 `devices` 节点读取。
+
+`devices[].esim_switch` 是高级兼容参数，零值保持原有行为：
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `use_refresh_true` | `false` | eSIM 主切换路径是否请求 `refresh=true`。 |
+| `event_gated_converge` | `false` | 是否等待 UIM indication 再执行切换后的收敛。 |
+| `radio_cycle` | `false` | 切换期间是否执行 LowPower → Online 无线电循环。 |
+| `reinit_window_ms` | `0` | UIM 重新初始化窗口；仅在 `event_gated_converge=true` 时有效，`0` 表示关闭。 |
+| `nas_attach_timeout_ms` | `0` | 恢复 Online 后等待 NAS 附着的最长毫秒数；`0` 表示不阻塞等待。 |
+
+### 6.5 代理参数
+
+```yaml
+proxy:
+  instances:
+    - id: proxy-1
+      name: 主卡 SOCKS5
+      device_id: modem-1
+      enabled: true
+      mode: socks5
+      listen_addr: 0.0.0.0
+      listen_port: 1080
+      auth_enabled: true
+      username: proxy-user
+      password: "替换为强密码"
+```
+
+每个 `proxy.instances[]` 支持 `id`、`name`、`device_id`、`enabled`、`mode`（`socks5` 或 `http`）、`listen_addr`、`listen_port`、`auth_enabled`、`username` 和 `password`。监听到非回环地址时应启用认证并配置防火墙，不要直接把代理端口暴露到公网。
+
+### 6.6 VoWiFi 与语音网关参数
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `vowifi.enabled` | `false` | VoWiFi 全局开关。 |
+| `vowifi.device_id` | 空 | 指定设备；留空时选择首个可用设备。 |
+| `vowifi.mode` | `vowifi` | 当前使用 `vowifi`；`volte` 目前会回退到 `vowifi`。 |
+| `vowifi.voice_gateway.sip.listen` | 空 | SIP 监听地址，例如 `0.0.0.0:5060`；非空时启用语音网关。 |
+| `vowifi.voice_gateway.sip.transport` | `udp` | SIP 传输：`udp`、`tcp` 或 `tls`。 |
+| `vowifi.voice_gateway.sip.realm` | `vohive.local` | SIP 认证域。 |
+| `vowifi.voice_gateway.sip.external_ip` | 空 | NAT 场景使用的外部地址。 |
+| `vowifi.voice_gateway.users[]` | `[]` | SIP 用户；字段为 `username`、`password`、`display_name`、`device_id`。 |
+| `vowifi.voice_gateway.media.rtp_port_min` | `10000` | RTP 起始端口，必须为偶数。 |
+| `vowifi.voice_gateway.media.rtp_port_max` | `20000` | RTP 结束端口，必须大于起始端口加 1。 |
+| `vowifi.voice_gateway.media.codecs` | 空 | 编解码器列表，例如 `PCMU/8000`、`PCMA/8000`。 |
+| `vowifi.voice_gateway.linphone_push.*` | 空 | `linphone_user` 和 `linphone_password` 推送凭据。 |
+
+### 6.7 通知参数
+
+所有通知渠道默认关闭，敏感字段会明文保存在受限配置文件中：
+
+| 节点 | 字段说明 |
+| --- | --- |
+| `telegram` | `enabled`、`bot_token`、`chat_id`、`admin_id`、`base_url`、`proxy`。 |
+| `feishu` | `enabled`、`app_id`、`app_secret`、`chat_ids`；`chat_id` 仅用于兼容旧版单目标配置。 |
+| `qq` | `enabled`、`app_id`、`app_secret`、`group_ids`、`direct_ids`；多个 ID 使用逗号分隔。 |
+| `webhook` | `enabled`、`urls`、`secret`、`headers`、`timeout_ms`（默认 `5000`）、`retry_max`（默认 `3`）、`text_template`（默认 `{{device_label}} {{text}}`）。 |
+| `bark` | `enabled`、`urls`、`group`（默认 `vohive`）、`icon`、`level`（默认 `active`）。 |
+| `email` | `enabled`、`use_ssl`、`smtp_host`、`smtp_port`、`username`、`password`、`from_address`、`to_addresses`。 |
+| `pushplus` | `enabled`、`token`、`topic`、`channel`。 |
+
+### 6.8 环境变量覆盖
+
+除 `config_schema` 和 `public_ip_probe` 外，标量配置可使用大写、下划线形式的环境变量覆盖。`VOHIVE_` 前缀优先，旧的 `PROXY_` 前缀仅作兼容：
+
+```sh
+VOHIVE_SERVER_PORT=9000
+VOHIVE_WEB_USERNAME=operator
+VOHIVE_WEB_PASSWORD='replace-with-a-secret'
+VOHIVE_FREE_DEVICE_LIMIT=0
+```
+
+环境变量只改变当前进程的有效值，不会回写 YAML。数组和复杂对象建议继续写入配置文件或通过 Web 页面维护。
+
+## 7. `vohivectl`：原生更新与诊断入口
 
 `vohivectl` 负责签名更新、事务恢复、备份和部署诊断；日志与卸载使用各自的系统入口：
 
@@ -199,9 +402,9 @@ vohivectl recover                        恢复被中断的事务
 
 查看 systemd 日志使用 `journalctl -u vohive.service -f`。卸载使用同一正式 Release 中的 `vohive-uninstall.sh`：默认只删除服务和程序版本；只有显式传入 `--purge` 并确认时才会先备份再删除 `/etc/vohive` 与 `/var/lib/vohive`。
 
-## 7. 安全更新与自动回滚
+## 8. 安全更新与自动回滚
 
-### 7.1 发布通道
+### 8.1 发布通道
 
 - `stable`：正式 SemVer 标签，默认通道，只接收非 prerelease Release。
 - `beta`：显式选择后才接收预发布版本。
@@ -215,7 +418,7 @@ vohivectl recover                        恢复被中断的事务
 - 从 `v1.6.0` 起，正式二进制同时内置事务更新器和发布公钥，才开放 Web 一键更新；清单中的 `min_updater_version` 固定为 `v1.6.0`，更旧更新器必须 fail closed。
 - 密钥轮换期间同时保留旧、新公钥；只有所有受支持版本都已包含新公钥后，后续 Release 才能移除旧公钥。
 
-### 7.2 原生更新流程
+### 8.2 原生更新流程
 
 ```text
 获取发布清单
@@ -236,11 +439,11 @@ vohivectl recover                        恢复被中断的事务
 - 更新使用 `/var/lib/vohive/update/update.lock` 防止 Web 与命令行同时更新。
 - 停止服务后再复制 SQLite 数据库及其 `-wal`、`-shm`，确保备份一致。
 - 数据库变更必须改为有版本号、可测试的显式迁移。仅依赖 `AutoMigrate` 会让旧二进制回滚后的兼容性不可判断。
-- `/readyz` 只有在配置、存储和 API 初始化完成后才可访问；更新器要求连续就绪并经过稳定观察期。当前探针不返回运行版本，因此文档不宣称已经执行独立的运行二进制版本核对。没有模组时仍可视为服务就绪，设备状态单独展示。
+- `/readyz` 只有在配置、存储和 API 初始化完成后才可访问；响应包含运行版本，更新器还会发送随机挑战并验证 root-only 密钥生成的证明，确认端口、目标版本和受管服务身份一致。更新器要求连续就绪并经过稳定观察期；没有模组时仍可视为服务就绪，设备状态单独展示。
 - 更新失败保留事务错误和备份；自动回滚会清理未被 `current` 或 `last-good` 引用的失败版本槽，确保同版本可安全重试。
 - 默认不启用无人值守自动更新。蜂窝网络和语音业务可能被升级中断，用户可自行配置维护窗口。
 
-### 7.3 Web 更新
+### 8.3 Web 更新
 
 Web 页面不再直接让进程替换自身。推荐流程是：
 
@@ -251,7 +454,7 @@ Web 页面不再直接让进程替换自身。推荐流程是：
 
 容器环境的更新 API 必须在服务端返回“不支持容器内自替换”，不能只靠前端拦截。
 
-## 8. 健康检查设计
+## 9. 健康检查设计
 
 当前提供两个无需登录、只返回最小信息的接口：
 
@@ -262,7 +465,7 @@ Web 页面不再直接让进程替换自身。推荐流程是：
 
 Dockerfile 和 Compose 都已声明 healthcheck，当前使用镜像内的 `vohivectl` 从配置解析实际 `server.port` 后请求 `/healthz`。
 
-## 9. Docker Compose 方案
+## 10. Docker Compose 方案
 
 当前仓库已经提供一份官方 `docker-compose.yml` 和 `.env.example`。用户可放在任意受控目录，例如 `/opt/vohive-compose`：
 
@@ -286,7 +489,7 @@ logs/
 
 后续若落地受限宿主机助手，再由它包装备份、拉取、原子修改 `.env`、`docker compose up -d`、健康观察和自动回滚；该助手必须使用最小权限，不能把 Docker Socket 暴露给 Web 容器。
 
-## 10. OpenWrt 方案
+## 11. OpenWrt 方案
 
 把现有 procd init 和示例配置补全为正式软件包：
 
@@ -299,7 +502,7 @@ logs/
 
 OpenWrt 包不应假设所有路由器都有足够存储或相同的 USB/QMI/MBIM 内核模块。安装后由 `vohivectl doctor` 输出缺失的设备相关依赖，而不是静默启动失败。
 
-## 11. Release 产物与供应链
+## 12. Release 产物与供应链
 
 每个正式 Release 建议一次性发布：
 
@@ -340,7 +543,7 @@ CI 需要增加：
 - 对 Compose 执行 config 校验、启动、healthcheck、升级和回滚测试。
 - 在发布前验证归档内版本号、目标架构和 Release 标签完全一致。
 
-## 12. 安全与运维默认值
+## 13. 安全与运维默认值
 
 - 安装时生成随机初始密码并只显示一次；当前尚未强制首次登录修改，部署后应立即修改。禁止发布固定通用密码。
 - 默认只建议在可信局域网访问 7575，不把管理端口直接暴露到公网。
@@ -350,7 +553,7 @@ CI 需要增加：
 - 备份中含配置密钥与通信数据，必须限制权限；导出时明确提示敏感性。
 - 当前版本尚未自动清理日志、备份和旧版本；部署者必须监控磁盘空间，后续保留策略落地前不能宣称自动限额。
 
-## 13. 实施状态与后续路线
+## 14. 实施状态与后续路线
 
 ### P0：已形成原生闭环
 
@@ -374,7 +577,7 @@ CI 需要增加：
 3. 增加首次启动 Web 引导，完成密码、设备发现和网络设置。
 4. 建立真实 `amd64`、`arm64`、`armv7` 主机与模组的发布验证矩阵。
 
-## 14. 验收标准
+## 15. 验收标准
 
 - 全新支持系统上，用户不安装编译工具即可完成部署。
 - 首次安装只需“下载脚本、sudo 执行”两步，结束时可打开安装器输出的本机 Web 地址。
@@ -386,7 +589,7 @@ CI 需要增加：
 - Docker 与原生安装共享通道和版本规则；Docker 的宿主机备份与回滚仍按 `CONTAINER.md` 手工执行。
 - 普通升级保留配置和数据库；普通卸载默认保留数据。
 
-## 15. 参考资料
+## 16. 参考资料
 
 - Docker Compose `pull`：<https://docs.docker.com/reference/cli/docker/compose/pull/>
 - Docker Compose healthcheck：<https://docs.docker.com/reference/compose-file/services/#healthcheck>

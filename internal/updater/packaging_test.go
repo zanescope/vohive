@@ -62,34 +62,55 @@ func TestBootstrapTrustAndRepositoryAreFixed(t *testing.T) {
 	}
 }
 
-func TestDocumentedInstallerBootstrapRequiresProvenanceVerification(t *testing.T) {
-	for _, name := range []string{"README.md", "DEPLOYMENT.zh-CN.md"} {
-		path := filepath.Join("..", "..", name)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
+func TestDocumentedInstallerBootstrapPaths(t *testing.T) {
+	readmeData, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(readmeData)
+	for _, required := range []string{
+		"releases/latest/download/vohive-install.sh",
+		"sudo sh vohive-install.sh",
+		"DEPLOYMENT.md#52-严格验证安装",
+	} {
+		if !strings.Contains(readme, required) {
+			t.Errorf("README.md is missing quick-install content %q", required)
 		}
-		text := string(data)
-		for _, required := range []string{
-			"VOHIVE_BOOTSTRAP_VERSION=v1.6.0",
-			"gh attestation verify vohive-install.sh",
-			"--repo zanescope/vohive",
-			"--signer-workflow zanescope/vohive/.github/workflows/binary-release.yml",
-			`--source-ref "refs/tags/${VOHIVE_BOOTSTRAP_VERSION}"`,
-			"--deny-self-hosted-runners",
-		} {
-			if !strings.Contains(text, required) {
-				t.Errorf("%s is missing bootstrap provenance constraint %q", name, required)
-			}
+	}
+	if strings.Contains(readme, "gh attestation verify vohive-install.sh") {
+		t.Fatal("README.md should keep strict provenance details in DEPLOYMENT.md")
+	}
+
+	deploymentData, err := os.ReadFile(filepath.Join("..", "..", "DEPLOYMENT.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment := string(deploymentData)
+	for _, required := range []string{
+		"VOHIVE_BOOTSTRAP_VERSION=v1.6.0",
+		"gh attestation verify vohive-install.sh",
+		"--repo zanescope/vohive",
+		"--signer-workflow zanescope/vohive/.github/workflows/binary-release.yml",
+		`--source-ref "refs/tags/${VOHIVE_BOOTSTRAP_VERSION}"`,
+		"--deny-self-hosted-runners",
+		"config_schema",
+		"free_device_limit",
+		"public_ip_probe.ipv4_urls",
+		"public_ip_probe.ipv6_urls",
+	} {
+		if !strings.Contains(deployment, required) {
+			t.Errorf("DEPLOYMENT.md is missing strict-install or configuration content %q", required)
 		}
-		if strings.Contains(text, "releases/latest/download/vohive-install.sh") {
-			t.Errorf("%s still downloads an unauthenticated moving installer", name)
+	}
+	verify := strings.Index(deployment, "gh attestation verify vohive-install.sh")
+	execute := -1
+	if verify >= 0 {
+		if offset := strings.Index(deployment[verify:], "sudo sh vohive-install.sh"); offset >= 0 {
+			execute = verify + offset
 		}
-		verify := strings.Index(text, "gh attestation verify vohive-install.sh")
-		execute := strings.Index(text, "sudo sh vohive-install.sh")
-		if verify < 0 || execute < 0 || verify > execute {
-			t.Errorf("%s must verify installer provenance before root execution: verify=%d execute=%d", name, verify, execute)
-		}
+	}
+	if verify < 0 || execute < 0 || verify > execute {
+		t.Errorf("DEPLOYMENT.md must verify installer provenance before strict root execution: verify=%d execute=%d", verify, execute)
 	}
 }
 
