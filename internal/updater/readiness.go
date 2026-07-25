@@ -210,7 +210,7 @@ func loadReadinessKey(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("readiness key is not a regular file")
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	if !readinessKeyPermissionsSecure(info.Mode()) {
 		return nil, errors.New("readiness key permissions allow group or other access")
 	}
 	if info.Size() > 1024 {
