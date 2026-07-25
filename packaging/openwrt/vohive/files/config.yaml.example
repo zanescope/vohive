@@ -1,11 +1,13 @@
 # Documentation only. The installer creates /etc/vohive/config.yaml with a
-# fresh random initial password and mode 0600. Never copy this example as an
-# initialized production configuration.
+# fresh random initial password and mode 0600. Never copy this example without
+# replacing the password with a strong, unique secret.
 config_schema: 1
 server:
-  host: 0.0.0.0
   port: 7575
-data_dir: /var/lib/vohive/data
+  debug: false
+web:
+  username: admin
+  password: replace-with-a-strong-random-secret
 free_device_limit: 5
 vowifi:
   enabled: false

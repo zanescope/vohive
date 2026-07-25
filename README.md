@@ -10,26 +10,16 @@ VoHive 把模组热插拔管理、SOCKS5/HTTP 代理编排、短信收发、VoWi
 
 ## 安装与部署
 
-从 `v1.6.0` 起，正式 GitHub Release 提供内置发布公钥的签名原生安装器。首次安装先安装
-[GitHub CLI](https://cli.github.com/)，再验证固定信任基线的 GitHub 构建来源；只有验证成功才交给 root：
+普通 Linux 推荐使用原生安装器：
 
 ```sh
-VOHIVE_BOOTSTRAP_VERSION=v1.6.0
-curl --proto '=https' --tlsv1.2 -fsSLO \
-  "https://github.com/zanescope/vohive/releases/download/${VOHIVE_BOOTSTRAP_VERSION}/vohive-install.sh"
-gh attestation verify vohive-install.sh \
-  --repo zanescope/vohive \
-  --signer-workflow zanescope/vohive/.github/workflows/binary-release.yml \
-  --source-ref "refs/tags/${VOHIVE_BOOTSTRAP_VERSION}" \
-  --deny-self-hosted-runners
+curl -fsSLO https://github.com/zanescope/vohive/releases/latest/download/vohive-install.sh
 sudo sh vohive-install.sh
 ```
 
-这一步防止被替换的 Release 附件以 root 权限运行。固定的 `v1.6.0` 安装器只负责建立信任根，随后会从签名清单选择当前 stable/beta 目标。不要跳过 `gh attestation verify` 的成功结果。
+安装器支持 `amd64`、`arm64`、`armv7`，自动安装服务并保留已有配置；更新时使用事务切换、健康检查和失败回滚。`v1.5.x` 及更早版本也应通过当前安装器完成迁移，不能继续使用旧的文件热替换更新。
 
-安装器支持 `amd64`、`arm64`、`armv7`，保留用户配置，并使用事务更新、健康检查和失败回滚。`v1.5.x` 及更早版本需要先运行这份已验证的 `v1.6.0` 安装器迁移，不能继续使用旧的文件热替换更新。
-
-详细规则见[《小白友好安装与更新方案》](DEPLOYMENT.zh-CN.md)。Docker 用户请按 [CONTAINER.md](CONTAINER.md) 使用 GHCR 镜像 digest；容器内自更新会 fail closed。
+如需在授予 root 权限前核验安装器的 GitHub 构建来源，请使用[严格验证安装](DEPLOYMENT.md#52-严格验证安装)。完整配置参数、更新、备份和回滚规则见[《部署、配置与更新指南》](DEPLOYMENT.md)。Docker 用户请按 [CONTAINER.md](CONTAINER.md) 使用 GHCR 镜像 digest；容器内不执行自更新。
 
 ## 核心特性
 
@@ -55,26 +45,6 @@ sudo sh vohive-install.sh
 - **Database**:SQLite(`vohive.db`)
 - **CI/CD**:GitHub Actions 自动化多架构 Docker 镜像构建与发布
 
-
-## 公网 IP 探测配置
-
-前端展示的公网 IPv4/IPv6 由服务端经对应模组网卡探测，避免浏览器网络与模组数据承载不一致。探测源在根配置文件中设置：
-
-~~~yaml
-public_ip_probe:
-  ipv4_urls:
-    - https://your-ipv4-endpoint.example
-  ipv6_urls:
-    - https://your-ipv6-endpoint.example
-~~~
-
-同一地址族的端点按顺序回退，最多 4 个；非空列表会完整替换该地址族的内置默认源，留空则继续使用默认源。端点必须使用 HTTPS、禁止重定向，并只返回单一公网 IP 文本。HTTP 请求与 DNS 查询都会绑定设备网卡；探测目标的解析结果禁止落到私网或特殊用途地址。DNS 优先使用运营商下发地址，再按境内公共 DNS、国际公共 DNS 顺序回退。
-
-单个承载连续探测失败时会先指数退避，最多进行 6 次快速尝试；之后停止快速重试，改为每 10 分钟低频检查一次，避免 SIM 欠费或网络不可用时持续请求和刷屏。数据承载重连、地址变化或手动刷新会立即重新探测。
-
-中国大陆网络可能无法稳定访问内置的国际探测源，建议部署受信任的境内双栈 HTTPS 回显端点，并将其放在各自列表首位。该配置在进程启动时从 YAML 读取，修改后需重启服务。
-
-HTTPS 探测依赖系统 CA 根证书。官方容器镜像已内置证书；OpenWrt 或直接运行发布二进制时，请安装 ca-bundle（或系统等价的 ca-certificates），不要通过关闭 TLS 校验来规避证书错误。
 
 ## 免责声明
 
