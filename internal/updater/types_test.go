@@ -35,6 +35,8 @@ func TestReleaseManifestValidate(t *testing.T) {
 		{"invalid updater", func(m *ReleaseManifest) { m.MinUpdaterVersion = "dev" }},
 		{"reversed config range", func(m *ReleaseManifest) { m.ConfigSchema = SchemaRange{Min: 2, Target: 1, Max: 3} }},
 		{"target above max", func(m *ReleaseManifest) { m.DatabaseSchema = SchemaRange{Min: 0, Target: 2, Max: 1} }},
+		{"config differs from compiled capability", func(m *ReleaseManifest) { m.ConfigSchema = SchemaRange{Min: 0, Target: 2, Max: 2} }},
+		{"database differs from compiled capability", func(m *ReleaseManifest) { m.DatabaseSchema = SchemaRange{Min: 1, Target: 1, Max: 1} }},
 		{"invalid artifact hash", func(m *ReleaseManifest) { m.Artifacts[0].SHA256 = "not-a-hash" }},
 		{"unsafe artifact name", func(m *ReleaseManifest) { m.Artifacts[0].Name = "../vohive" }},
 	}

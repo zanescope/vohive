@@ -62,6 +62,64 @@ func TestBootstrapTrustAndRepositoryAreFixed(t *testing.T) {
 	}
 }
 
+func TestDocumentedInstallerBootstrapRequiresProvenanceVerification(t *testing.T) {
+	for _, name := range []string{"README.md", "DEPLOYMENT.zh-CN.md"} {
+		path := filepath.Join("..", "..", name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		for _, required := range []string{
+			"VOHIVE_BOOTSTRAP_VERSION=v1.6.0",
+			"gh attestation verify vohive-install.sh",
+			"--repo zanescope/vohive",
+			"--signer-workflow zanescope/vohive/.github/workflows/binary-release.yml",
+			`--source-ref "refs/tags/${VOHIVE_BOOTSTRAP_VERSION}"`,
+			"--deny-self-hosted-runners",
+		} {
+			if !strings.Contains(text, required) {
+				t.Errorf("%s is missing bootstrap provenance constraint %q", name, required)
+			}
+		}
+		if strings.Contains(text, "releases/latest/download/vohive-install.sh") {
+			t.Errorf("%s still downloads an unauthenticated moving installer", name)
+		}
+		verify := strings.Index(text, "gh attestation verify vohive-install.sh")
+		execute := strings.Index(text, "sudo sh vohive-install.sh")
+		if verify < 0 || execute < 0 || verify > execute {
+			t.Errorf("%s must verify installer provenance before root execution: verify=%d execute=%d", name, verify, execute)
+		}
+	}
+}
+
+func TestInstallerRequiresExplicitNoServiceMode(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, required := range []string{
+		`if [ "$NO_SERVICE" -eq 1 ]; then SERVICE_TYPE='portable'`,
+		"no supported service manager detected",
+		"use --no-service only if you will start and monitor VoHive yourself",
+		"files installed in explicit --no-service mode",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("installer service-manager preflight is missing %q", required)
+		}
+	}
+	if strings.Contains(text, "else SERVICE_TYPE='portable'") {
+		t.Fatal("installer still silently falls back to an unmanaged portable installation")
+	}
+	preflight := strings.LastIndex(text, "\ndetect_service\n")
+	download := strings.Index(text, "\nif [ \"$REPAIR\" -eq 0 ] || [ \"$VERSION_SET\" -eq 1 ]; then")
+	stateWrite := strings.Index(text, "\nmkdir -p \"$STATE_ROOT\"")
+	if preflight < 0 || download < 0 || stateWrite < 0 || !(preflight < download && download < stateWrite) {
+		t.Fatalf("service-manager preflight must precede downloads and state writes: service=%d download=%d state=%d", preflight, download, stateWrite)
+	}
+}
+
 func TestSystemdUnitKeepsConfigWritableWithoutHOMEOverride(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "packaging", "systemd", "vohive.service"))
 	if err != nil {

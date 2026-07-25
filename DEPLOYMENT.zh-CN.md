@@ -2,7 +2,7 @@
 
 ## 1. 目标与范围
 
-本文设计一套面向非开发者的 VoHive 交付方案。用户不需要安装 Go、Node.js、Git 或手动编辑源码，只需要会复制两行安装命令，日常更新可在 Web 页面点击按钮。
+本文设计一套面向非开发者的 VoHive 交付方案。用户不需要安装 Go、Node.js、Git 或手动编辑源码，只需复制一段带来源校验的安装命令，日常更新可在 Web 页面点击按钮。
 
 目标：
 
@@ -96,9 +96,20 @@
 项目首页只保留一个醒目的首选安装入口：
 
 ```sh
-curl -fsSLO https://github.com/zanescope/vohive/releases/latest/download/vohive-install.sh
+VOHIVE_BOOTSTRAP_VERSION=v1.6.0
+curl --proto '=https' --tlsv1.2 -fsSLO \
+  "https://github.com/zanescope/vohive/releases/download/${VOHIVE_BOOTSTRAP_VERSION}/vohive-install.sh"
+gh attestation verify vohive-install.sh \
+  --repo zanescope/vohive \
+  --signer-workflow zanescope/vohive/.github/workflows/binary-release.yml \
+  --source-ref "refs/tags/${VOHIVE_BOOTSTRAP_VERSION}" \
+  --deny-self-hosted-runners
 sudo sh vohive-install.sh
 ```
+
+运行前需要按 [GitHub CLI 官方说明](https://cli.github.com/)安装 `gh`；如果公共证明查询要求登录，先执行 `gh auth login`。验证必须同时匹配唯一仓库、固定发布工作流、`v1.6.0` tag ref，并拒绝 self-hosted runner。任何验证错误都应停止，不能继续执行安装器。
+
+这里固定下载 `v1.6.0` 是为了固定 bootstrap 信任基线，而不是把目标版本固定在 `v1.6.0`。验证后的安装器内置 Minisign 公钥和 bootstrap verifier 摘要，默认仍从签名清单安装最新 stable；`--channel beta` 会选择 beta。
 
 安装器必须同时支持非交互参数，方便高级用户和自动化：
 
@@ -106,7 +117,9 @@ sudo sh vohive-install.sh
 sudo sh vohive-install.sh --version v1.6.0 --channel stable
 ```
 
-不把 `curl | sh` 作为唯一方式。分两步下载后执行，用户可以先查看脚本，网络中断时也更容易重试。
+不提供 `curl | sh` 入口，也不允许把未验证的 `latest` 附件直接交给 root。分步下载、验证、执行让网络中断可重试，也让错误停在任何系统修改之前。
+
+默认安装只接受正在运行的 systemd 或 OpenWrt procd；检测不到受支持的服务管理器时会在下载和系统写入前失败。`--no-service` 是明确的高级模式，只适合已经准备好自行启动、监控和重启 VoHive 的用户；安装器不会再自动降级到未托管模式并报告普通安装成功。
 
 ### 5.2 安装器职责
 
@@ -243,11 +256,11 @@ Web 页面不再直接让进程替换自身。推荐流程是：
 当前提供两个无需登录、只返回最小信息的接口：
 
 - `GET /healthz`：进程事件循环和 HTTP 服务可响应即返回 200，用于 systemd/Docker 存活检查。
-- `GET /readyz`：配置已加载、数据库可用、核心服务完成初始化时返回 200，用于安装和更新确认。
+- `GET /readyz`：配置已加载、数据库可用、核心服务完成初始化时返回 200；响应包含运行版本，更新器传入随机挑战时还返回基于 root-only 密钥的证明，用于排除错误端口上的其他进程。
 
-响应不包含设备标识、配置路径、版本细节或其他敏感信息。
+响应不包含设备标识、配置路径或其他敏感信息。就绪证明不能脱离每次随机挑战重放。
 
-Dockerfile 和 Compose 都已声明 healthcheck，当前使用镜像内的 `wget` 请求 `/healthz`。
+Dockerfile 和 Compose 都已声明 healthcheck，当前使用镜像内的 `vohivectl` 从配置解析实际 `server.port` 后请求 `/healthz`。
 
 ## 9. Docker Compose 方案
 
@@ -266,7 +279,7 @@ logs/
 - 复制 `.env.example` 为 `.env` 后必须填入不可变镜像 digest；缺失时 Compose 直接报错。
 - 使用 `network_mode: host`，不再声明无效的 `ports` 映射，也不硬编码代理。
 - 主容器不挂载 Docker Socket、不替换自身二进制；没有受限宿主机更新代理时，Web 更新 fail closed。
-- Dockerfile 与 Compose 都使用 `/healthz`；正式镜像只发布 `amd64`、`arm64`，armv7 走原生安装或 OpenWrt。
+- Dockerfile 与 Compose 都通过 `vohivectl` 按配置端口检查 `/healthz`；正式镜像只发布 `amd64`、`arm64`，armv7 走原生安装或 OpenWrt。
 - 配置、数据和日志均由宿主机 bind mount 持久化，镜像升级不得覆盖配置。
 
 当前版本按 `CONTAINER.md` 手工保存旧 digest、拉取并解析新 digest、重建、检查 healthy，失败时恢复旧 `.env`。仓库尚未提供 `install-docker.sh` 或可控制宿主 Docker 的 `vohivectl update`，前端不会把多条宿主机命令伪装成“一键更新”。

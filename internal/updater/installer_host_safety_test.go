@@ -52,7 +52,12 @@ func TestUninstallerNeverStopsAnActiveTransactionWorker(t *testing.T) {
 		"refuse_active_transaction_services()",
 		"vohive-update.service vohive-recover.service",
 		"vohive-update vohive-recover",
-		"refuse_unresolved_lock()",
+		"acquire_uninstall_lock()",
+		"set -C",
+		"process_start_ticks=%s",
+		"release_uninstall_lock()",
+		"trap cleanup_uninstall_lock 0",
+		"LOCK_HELD=0",
 		"reboot for boot recovery",
 		"vohivectl doctor",
 	} {
@@ -73,11 +78,20 @@ func TestUninstallerNeverStopsAnActiveTransactionWorker(t *testing.T) {
 		t.Fatal("stop_services must not terminate transaction workers")
 	}
 	firstPreflight := strings.Index(text, "\nrefuse_active_transaction_services\n")
-	firstStop := strings.Index(text, "\nstop_services\n")
-	if firstPreflight < 0 || firstStop < 0 || firstPreflight > firstStop {
-		t.Fatalf("transaction workers must be checked before the main service is stopped: preflight=%d stop=%d", firstPreflight, firstStop)
+	lock := strings.Index(text, "\nacquire_uninstall_lock\n")
+	secondPreflight := -1
+	if lock >= 0 {
+		offset := strings.Index(text[lock+1:], "\nrefuse_active_transaction_services\n")
+		if offset >= 0 {
+			secondPreflight = lock + 1 + offset
+		}
 	}
-	if strings.Count(text, "\nrefuse_active_transaction_services\n") < 2 || strings.Count(text, "\nrefuse_unresolved_lock\n") < 2 {
-		t.Fatal("uninstaller must repeat transaction preflight after stopping the main service")
+	firstStop := strings.Index(text, "\nstop_services\n")
+	if firstPreflight < 0 || lock < 0 || secondPreflight < 0 || firstStop < 0 ||
+		!(firstPreflight < lock && lock < secondPreflight && secondPreflight < firstStop) {
+		t.Fatalf(
+			"uninstaller must check workers, acquire the shared lock, recheck workers, and only then stop the main service: first=%d lock=%d second=%d stop=%d",
+			firstPreflight, lock, secondPreflight, firstStop,
+		)
 	}
 }

@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -117,15 +118,94 @@ func (s *managedService) Active(ctx context.Context) (bool, error) {
 }
 
 type ReadyChecker interface {
-	Ready(context.Context, string) error
+	Ready(context.Context, ReadyExpectation) error
 }
 
 type HTTPReadyChecker struct {
 	Client *http.Client
 }
 
-func (h HTTPReadyChecker) Ready(ctx context.Context, endpoint string) error {
+func (h HTTPReadyChecker) Ready(ctx context.Context, expectation ReadyExpectation) error {
 	client := h.Client
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+	if expectation.Endpoint == "" {
+		return errors.New("readiness endpoint is required")
+	}
+	if expectation.ExpectedVersion == "" {
+		return errors.New("expected readiness version is required")
+	}
+	challenge, err := NewReadinessChallenge()
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, expectation.Endpoint, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set(ReadinessChallengeHeader, challenge)
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		return fmt.Errorf("readiness endpoint returned HTTP %d", response.StatusCode)
+	}
+	var payload ReadinessResponse
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	if err := decoder.Decode(&payload); err != nil {
+		return fmt.Errorf("decode readiness response: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("readiness response contains multiple JSON values")
+		}
+		return fmt.Errorf("decode readiness response trailer: %w", err)
+	}
+	if payload.Status != "ready" {
+		return fmt.Errorf("readiness endpoint returned status %q", payload.Status)
+	}
+	expectedVersion := normalizeVersion(expectation.ExpectedVersion)
+	if expectation.AllowLegacy && payload.Version == "" && payload.Proof == "" {
+		return nil
+	}
+	if normalizeVersion(payload.Version) != expectedVersion {
+		return fmt.Errorf("readiness endpoint reports version %q, want %q", payload.Version, expectedVersion)
+	}
+	if err := VerifyReadinessProof(expectation.KeyFile, payload.Version, challenge, payload.Proof); err != nil {
+		return err
+	}
+	return nil
+}
+
+type managedReadyChecker struct {
+	service ServiceController
+	next    ReadyChecker
+}
+
+func (c managedReadyChecker) Ready(ctx context.Context, expectation ReadyExpectation) error {
+	if c.service == nil {
+		return errors.New("service controller is required for managed readiness")
+	}
+	if c.next == nil {
+		return errors.New("readiness checker is required")
+	}
+	active, err := c.service.Active(ctx)
+	if err != nil {
+		return fmt.Errorf("verify managed service activity: %w", err)
+	}
+	if !active {
+		return errors.New("managed VoHive service is not active")
+	}
+	return c.next.Ready(ctx, expectation)
+}
+
+func ProbeHTTP(ctx context.Context, client *http.Client, endpoint string) error {
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
@@ -140,7 +220,7 @@ func (h HTTPReadyChecker) Ready(ctx context.Context, endpoint string) error {
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("readiness endpoint returned HTTP %d", response.StatusCode)
+		return fmt.Errorf("health endpoint returned HTTP %d", response.StatusCode)
 	}
 	return nil
 }
@@ -209,18 +289,15 @@ func DetectCapabilities(deployment Deployment) Capabilities {
 	return capabilities
 }
 
-func waitReady(ctx context.Context, checker ReadyChecker, endpoint string, timeout, interval, stableFor time.Duration) error {
+func waitReady(ctx context.Context, checker ReadyChecker, expectation ReadyExpectation, timeout, interval, stableFor time.Duration) error {
 	if checker == nil {
 		return errors.New("readiness checker is required")
-	}
-	if endpoint == "" {
-		endpoint = DefaultReadyURL
 	}
 	deadline := time.Now().Add(timeout)
 	consecutive := 0
 	for {
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := checker.Ready(checkCtx, endpoint)
+		err := checker.Ready(checkCtx, expectation)
 		cancel()
 		if err == nil {
 			consecutive++
@@ -250,7 +327,7 @@ func waitReady(ctx context.Context, checker ReadyChecker, endpoint string, timeo
 		case <-time.After(interval):
 		}
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := checker.Ready(checkCtx, endpoint)
+		err := checker.Ready(checkCtx, expectation)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("service lost readiness during stabilization: %w", err)

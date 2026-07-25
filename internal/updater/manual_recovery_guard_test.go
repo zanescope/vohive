@@ -26,7 +26,7 @@ func (manualGuardService) Active(context.Context) (bool, error) { return false, 
 
 type manualGuardReady struct{}
 
-func (manualGuardReady) Ready(context.Context, string) error { return nil }
+func (manualGuardReady) Ready(context.Context, ReadyExpectation) error { return nil }
 
 type manualGuardLauncher struct {
 	called bool

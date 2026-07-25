@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/zanescope/vohive/internal/schemacontract"
 	"gorm.io/gorm"
 )
 
 const (
 	LegacyDatabaseSchema           = 0
-	MinimumSupportedDatabaseSchema = LegacyDatabaseSchema
-	CurrentDatabaseSchema          = 1
+	MinimumSupportedDatabaseSchema = schemacontract.DatabaseMin
+	CurrentDatabaseSchema          = schemacontract.DatabaseTarget
+	MaximumSupportedDatabaseSchema = schemacontract.DatabaseMax
 )
 
 var (
@@ -80,7 +82,7 @@ func PlanDatabaseMigration(database *gorm.DB) (DatabaseMigrationPlan, error) {
 		CurrentSchema: current,
 		TargetSchema:  CurrentDatabaseSchema,
 	}
-	if current > CurrentDatabaseSchema {
+	if current > MaximumSupportedDatabaseSchema {
 		return plan, fmt.Errorf("%w: database=%d binary=%d", ErrDatabaseSchemaTooNew, current, CurrentDatabaseSchema)
 	}
 	if current < MinimumSupportedDatabaseSchema {

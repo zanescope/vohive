@@ -88,6 +88,9 @@ type Server struct {
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
 
+	updateAuthMu       sync.Mutex
+	updateAuthAttempts map[string]loginAttempt
+
 	shutdownCh chan struct{}
 }
 
@@ -106,7 +109,28 @@ func (s *Server) handleLiveness(c *gin.Context) {
 // server have been initialized. Reaching this handler therefore confirms that
 // a newly started release is ready to accept traffic.
 func (s *Server) handleReadiness(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ready"})
+	response := updater.ReadinessResponse{
+		Status:  "ready",
+		Version: global.Version,
+	}
+	challenge := strings.TrimSpace(c.GetHeader(updater.ReadinessChallengeHeader))
+	if challenge == "" {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
+	version, proof, err := updater.SignReadinessChallenge(
+		updater.ReadinessKeyPath(),
+		global.Version,
+		challenge,
+	)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
+		return
+	}
+	response.Version = version
+	response.Proof = proof
+	c.JSON(http.StatusOK, response)
 }
 
 // New 创建一个新的 API 服务器实例
@@ -119,20 +143,21 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 		configPath = "config/config.yaml"
 	}
 	s := &Server{
-		cfg:           cfg.Server,
-		fullCfg:       cfg,
-		auth:          cfg.Web,
-		pool:          pool,
-		fs:            fs,
-		configPath:    configPath,
-		proxyMgr:      proxyMgr,
-		voiceGW:       voiceGW,
-		notifyMgr:     notifyMgr,
-		proxyRepo:     repo.NewDBRepo(),
-		websheets:     vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
-		updates:       newDefaultUpdateCoordinator(),
-		loginAttempts: make(map[string]loginAttempt),
-		shutdownCh:    make(chan struct{}),
+		cfg:                cfg.Server,
+		fullCfg:            cfg,
+		auth:               cfg.Web,
+		pool:               pool,
+		fs:                 fs,
+		configPath:         configPath,
+		proxyMgr:           proxyMgr,
+		voiceGW:            voiceGW,
+		notifyMgr:          notifyMgr,
+		proxyRepo:          repo.NewDBRepo(),
+		websheets:          vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
+		updates:            newDefaultUpdateCoordinator(),
+		loginAttempts:      make(map[string]loginAttempt),
+		updateAuthAttempts: make(map[string]loginAttempt),
+		shutdownCh:         make(chan struct{}),
 	}
 
 	return s

@@ -84,3 +84,57 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 		t.Fatalf("restore mismatch: config=%q data=%q", config, data)
 	}
 }
+
+func TestFailedBackupLeavesNoVisibleOrStagingDirectory(t *testing.T) {
+	paths := backupPresencePaths(t)
+	if err := os.MkdirAll(paths.ConfigFile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := createBackup(paths, "v1.5.0", time.Unix(4, 0)); err == nil {
+		t.Fatal("createBackup succeeded with a directory in place of the config file")
+	}
+	entries, err := os.ReadDir(paths.BackupsDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed backup left published or staging entries: %v", entries)
+	}
+}
+
+func TestBackupDoesNotReplaceAnExistingSnapshot(t *testing.T) {
+	paths := backupPresencePaths(t)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(5, 0)
+	first, err := createBackup(paths, "v1.5.0", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := createBackup(paths, "v1.5.0", now); err == nil {
+		t.Fatal("duplicate backup replaced an existing snapshot")
+	}
+	data, err := os.ReadFile(filepath.Join(first, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "first" {
+		t.Fatalf("existing snapshot was replaced: config=%q", data)
+	}
+	entries, err := os.ReadDir(paths.BackupsDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(first) {
+		t.Fatalf("duplicate backup left unexpected entries: %v", entries)
+	}
+}

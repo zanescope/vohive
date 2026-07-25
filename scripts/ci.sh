@@ -29,7 +29,28 @@ run() {
 }
 
 workflow_lint() {
-	local actionlint_bin tmpbin
+	local action_ref action_value actionlint_bin invalid_pin tmpbin workflow_use
+
+	invalid_pin=0
+	while IFS= read -r workflow_use; do
+		read -r action_value _ <<< "${workflow_use#*uses:}"
+		case "$action_value" in
+			./*|docker://*) continue ;;
+		esac
+		if [[ "$action_value" != *@* ]]; then
+			printf 'remote action has no immutable ref: %s\n' "$workflow_use" >&2
+			invalid_pin=1
+			continue
+		fi
+		action_ref="${action_value##*@}"
+		if [[ ! "$action_ref" =~ ^[0-9a-f]{40}$ ]]; then
+			printf 'remote action must use a full commit SHA: %s\n' "$workflow_use" >&2
+			invalid_pin=1
+		fi
+	done < <(grep -HnE '^[[:space:]]*uses:[[:space:]]+' .github/workflows/*.yml)
+	if [[ "$invalid_pin" -ne 0 ]]; then
+		return 1
+	fi
 
 	if [[ -n "${ACTIONLINT_BIN:-}" ]]; then
 		actionlint_bin="$ACTIONLINT_BIN"
@@ -194,7 +215,7 @@ container_hygiene() {
 		return 1
 	fi
 	for file in Dockerfile Dockerfile.github Dockerfile.runtime; do
-		for needle in 'ARG ALPINE_VERSION=3.23' 'org.opencontainers.image.source' 'org.opencontainers.image.revision' 'org.opencontainers.image.version' '/healthz'; do
+		for needle in 'ARG ALPINE_VERSION=3.23' 'org.opencontainers.image.source' 'org.opencontainers.image.revision' 'org.opencontainers.image.version' '/usr/local/bin/vohivectl' '"--liveness"'; do
 			if ! grep -Fq -- "$needle" "$file"; then
 				printf '%s is missing required image constraint: %s\n' "$file" "$needle" >&2
 				return 1
@@ -246,7 +267,7 @@ container_hygiene() {
 			return 1
 		fi
 	done
-	for needle in 'VOHIVE_IMAGE:?' 'ghcr.io/zanescope/vohive@sha256:<digest>' 'network_mode: host' '/healthz'; do
+	for needle in 'VOHIVE_IMAGE:?' 'ghcr.io/zanescope/vohive@sha256:<digest>' 'network_mode: host' '/usr/local/bin/vohivectl' '"--liveness"'; do
 		if ! grep -Fq -- "$needle" "$compose"; then
 			printf 'Compose file is missing constraint: %s\n' "$needle" >&2
 			return 1

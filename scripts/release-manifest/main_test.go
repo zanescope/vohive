@@ -225,6 +225,28 @@ func TestPolicyRejectsDifferentRepository(t *testing.T) {
 	}
 }
 
+func TestPolicyRejectsSchemaDriftFromCompiledRuntime(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		edit func(*releasePolicy)
+	}{
+		{"config", func(p *releasePolicy) { p.ConfigSchema = schemaRange{Min: 0, Target: 2, Max: 2} }},
+		{"database", func(p *releasePolicy) { p.DatabaseSchema = schemaRange{Min: 1, Target: 1, Max: 1} }},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			policy := testPolicy()
+			test.edit(&policy)
+			if err := validatePolicy(policy); err == nil {
+				t.Fatal("validatePolicy accepted a structurally valid schema range that differs from the compiled runtime")
+			}
+		})
+	}
+}
+
 func writeTestPolicy(t *testing.T, dir string) string {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {

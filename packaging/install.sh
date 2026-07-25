@@ -41,6 +41,7 @@ LEGACY_RELEASE=''
 LEGACY_SOURCE=''
 VERIFY_BIN=''
 INITIAL_PASSWORD=''
+WEB_UI_URL=''
 MANIFEST=''
 MANIFEST_SHA=''
 MANIFEST_SIZE=''
@@ -81,7 +82,7 @@ Usage: vohive-install.sh [options]
   --version TAG      install an exact signed release
   --channel CHANNEL  stable or beta (default: stable)
   --dry-run          resolve and verify signed metadata without changing the host
-  --no-service       install without systemd/procd integration (no auto-update)
+  --no-service       explicit advanced mode: install files without starting a service
   --repair           transactionally repair the installed version and service files
   -h, --help         show this help
 EOF
@@ -459,7 +460,8 @@ detect_service() {
 	if [ "$NO_SERVICE" -eq 1 ]; then SERVICE_TYPE='portable'
 	elif [ -f /etc/openwrt_release ] && [ -x /sbin/procd ]; then SERVICE_TYPE='openwrt'
 	elif command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then SERVICE_TYPE='systemd'
-	else SERVICE_TYPE='portable'
+	else
+		die 'no supported service manager detected; install systemd/OpenWrt procd, or use --no-service only if you will start and monitor VoHive yourself'
 	fi
 }
 
@@ -578,6 +580,25 @@ random_password() {
 	elif command -v openssl >/dev/null 2>&1; then openssl rand -hex 24
 	else return 1
 	fi
+}
+
+write_readiness_key() {
+	if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+		readiness_key=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+	elif command -v openssl >/dev/null 2>&1; then
+		readiness_key=$(openssl rand -hex 32)
+	else
+		die 'a secure random source is required for readiness verification'
+	fi
+	case "$readiness_key" in
+		????????????????????????????????????????????????????????????????) ;;
+		*) die 'secure readiness key generation failed' ;;
+	esac
+	tmp_key="$STATE_ROOT/readiness.key.tmp.$$"
+	printf '%s\n' "$readiness_key" >"$tmp_key"
+	chmod 0600 "$tmp_key"
+	mv -f "$tmp_key" "$STATE_ROOT/readiness.key"
+	readiness_key=''
 }
 
 write_initial_config() {
@@ -879,9 +900,8 @@ EOF
 }
 
 ready_once() {
-	if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 http://127.0.0.1:7575/readyz >/dev/null 2>&1
-	else wget -q -T 5 -O /dev/null http://127.0.0.1:7575/readyz >/dev/null 2>&1
-	fi
+	"$INSTALL_ROOT/control/vohivectl" --deployment "$DEPLOYMENT_FILE" \
+		probe --expected-version "$VERSION" >/dev/null 2>&1
 }
 
 wait_ready() {
@@ -915,9 +935,9 @@ END{if(seen["vohive"]!=1||seen["vohivectl"]!=1||seen["LICENSE"]!=1)exit 1}' "$ar
 detect_arch
 validate_trust_material
 [ "$DRY_RUN" -eq 1 ] || [ "$(id -u)" -eq 0 ] || die 'run as root (for example: sudo sh vohive-install.sh)'
+detect_service
 if [ "$DRY_RUN" -eq 1 ]; then
 	[ "$REPAIR" -eq 0 ] || die '--repair cannot be combined with --dry-run'
-	detect_service
 	resolve_version
 	prepare_verifier
 	verify_metadata
@@ -984,7 +1004,6 @@ if [ -e "$STATE_ROOT/state.json" ] || [ -L "$STATE_ROOT/state.json" ]; then
 		*) die "an install or update transaction is unresolved (phase: $existing_phase); reboot for recovery, then run vohivectl doctor" ;;
 	esac
 fi
-detect_service
 detect_layout
 record_existing_deployment
 [ "$RELEASE_PREPARED" -eq 1 ] || prepare_release_archive
@@ -1115,21 +1134,33 @@ fi
 tmp_deployment="$DEPLOYMENT_FILE.tmp.$$"
 mkdir -p "$(dirname "$DEPLOYMENT_FILE")"
 cat >"$tmp_deployment" <<EOF
-{"schema":1,"product":"vohive","repository":"$REPOSITORY","channel":"$CHANNEL","install_type":"$SERVICE_TYPE","layout":"$LAYOUT","current_version":"$VERSION","last_good_version":"$last_good","install_root":"$INSTALL_ROOT","config_path":"$CONFIG_FILE","data_path":"$DATA_ROOT","state_root":"$STATE_ROOT","ready_url":"http://127.0.0.1:7575/readyz"}
+{"schema":1,"product":"vohive","repository":"$REPOSITORY","channel":"$CHANNEL","install_type":"$SERVICE_TYPE","layout":"$LAYOUT","current_version":"$VERSION","last_good_version":"$last_good","install_root":"$INSTALL_ROOT","config_path":"$CONFIG_FILE","data_path":"$DATA_ROOT","state_root":"$STATE_ROOT"}
 EOF
 chmod 0600 "$tmp_deployment"
 mv -f "$tmp_deployment" "$DEPLOYMENT_FILE"
+write_readiness_key
 
 SERVICE_MAY_BE_RUNNING=1
 start_service
 wait_ready
+if [ "$SERVICE_TYPE" != portable ]; then
+	WEB_UI_URL=$("$INSTALL_ROOT/control/vohivectl" --deployment "$DEPLOYMENT_FILE" probe --expected-version "$VERSION" --print-url)
+fi
 
 write_terminal_state completed '' "$VERSION"
 if [ -n "$TARGET_HOLD" ] && [ -d "$TARGET_HOLD" ]; then remove_managed_tree "$TARGET_HOLD"; TARGET_HOLD=''; fi
 TRANSACTION_ACTIVE=0
 if [ "$LOCK_HELD" -eq 1 ]; then rm -f -- "$LOCK_FILE"; LOCK_HELD=0; fi
-say "VoHive $VERSION installed successfully."
-say 'Web UI: http://127.0.0.1:7575/'
+if [ "$SERVICE_TYPE" = portable ]; then
+	say "VoHive $VERSION files installed in explicit --no-service mode."
+else
+	say "VoHive $VERSION installed successfully."
+fi
+if [ -n "$WEB_UI_URL" ]; then
+	say "Web UI: $WEB_UI_URL"
+else
+	say 'No service was started; launch VoHive with the configured server.port before opening the Web UI.'
+fi
 if [ -n "$INITIAL_PASSWORD" ]; then
 	say 'Initial administrator username: admin'
 	say "Initial administrator password: $INITIAL_PASSWORD"

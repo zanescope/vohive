@@ -53,6 +53,9 @@ func (p RuntimePaths) ControlDir() string   { return filepath.Join(p.InstallRoot
 func (p RuntimePaths) StateFile() string    { return filepath.Join(p.StateRoot, "state.json") }
 func (p RuntimePaths) RequestFile() string  { return filepath.Join(p.StateRoot, "request.json") }
 func (p RuntimePaths) LockFile() string     { return filepath.Join(p.StateRoot, "update.lock") }
+func (p RuntimePaths) ReadinessKeyFile() string {
+	return filepath.Join(p.StateRoot, "readiness.key")
+}
 func (p RuntimePaths) DownloadsDir() string { return filepath.Join(p.StateRoot, "downloads") }
 func (p RuntimePaths) BackupsDir() string   { return filepath.Join(filepath.Dir(p.StateRoot), "backups") }
 
@@ -438,10 +441,26 @@ func createBackup(paths RuntimePaths, version string, now time.Time) (string, er
 		return "", err
 	}
 	backupName := now.UTC().Format("20060102T150405.000000000Z") + "-" + sanitizeVersion(version)
-	backupPath := filepath.Join(paths.BackupsDir(), backupName)
-	if err := os.MkdirAll(backupPath, 0o700); err != nil {
+	backupRoot := paths.BackupsDir()
+	backupPath := filepath.Join(backupRoot, backupName)
+	if err := os.MkdirAll(backupRoot, 0o700); err != nil {
 		return "", err
 	}
+	if _, err := os.Lstat(backupPath); err == nil {
+		return "", fmt.Errorf("backup already exists: %s", backupPath)
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	stagingPath, err := os.MkdirTemp(backupRoot, "."+backupName+".tmp-")
+	if err != nil {
+		return "", err
+	}
+	published := false
+	defer func() {
+		if !published {
+			_ = os.RemoveAll(stagingPath)
+		}
+	}()
 	metadata := BackupMetadata{
 		Schema: 1, CreatedAt: now.UTC(), SourceVersion: version,
 		ConfigPath: paths.ConfigFile, DataPath: paths.DataDir,
@@ -451,7 +470,7 @@ func createBackup(paths RuntimePaths, version string, now time.Time) (string, er
 			return "", fmt.Errorf("config is not a regular file: %s", paths.ConfigFile)
 		}
 		metadata.ConfigPresent = true
-		if err := copyFile(paths.ConfigFile, filepath.Join(backupPath, "config.yaml"), 0o600); err != nil {
+		if err := copyFile(paths.ConfigFile, filepath.Join(stagingPath, "config.yaml"), 0o600); err != nil {
 			return "", err
 		}
 	} else if !os.IsNotExist(err) {
@@ -462,7 +481,7 @@ func createBackup(paths RuntimePaths, version string, now time.Time) (string, er
 			return "", fmt.Errorf("data path is not a directory: %s", paths.DataDir)
 		}
 		metadata.DataPresent = true
-		if err := copyTree(paths.DataDir, filepath.Join(backupPath, "data")); err != nil {
+		if err := copyTree(paths.DataDir, filepath.Join(stagingPath, "data")); err != nil {
 			return "", err
 		}
 	} else if !os.IsNotExist(err) {
@@ -474,7 +493,7 @@ func createBackup(paths RuntimePaths, version string, now time.Time) (string, er
 			return "", fmt.Errorf("control binary is not a regular file: %s", controlBinary)
 		}
 		metadata.ControlPresent = true
-		if err := copyFile(controlBinary, filepath.Join(backupPath, "control", "vohivectl"), 0o755); err != nil {
+		if err := copyFile(controlBinary, filepath.Join(stagingPath, "control", "vohivectl"), 0o755); err != nil {
 			return "", err
 		}
 	} else if !os.IsNotExist(err) {
@@ -482,14 +501,27 @@ func createBackup(paths RuntimePaths, version string, now time.Time) (string, er
 	}
 	if data, err := os.ReadFile(paths.DeploymentFile); err == nil {
 		metadata.DeploymentPresent = true
-		if err := atomicWriteFile(filepath.Join(backupPath, "deployment.json"), data, 0o600); err != nil {
+		if err := atomicWriteFile(filepath.Join(stagingPath, "deployment.json"), data, 0o600); err != nil {
 			return "", err
 		}
 	} else if !os.IsNotExist(err) {
 		return "", err
 	}
-	if err := atomicWriteJSON(filepath.Join(backupPath, "metadata.json"), metadata, 0o600); err != nil {
+	if err := atomicWriteJSON(filepath.Join(stagingPath, "metadata.json"), metadata, 0o600); err != nil {
 		return "", err
+	}
+	if _, err := os.Lstat(backupPath); err == nil {
+		return "", fmt.Errorf("backup already exists: %s", backupPath)
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	if err := os.Rename(stagingPath, backupPath); err != nil {
+		return "", err
+	}
+	published = true
+	if directory, err := os.Open(backupRoot); err == nil {
+		_ = directory.Sync()
+		_ = directory.Close()
 	}
 	return backupPath, nil
 }
