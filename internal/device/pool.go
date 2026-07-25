@@ -114,6 +114,7 @@ type Worker struct {
 	stop             chan struct{}
 	stopOnce         sync.Once
 	resourceStopOnce sync.Once
+	retired          atomic.Bool
 
 	cachedIP            string
 	cachedPublicIPv6    string
@@ -180,6 +181,10 @@ type Pool struct {
 	missingWorkerRetryMu      sync.Mutex
 	missingWorkerRetries      map[string]missingWorkerRetryState
 	rescanAndReconnectForTest func() error
+	rescanScheduleMu          sync.Mutex
+	rescanScheduled           bool
+	rescanPending             bool
+	rescanSources             map[string]struct{}
 
 	// SIP 注册器 (用于 CS 域语音桥接查路由)
 	sipRegistrar *sipgw.Registrar
@@ -232,6 +237,7 @@ func NewPool(cfg *config.Config) *Pool {
 		switchContexts:        make(map[string]esimSwitchContext),
 		switchTokens:          make(map[string]uint64),
 		vowifiUSSDSubs:        make(map[string]map[uint64]chan VoWiFiUSSDEvent),
+		rescanSources:         make(map[string]struct{}),
 		lifecycle:             newLifecycleCoordinator(),
 	}
 	p.transportRecovery = NewTransportRecoveryController(p)
@@ -296,6 +302,35 @@ func (p *Pool) currentWorkerGeneration(deviceID string) uint64 {
 	return generation
 }
 
+func (p *Pool) isCurrentWorker(worker *Worker) bool {
+	if p == nil || worker == nil || worker.retired.Load() {
+		return false
+	}
+	p.mu.RLock()
+	current := p.workers[worker.ID]
+	p.mu.RUnlock()
+	return current == worker
+}
+
+// acceptsWorkerCallback also permits callbacks fired during startup, after a generation
+// has been assigned but before the Worker is published in the pool.
+func (p *Pool) acceptsWorkerCallback(worker *Worker, generation uint64) bool {
+	if p == nil || worker == nil || worker.retired.Load() {
+		return false
+	}
+	if generation != 0 && worker.generation != 0 && generation != worker.generation {
+		return false
+	}
+	p.mu.RLock()
+	current := p.workers[worker.ID]
+	currentGeneration := p.workerGenerations[worker.ID]
+	p.mu.RUnlock()
+	if generation != 0 && currentGeneration != 0 && generation != currentGeneration {
+		return false
+	}
+	return current == nil || current == worker
+}
+
 func (p *Pool) registerWorkerStarting(worker *Worker) error {
 	if p == nil || worker == nil || strings.TrimSpace(worker.ID) == "" {
 		return fmt.Errorf("worker_nil")
@@ -338,6 +373,7 @@ func (p *Pool) removeWorkerRegistrationIfCurrent(worker *Worker) {
 	p.mu.Lock()
 	if current := p.workers[worker.ID]; current == worker {
 		delete(p.workers, worker.ID)
+		worker.retired.Store(true)
 	}
 	p.mu.Unlock()
 }
@@ -536,7 +572,7 @@ func (w *Worker) RefreshRuntime(ctx context.Context, reason string) error {
 	}
 
 	status := w.collectRuntimeStatus(ctx, reason)
-	healthy := w.IsDeviceHealthy()
+	healthy := w.HealthSnapshot().State == HealthStateHealthy
 
 	w.cacheMu.Lock()
 	updated := w.mergeRuntimeStateLocked(status, healthy)
@@ -708,12 +744,19 @@ func (p *Pool) bindQMIStateIndications(worker *Worker) {
 	if worker == nil || worker.QMICore == nil {
 		return
 	}
+	generation := worker.generation
 
 	worker.QMICore.OnSimStatusChanged(func() {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		logger.Info("[事件驱动] SIM 状态变化", "device", worker.ID)
 		p.handleSIMStatusEvent(worker.ID, "qmi_sim_status", nil, "")
 		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "post_switch_qmi_sim_status")
 		go func() {
+			if !p.acceptsWorkerCallback(worker, generation) {
+				return
+			}
 			if err := p.applyNetworkPreference(worker); err != nil {
 				logger.Warn("SIM 状态变化后 QMI 网络偏好协调失败", "device", worker.ID, "err", err)
 			}
@@ -725,8 +768,12 @@ func (p *Pool) bindMBIMStateIndications(worker *Worker) {
 	if worker == nil || worker.MBIMCore == nil {
 		return
 	}
+	generation := worker.generation
 
 	worker.MBIMCore.OnSimStatusChanged(func() {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		logger.Info("[事件驱动] MBIM SIM 状态变化", "device", worker.ID)
 		p.handleSIMStatusEvent(worker.ID, "mbim_sim_status", nil, "")
 		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "post_switch_mbim_sim_status")
@@ -756,7 +803,11 @@ func (p *Pool) bindMBIMSlotIndications(worker *Worker) {
 	if worker == nil || worker.MBIMCore == nil {
 		return
 	}
+	generation := worker.generation
 	worker.MBIMCore.OnSlotStatus(func(slotIndex, state uint32) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		logger.Debug("收到 MBIM 卡槽状态指示", "device", worker.ID, "slot", slotIndex, "state", state)
 		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "mbim_slot_status")
 	})
@@ -766,10 +817,17 @@ func (p *Pool) bindMBIMHealthIndications(worker *Worker) {
 	if worker == nil || worker.MBIMCore == nil {
 		return
 	}
+	generation := worker.generation
 	worker.MBIMCore.OnRecoveryExhausted(func(reason string, err error) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		p.maybeScheduleTransportRebuild(worker, HealthLayerMBIM, reason, err)
 	})
 	worker.MBIMCore.OnHealth(func(event mbimcore.HealthEvent) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		switch event.State {
 		case mbimcore.HealthEventHealthy:
 			worker.RecordWatchdogEvent(WatchdogEvent{
@@ -809,7 +867,11 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 	if worker == nil || worker.QMICore == nil {
 		return
 	}
+	generation := worker.generation
 	worker.QMICore.OnRecoveryExhausted(func(reason string, err error) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		p.maybeScheduleTransportRebuild(worker, HealthLayerQMI, reason, err)
 	})
 	worker.QMICore.OnIPChanged(func() {
@@ -825,6 +887,9 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		p.invalidatePublicIPState(worker, true)
 	})
 	worker.QMICore.OnHealthEvent(func(event qmicore.HealthEvent) {
+		if !p.acceptsWorkerCallback(worker, generation) {
+			return
+		}
 		switch event.State {
 		case qmicore.HealthEventHealthy:
 			worker.RecordWatchdogEvent(WatchdogEvent{
@@ -1072,6 +1137,7 @@ func (p *Pool) RemoveWorker(deviceID string) error {
 	alreadyRebuilding := p.rebuilding[deviceID]
 	if worker != nil {
 		delete(p.workers, deviceID)
+		worker.retired.Store(true)
 		if !alreadyRebuilding {
 			p.rebuilding[deviceID] = true
 		}
@@ -1655,7 +1721,7 @@ func (p *Pool) startAllSynchronousLegacy() error {
 
 		if qmiCore != nil {
 			qmiCore.SetOnConnect(func() {
-				if !p.isCurrentPublicIPWorker(w) {
+				if !p.acceptsWorkerCallback(w, w.generation) {
 					return
 				}
 				p.markQMIControlRecovered(w, "qmi_connected")
@@ -1673,6 +1739,9 @@ func (p *Pool) startAllSynchronousLegacy() error {
 		if backendUsesATRuntime(bMode) {
 			// 注册掉线回调：串口断开后延迟等待模块重启，然后自动重连
 			m.SetOnDisconnectWithReason(func(reason string) {
+				if !p.acceptsWorkerCallback(w, w.generation) {
+					return
+				}
 				devID := w.ID
 				if strings.TrimSpace(reason) == "" {
 					reason = "modem_disconnect"
@@ -1940,10 +2009,108 @@ func (opts rescanReconnectOptions) allowWorkerMutation(deviceID string) bool {
 	return strings.TrimSpace(deviceID) == strings.TrimSpace(opts.targetDeviceID)
 }
 
+func (p *Pool) canEvictRescanWorker(deviceID string, expected *Worker) (bool, string) {
+	if p == nil || expected == nil {
+		return false, "worker_nil"
+	}
+	if current := p.GetWorker(deviceID); current != expected {
+		return false, "worker_replaced"
+	}
+	if p.lifecycle != nil {
+		if canEvict, reason := p.lifecycle.CanEvict(deviceID, time.Now()); !canEvict {
+			return false, reason
+		}
+	}
+	return true, ""
+}
+
+func rescanHealthAllowsEviction(state HealthState) bool {
+	switch state {
+	case HealthStateInvalid, HealthStateFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 // RescanAndReconnect 重新扫描硬件设备并根据 IMEI 自动重连
 // 用于热插拔场景：设备插入后自动启动对应 Worker，设备拔出后标记离线
 func (p *Pool) RescanAndReconnect() error {
 	return p.rescanAndReconnect(rescanReconnectOptions{})
+}
+
+// scheduleRescan 合并来自健康检查、udev 等异步来源的重复重扫请求。
+// 同一批突发请求最多触发当前扫描和一次补偿扫描，避免并发扫描互相驱逐 Worker。
+func (p *Pool) scheduleRescan(source string) {
+	if p == nil {
+		return
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "unspecified"
+	}
+
+	p.rescanScheduleMu.Lock()
+	if p.rescanSources == nil {
+		p.rescanSources = make(map[string]struct{})
+	}
+	p.rescanSources[source] = struct{}{}
+	if p.rescanScheduled {
+		p.rescanPending = true
+		p.rescanScheduleMu.Unlock()
+		return
+	}
+	p.rescanScheduled = true
+	p.rescanPending = false
+	p.rescanScheduleMu.Unlock()
+
+	go p.runScheduledRescans()
+}
+
+func (p *Pool) runScheduledRescans() {
+	for {
+		p.rescanScheduleMu.Lock()
+		sources := make([]string, 0, len(p.rescanSources))
+		for source := range p.rescanSources {
+			sources = append(sources, source)
+		}
+		clear(p.rescanSources)
+		p.rescanPending = false
+		p.rescanScheduleMu.Unlock()
+
+		select {
+		case <-p.ctx.Done():
+			p.rescanScheduleMu.Lock()
+			p.rescanScheduled = false
+			p.rescanPending = false
+			clear(p.rescanSources)
+			p.rescanScheduleMu.Unlock()
+			return
+		default:
+		}
+
+		sort.Strings(sources)
+		var err error
+		if p.rescanAndReconnectForTest != nil {
+			err = p.rescanAndReconnectForTest()
+		} else {
+			err = p.RescanAndReconnect()
+		}
+		if err != nil {
+			sourceKey := strings.Join(sources, ",")
+			logger.WarnRate("scheduled_rescan_failed:"+sourceKey, time.Minute,
+				"合并设备重扫失败", "sources", sources, "err", err)
+		}
+
+		p.rescanScheduleMu.Lock()
+		if p.rescanPending || len(p.rescanSources) > 0 {
+			p.rescanScheduleMu.Unlock()
+			continue
+		}
+		p.rescanScheduled = false
+		p.rescanScheduleMu.Unlock()
+		return
+	}
 }
 
 func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex WorkerDiscoveryIndex) []CompatibleModem {
@@ -2027,8 +2194,7 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 
 	discovered, err := discoverQMIDevicesFn()
 	if err != nil {
-		logger.Warn("QMI 硬件扫描失败，将继续使用兼容扫描", "err", err)
-		discovered = nil
+		return fmt.Errorf("QMI 硬件扫描失败: %w", err)
 	}
 
 	liveWorkerIndex := BuildWorkerDiscoveryIndex(p.GetAllWorkers(), false)
@@ -2096,48 +2262,8 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 					}
 				}(md.ID)
 			}
-		} else if !worker.IsDeviceHealthy() {
-			if !opts.allowWorkerMutation(md.ID) {
-				logger.Debug("跳过非目标设备重新初始化：当前处于手动重启恢复重扫窗口",
-					"device", md.ID,
-					"target_device", opts.targetDeviceID)
-				continue
-			}
-			// Worker 存在但不健康，需要重建
-			logger.Info("检测到设备恢复，尝试重新初始化", "device", md.ID, "imei", md.ModemIMEI)
-			p.teardownVoWiFiForReconnect(md.ID)
-			if p.lifecycle != nil {
-				p.lifecycle.BeginRecovery(md.ID, LifecyclePhaseWorkerStarting, "rescan_reinitialize", qmiLifecycleRecoveryTTL)
-			}
-			_ = p.RemoveWorker(md.ID)
-			cfg := md
-			if !useQMI {
-				if hw.NetInterface != "" {
-					cfg.Interface = hw.NetInterface
-				}
-				cfg.ControlDevice = strings.TrimSpace(hw.ControlPath)
-				cfg.QMIDevice = strings.TrimSpace(hw.ControlPath)
-				cfg.ATPort = hw.ATPort
-				cfg.ManagePort = hw.ATPort
-			} else {
-				cfg = applyQMIManagedAttachment(cfg, QMIDevice{
-					ControlPath:  hw.ControlPath,
-					NetInterface: hw.NetInterface,
-					USBPath:      hw.USBPath,
-					ATPort:       hw.ATPort,
-				})
-			}
-			if _, err := p.AddWorkerFromConfig(cfg); err != nil {
-				logger.Warn("重新初始化设备失败", "device", md.ID, "err", err)
-			} else if md.VoWiFiEnabled {
-				go func(deviceID string) {
-					if err := p.enableVoWiFiWhenReady(deviceID, 5*time.Second, "device_recovery"); err != nil {
-						logger.Warn("设备恢复后自动重启 VoWiFi 失败", "device", deviceID, "err", err)
-					}
-				}(md.ID)
-			}
 		} else {
-			// Worker 存在且标记为健康
+			// Worker 已存在；重扫只处理已确认的拓扑变化，不用单次探活结果驱逐 Worker。
 			hwQMI := QMIDevice{
 				ControlPath:  hw.ControlPath,
 				NetInterface: hw.NetInterface,
@@ -2156,6 +2282,13 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 							"new_interface", hw.NetInterface)
 						continue
 					}
+					if canEvict, reason := p.canEvictRescanWorker(md.ID, worker); !canEvict {
+						logger.Debug("跳过 QMI 路径变化重建",
+							"device", md.ID,
+							"reason", reason)
+						continue
+					}
+
 					nextCfg := applyQMIManagedAttachment(md, hwQMI)
 					logger.Info("检测到 QMI 设备路径变化，重建 Worker",
 						"device", md.ID,
@@ -2187,6 +2320,19 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 			}
 			currentATPort := hw.ATPort
 			if currentATPort != "" && currentATPort != worker.Config.ATPort {
+				if !opts.allowWorkerMutation(md.ID) {
+					logger.Debug("跳过非目标设备端口变化重建：当前处于手动重启恢复重扫窗口",
+						"device", md.ID,
+						"target_device", opts.targetDeviceID)
+					continue
+				}
+				if canEvict, reason := p.canEvictRescanWorker(md.ID, worker); !canEvict {
+					logger.Debug("跳过设备端口变化重建",
+						"device", md.ID,
+						"reason", reason)
+					continue
+				}
+
 				logger.Info("检测到设备端口变化，重建 Worker",
 					"device", md.ID, "old_port", worker.Config.ATPort, "new_port", currentATPort)
 				p.teardownVoWiFiForReconnect(md.ID)
@@ -2224,18 +2370,33 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 			continue
 		}
 		worker := p.GetWorker(md.ID)
-		if worker != nil {
-			logger.Info("检测到设备离线，清理 Worker 以便后续重建",
-				"device", md.ID, "imei", md.ModemIMEI,
-				"was_healthy", worker.IsDeviceHealthy())
-			p.teardownVoWiFiForReconnect(md.ID)
-			if p.lifecycle != nil {
-				p.lifecycle.BeginRecovery(md.ID, LifecyclePhaseUSBWait, "rescan_device_missing", qmiLifecycleRecoveryTTL)
-			}
-			_ = p.RemoveWorker(md.ID)
-			if p.lifecycle != nil {
-				p.lifecycle.MarkOffline(md.ID, "rescan_device_missing")
-			}
+		if worker == nil {
+			continue
+		}
+		health := worker.HealthSnapshot()
+		if !rescanHealthAllowsEviction(health.State) {
+			logger.Debug("扫描未发现设备，但健康控制器尚未确认故障，保留 Worker",
+				"device", md.ID,
+				"health_state", health.State,
+				"health_reason", health.Reason)
+			continue
+		}
+		if canEvict, reason := p.canEvictRescanWorker(md.ID, worker); !canEvict {
+			logger.Debug("扫描未发现设备，但 Worker 当前不可驱逐",
+				"device", md.ID,
+				"reason", reason)
+			continue
+		}
+		logger.Info("检测到设备离线且健康状态已确认失败，清理 Worker 以便后续重建",
+			"device", md.ID, "imei", md.ModemIMEI,
+			"health_state", health.State)
+		p.teardownVoWiFiForReconnect(md.ID)
+		if p.lifecycle != nil {
+			p.lifecycle.BeginRecovery(md.ID, LifecyclePhaseUSBWait, "rescan_device_missing", qmiLifecycleRecoveryTTL)
+		}
+		_ = p.RemoveWorker(md.ID)
+		if p.lifecycle != nil {
+			p.lifecycle.MarkOffline(md.ID, "rescan_device_missing")
 		}
 	}
 

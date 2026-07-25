@@ -127,7 +127,7 @@ func (w *Worker) RecordWatchdogEvent(event WatchdogEvent) HealthSnapshot {
 	switch event.State {
 	case HealthStateHealthy:
 		w.state.Meta.Healthy = true
-	case HealthStateInvalid, HealthStateFailed:
+	default:
 		w.state.Meta.Healthy = false
 	}
 	w.cacheMu.Unlock()
