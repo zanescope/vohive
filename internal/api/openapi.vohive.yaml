@@ -2038,6 +2038,8 @@ components:
           type: string
         name:
           type: string
+        local_phone:
+          type: string
         interface:
           type: string
         proxy_port:
@@ -2568,6 +2570,8 @@ components:
         id:
           type: string
         name:
+          type: string
+        local_phone:
           type: string
         running:
           type: boolean

@@ -404,6 +404,7 @@ type deviceMgmtListModem struct {
 type deviceMgmtListItem struct {
 	ID                     string              `json:"id"`
 	Name                   string              `json:"name"`
+	LocalPhone             string              `json:"local_phone,omitempty"`
 	Running                bool                `json:"running"`
 	Healthy                bool                `json:"healthy"`
 	ControlOnline          bool                `json:"control_online"`
@@ -747,6 +748,11 @@ func (s *Server) handleDeviceMgmtList(c *gin.Context) {
 		cfgByID[d.ID] = d
 	}
 
+	imsiPhone := make(map[string]string)
+	if phones, err := db.GetSIMPhoneNumbersByIMSI(); err == nil {
+		imsiPhone = phones
+	}
+
 	workerByID := map[string]bool{}
 	items := make([]deviceMgmtListItem, 0, len(workers))
 	for _, w := range workers {
@@ -761,6 +767,7 @@ func (s *Server) handleDeviceMgmtList(c *gin.Context) {
 		item := deviceMgmtListItem{
 			ID:                     w.ID,
 			Name:                   cfg.Name,
+			LocalPhone:             imsiPhone[effectiveOverviewIMSI(w, status)],
 			Running:                true,
 			Healthy:                controlOnline,
 			ControlOnline:          controlOnline,

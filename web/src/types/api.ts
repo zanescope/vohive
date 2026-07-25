@@ -108,6 +108,7 @@ export type DeviceOverviewItem = {
 export type DeviceMgmtListItem = {
   id: string
   name: string
+  local_phone?: string
   running: boolean
   healthy: boolean
   control_online?: boolean
@@ -294,6 +295,7 @@ export type DiscoveredDevice = {
 export type DashboardDevice = {
   id: string
   name?: string
+  local_phone?: string
   healthy: boolean
   operator?: string
   network_mode?: string
