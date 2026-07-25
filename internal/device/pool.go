@@ -154,6 +154,7 @@ type Worker struct {
 	healthGraceUntil          time.Time
 	healthSnapshot            HealthSnapshot
 	healthSyncInFlight        atomic.Bool
+	qmiControlReady           atomic.Bool
 
 	streamSubs          atomic.Int32 // 单设备的流订阅计数器
 	uimIndicationsReady atomic.Bool  // worker 完成启动注册后才处理 UIM 事件触发的重扫/重载
@@ -184,6 +185,7 @@ type Pool struct {
 	dataConnectHandlersMu     sync.RWMutex
 	dataConnectHandlers       []func(deviceID string)
 	rescanMu                  sync.Mutex
+	startupSyncSem            chan struct{}
 	missingWorkerRetryMu      sync.Mutex
 	missingWorkerRetries      map[string]missingWorkerRetryState
 	rescanAndReconnectForTest func() error
@@ -244,6 +246,7 @@ func NewPool(cfg *config.Config) *Pool {
 		switchTokens:          make(map[string]uint64),
 		vowifiUSSDSubs:        make(map[string]map[uint64]chan VoWiFiUSSDEvent),
 		rescanSources:         make(map[string]struct{}),
+		startupSyncSem:        make(chan struct{}, startupStateSyncConcurrency),
 		lifecycle:             newLifecycleCoordinator(),
 	}
 	p.transportRecovery = NewTransportRecoveryController(p)
@@ -878,6 +881,7 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		if !p.acceptsWorkerCallback(worker, generation) {
 			return
 		}
+		worker.markQMIControlUnavailable()
 		p.maybeScheduleTransportRebuild(worker, HealthLayerQMI, reason, err)
 	})
 	worker.QMICore.OnIPChanged(func() {
@@ -898,6 +902,7 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		}
 		switch event.State {
 		case qmicore.HealthEventHealthy:
+			worker.qmiControlReady.Store(true)
 			worker.RecordWatchdogEvent(WatchdogEvent{
 				Layer:     HealthLayerQMI,
 				State:     HealthStateHealthy,
@@ -915,6 +920,7 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 				At:        event.At,
 			})
 		case qmicore.HealthEventRecovering:
+			worker.markQMIControlUnavailable()
 			recoveryUntil := time.Now().Add(qmiHealthGraceAfterReset)
 			worker.RecordWatchdogEvent(WatchdogEvent{
 				Layer:         HealthLayerQMI,
@@ -1218,7 +1224,7 @@ func (p *Pool) endRebuildAttemptIfCurrent(deviceID string, attempt uint64) {
 // 如果启动流程在 deadline 内既没有成功完成、也没有被更新的尝试取代，
 // 看门狗会作废本次 attempt 并释放 rebuilding 标记，让设备重新可以被重试或删除；
 // 调用方应在自身正常返回时 close 掉返回的 stop channel 以避免看门狗误触发日志。
-func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline time.Duration) chan struct{} {
+func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline time.Duration, cancelAttempt ...context.CancelFunc) chan struct{} {
 	stop := make(chan struct{})
 	go func() {
 		timer := time.NewTimer(deadline)
@@ -1238,6 +1244,11 @@ func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline 
 		}
 		p.mu.Unlock()
 		if isCurrent {
+			for _, cancel := range cancelAttempt {
+				if cancel != nil {
+					cancel()
+				}
+			}
 			logger.Warn("QMI worker 启动看门狗超时，作废当前 attempt 并释放 rebuilding 标记",
 				"device", deviceID,
 				"deadline", deadline.String())

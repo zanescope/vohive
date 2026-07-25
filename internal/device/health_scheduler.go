@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -9,10 +10,11 @@ import (
 )
 
 const (
-	healthCheckInterval = time.Minute
-	healthSyncOffset    = 30 * time.Second
-	healthSyncInterval  = time.Minute
-	healthSyncTimeout   = 20 * time.Second
+	healthCheckInterval   = time.Minute
+	healthSyncOffset      = 30 * time.Second
+	healthSyncInterval    = time.Minute
+	healthSyncTimeout     = 20 * time.Second
+	healthSyncConcurrency = 3
 )
 
 func runHealthTaskSafely(task func() bool) (result bool, panicValue any) {
@@ -53,7 +55,13 @@ func (p *Pool) refreshWorkerIPsSafely(worker *Worker) {
 }
 
 func (p *Pool) scheduleWorkerHealthSync(worker *Worker, sem chan struct{}) {
-	if !p.isCurrentWorker(worker) || !worker.tryBeginHealthSync() {
+	if !p.isCurrentWorker(worker) {
+		return
+	}
+	if worker.QMICore != nil && !worker.qmiControlTasksReady() {
+		return
+	}
+	if !worker.tryBeginHealthSync() {
 		return
 	}
 	select {
@@ -87,6 +95,10 @@ func (p *Pool) scheduleWorkerHealthSync(worker *Worker, sem chan struct{}) {
 			if p.isCurrentWorker(worker) {
 				logger.WarnRate("health_sync_timeout:"+worker.ID, 5*time.Minute,
 					"设备状态同步超时；释放全局槽位并保留设备单飞标记", "device", worker.ID)
+				if worker.QMICore != nil {
+					err := fmt.Errorf("QMI health sync exceeded %s", healthSyncTimeout)
+					p.requestQMICoreRecovery(worker, "qmi_health_sync_timeout", err)
+				}
 			}
 		})
 		defer timeout.Stop()

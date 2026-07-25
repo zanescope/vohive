@@ -109,7 +109,7 @@ func (p *Pool) healthCheckLoop() {
 	syncTimer := time.NewTimer(healthSyncOffset)
 	defer syncTimer.Stop()
 
-	sem := make(chan struct{}, 6)
+	sem := make(chan struct{}, healthSyncConcurrency)
 
 	for {
 		select {
@@ -276,11 +276,15 @@ func (w *Worker) PreWarmCache() {
 	if w == nil {
 		return
 	}
-	_ = w.RefreshRuntime(nil, "prewarm")
-	_ = w.RefreshIdentityLive(nil, "prewarm")
+	runtimeErr := w.RefreshRuntime(nil, "prewarm")
+	identityErr := w.RefreshIdentityLive(nil, "prewarm")
 	if w.Pool != nil {
 		w.Pool.PersistRuntimeState(w)
 		w.Pool.PersistIdentityState(w)
+	}
+	if runtimeErr != nil || identityErr != nil {
+		logger.Warn("device cold-start prewarm did not converge", "device", w.ID, "runtime_err", runtimeErr, "identity_err", identityErr)
+		return
 	}
 	logger.Info(fmt.Sprintf("[%s] 设备冷启动预热完毕", w.ID))
 }

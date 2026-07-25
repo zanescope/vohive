@@ -50,10 +50,14 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 	if !p.isCurrentWorker(worker) {
 		return false
 	}
+	layer := healthLayerForWorker(worker)
+	if layer == HealthLayerQMI && worker.QMICore != nil && !worker.qmiControlTasksReady() {
+		logger.Debug("QMI control is not ready; skipping pool health probe", "device", worker.ID)
+		return false
+	}
 	p.refreshIPs(worker, false)
 	worker.cleanupFragmentCache(30 * time.Minute)
 
-	layer := healthLayerForWorker(worker)
 	if layer == HealthLayerMBIM && worker.MBIMCore != nil {
 		// MBIM Core 自带 30 秒探活、单飞 reopen 和 exhausted 回调；池级重复探活会与它竞争控制端点。
 		return false

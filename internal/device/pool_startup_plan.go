@@ -25,7 +25,7 @@ func (p *Pool) prepareConfiguredDeviceBootstraps(devices []config.DeviceConfig) 
 		err:    err,
 	}
 	if err != nil {
-		logger.Warn("??? QMI ????????????????????", "err", err)
+		logger.Warn("startup QMI discovery failed; trying existing runtime attachments", "err", err)
 		return configuredDeviceBootstrapPlan{devices: planned, discovery: cache}
 	}
 
@@ -52,7 +52,7 @@ func (p *Pool) prepareConfiguredDeviceBootstraps(devices []config.DeviceConfig) 
 	cache.mu.Lock()
 	cache.list = append([]QMIDevice(nil), discovered...)
 	cache.mu.Unlock()
-	logger.Info("???????????",
+	logger.Info("startup hardware identity resolution completed",
 		"configured", len(devices),
 		"discovered_qmi", len(discovered),
 		"matched", len(resolved.Matched),

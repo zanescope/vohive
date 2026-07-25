@@ -52,19 +52,24 @@ func (w *Worker) requestQMICoreRecovery(reason string) bool {
 // The manager's exhausted callback remains responsible for escalating to a full
 // Worker rebuild when this cheaper recovery cannot converge.
 func (p *Pool) requestQMICoreRecoveryForTransportFailure(worker *Worker, reason string, err error) bool {
-	if p == nil || worker == nil || err == nil || !p.isCurrentWorker(worker) {
+	if err == nil || !qmiErrorIndicatesTransportDown(err.Error()) {
 		return false
 	}
-	if !qmiErrorIndicatesTransportDown(err.Error()) {
+	return p.requestQMICoreRecovery(worker, reason, err)
+}
+
+func (p *Pool) requestQMICoreRecovery(worker *Worker, reason string, err error) bool {
+	if p == nil || worker == nil || !p.isCurrentWorker(worker) {
 		return false
 	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
-		reason = "qmi_transport_down"
+		reason = "qmi_core_recovery"
 	}
 	if !worker.requestQMICoreRecovery(reason) {
 		return false
 	}
+	worker.markQMIControlUnavailable()
 
 	recoveryUntil := time.Now().Add(qmiHealthGraceAfterReset)
 	worker.markHealthRecoveryWindow(qmiHealthGraceAfterReset)
@@ -79,7 +84,7 @@ func (p *Pool) requestQMICoreRecoveryForTransportFailure(worker *Worker, reason 
 	if p.lifecycle != nil {
 		p.lifecycle.BeginRecovery(worker.ID, LifecyclePhaseRecovering, reason, qmiLifecycleRecoveryTTL)
 	}
-	logger.Info("QMI transport is down; requesting in-place core recovery first",
+	logger.Info("QMI failure detected; requesting in-place core recovery first",
 		"device", worker.ID,
 		"reason", reason,
 		"recovery_window", qmiHealthGraceAfterReset.String(),

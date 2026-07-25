@@ -1,6 +1,8 @@
 package device
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -300,5 +302,28 @@ func TestBootstrapWatchdogInvalidatesTimedOutAttemptBeforeRegistration(t *testin
 	}
 	if worker := p.GetWorker("dev1"); worker != nil {
 		t.Fatalf("timed-out startup registered worker: %#v", worker)
+	}
+}
+
+func TestStartBootstrapWatchdogCancelsTimedOutAttemptContext(t *testing.T) {
+	p := NewPool(&config.Config{})
+	defer p.cancel()
+	p.mu.Lock()
+	p.rebuilding["dev1"] = true
+	p.rebuildAttempt["dev1"] = 1
+	p.mu.Unlock()
+
+	attemptCtx, cancelAttempt := context.WithCancel(context.Background())
+	defer cancelAttempt()
+	stop := p.startBootstrapWatchdog("dev1", 1, 20*time.Millisecond, cancelAttempt)
+	defer close(stop)
+
+	select {
+	case <-attemptCtx.Done():
+		if !errors.Is(attemptCtx.Err(), context.Canceled) {
+			t.Fatalf("attempt context error = %v, want canceled", attemptCtx.Err())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not cancel the timed-out attempt context")
 	}
 }

@@ -895,7 +895,7 @@ func buildQMIManagerConfig(cfg config.DeviceConfig, device qmimanager.ModemDevic
 		},
 		RecoveryPolicy: qmimanager.RecoveryPolicy{
 			MaxRecoverElapsed:       90 * time.Second, // 核心恢复 90s 仍未收敛即放弃并重建 worker
-			ServiceTimeoutThreshold: 2,
+			ServiceTimeoutThreshold: 3,
 			ServiceTimeoutWindow:    3 * time.Minute,
 		},
 		ClientOptions: ClientOptionsFromDeviceConfig(cfg),
