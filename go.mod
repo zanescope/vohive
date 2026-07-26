@@ -19,7 +19,7 @@ require (
 	github.com/things-go/go-socks5 v0.1.1
 	github.com/vishvananda/netlink v1.3.1
 	github.com/warthog618/sms v0.3.0
-	github.com/zanescope/quectel-qmi-go v0.0.0-20260720090225-dd9e2e0318d9
+	github.com/zanescope/quectel-qmi-go v0.0.0-20260726065114-f53d9a7e82b8
 	github.com/zanescope/vowifi-go v0.0.0-20260720090131-200213131229
 	go.bug.st/serial v1.6.4
 	go.uber.org/zap v1.27.1
