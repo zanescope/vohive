@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -152,21 +153,68 @@ func configuredDevicesNeedCompatibleATDiscovery(devices []config.DeviceConfig) b
 }
 
 type qmiBootstrapDiscoveryCache struct {
-	loaded bool
-	list   []QMIDevice
-	err    error
+	mu         sync.Mutex
+	loaded     bool
+	list       []QMIDevice
+	err        error
+	identities map[string]string
 }
 
 func (c *qmiBootstrapDiscoveryCache) Get() ([]QMIDevice, error) {
 	if c == nil {
 		return discoverQMIDevicesFn()
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.loaded {
-		return c.list, c.err
+		return append([]QMIDevice(nil), c.list...), c.err
 	}
 	c.loaded = true
 	c.list, c.err = discoverQMIDevicesFn()
-	return c.list, c.err
+	return append([]QMIDevice(nil), c.list...), c.err
+}
+
+func qmiBootstrapIdentityKey(dev QMIDevice) string {
+	if key := strings.TrimSpace(dev.ControlPath); key != "" {
+		return "control:" + key
+	}
+	if key := strings.TrimSpace(dev.USBPath); key != "" {
+		return "usb:" + key
+	}
+	if key := strings.TrimSpace(dev.NetInterface); key != "" {
+		return "interface:" + key
+	}
+	return ""
+}
+
+func (c *qmiBootstrapDiscoveryCache) RememberIdentity(dev QMIDevice, imei string) {
+	if c == nil {
+		return
+	}
+	key := qmiBootstrapIdentityKey(dev)
+	if key == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.identities == nil {
+		c.identities = make(map[string]string)
+	}
+	c.identities[key] = strings.TrimSpace(imei)
+	c.mu.Unlock()
+}
+
+func (c *qmiBootstrapDiscoveryCache) Identity(dev QMIDevice) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	key := qmiBootstrapIdentityKey(dev)
+	if key == "" {
+		return "", false
+	}
+	c.mu.Lock()
+	imei, ok := c.identities[key]
+	c.mu.Unlock()
+	return imei, ok
 }
 
 func buildESIMQMITransport(cfg config.DeviceConfig, qmiCore *qmicore.Manager) (esim.QMIAPDUTransport, esim.QMIAPDUTransportLifecycle, error) {
@@ -208,6 +256,10 @@ type apduArbiterAwareTransport interface {
 }
 
 func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) {
+	return p.addWorkerFromConfig(devCfg, nil)
+}
+
+func (p *Pool) addWorkerFromConfig(devCfg config.DeviceConfig, discoveryCache *qmiBootstrapDiscoveryCache) (*Worker, error) {
 	p.mu.Lock()
 	if _, exists := p.workers[devCfg.ID]; exists {
 		p.mu.Unlock()
@@ -225,12 +277,14 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 	p.rebuilding[devCfg.ID] = true
 	attempt := p.beginRebuildAttemptLocked(devCfg.ID)
 	p.mu.Unlock()
+	attemptCtx, cancelAttempt := context.WithCancel(p.ctx)
+	defer cancelAttempt()
 
 	// 启动看门狗：如果本次启动流程因内部某次探测卡死（如 vendored QMI 库未正确
 	// 响应 context 取消）而长期不返回，强制释放 rebuilding 标记，避免设备槽位
 	// 永久无法重试或删除。正常路径下下面的 defer 会在返回前 close(watchdogStop)
 	// 让看门狗安静退出。
-	watchdogStop := p.startBootstrapWatchdog(devCfg.ID, attempt, qmiWorkerBootstrapDeadline)
+	watchdogStop := p.startBootstrapWatchdog(devCfg.ID, attempt, qmiWorkerBootstrapDeadline, cancelAttempt)
 	defer func() {
 		close(watchdogStop)
 		p.endRebuildAttemptIfCurrent(devCfg.ID, attempt)
@@ -264,7 +318,9 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 	}
 
 	var matched *QMIDevice
-	discoveryCache := &qmiBootstrapDiscoveryCache{}
+	if discoveryCache == nil {
+		discoveryCache = &qmiBootstrapDiscoveryCache{}
+	}
 	liveWorkerIndex := BuildWorkerDiscoveryIndex(p.GetAllWorkers(), false)
 	configuredIndex := BuildConfiguredDeviceIndex(config.ListDevices())
 	if !needsQMICore {
@@ -339,7 +395,12 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 					continue
 				}
 				allowQMIIMEIProbe := configuredID == ""
-				d, got := resolveDiscoveredQMIDeviceWithConfig(list[i], 1600*time.Millisecond, allowQMIIMEIProbe, devCfg)
+				d := list[i]
+				got, identityKnown := discoveryCache.Identity(d)
+				if !identityKnown {
+					d, got = resolveDiscoveredQMIDeviceWithConfig(d, 1600*time.Millisecond, allowQMIIMEIProbe, devCfg)
+					discoveryCache.RememberIdentity(d, got)
+				}
 				if got == "" || !config.IMEIMatches(got, imei) {
 					continue
 				}
@@ -399,7 +460,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 		mbimCore = mbimcore.New(devCfg.ControlDevice, config.NormalizeMBIMTransport(devCfg.MBIMTransport))
 		p.configurePublicIPProbeSources(mbimCore)
 		mbimCore.SetDataConfig(mbimcore.DataConfig{APN: devCfg.APN, Interface: devCfg.Interface, IPVersion: devCfg.IPVersion})
-		if err := mbimCore.Open(p.ctx); err != nil {
+		if err := mbimCore.Open(attemptCtx); err != nil {
 			m.Stop()
 			return nil, fmt.Errorf("MBIM 控制通道打开失败: %w", err)
 		}
@@ -487,6 +548,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 			if !p.acceptsWorkerCallback(w, w.generation) {
 				return
 			}
+			w.markQMIControlUnavailable()
 			if p.lifecycle != nil {
 				p.lifecycle.BeginRecovery(w.ID, LifecyclePhaseRecovering, "qmi_modem_reset", qmiLifecycleRecoveryTTL)
 			}
@@ -625,7 +687,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 		cleanupWorkerStartupSIMAuthLogicalChannels(w)
 	}
 
-	if !p.isRebuildAttemptCurrent(devCfg.ID, attempt) {
+	if attemptCtx.Err() != nil || !p.isRebuildAttemptCurrent(devCfg.ID, attempt) {
 		// 看门狗已判定本次启动超时，或期间已有更新的尝试在进行；放弃用这条
 		// 过期路径注册 worker，避免释放占位后迟到覆盖最新状态或突破设备上限。
 		if qmiTransportLifecycle != nil {
@@ -649,7 +711,7 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 			return nil, err
 		}
 		qmiWorkerRegistered = true
-		if err := p.startQMICoreWithStartupBudget(w, "qmi_start_core"); err != nil {
+		if err := p.startQMICoreWithStartupBudgetContext(attemptCtx, w, "qmi_start_core"); err != nil {
 			logger.Warn(fmt.Sprintf("[%s] 启动 QMI Core 失败", devCfg.ID), "err", err)
 			if qmiTransportLifecycle != nil {
 				_ = qmiTransportLifecycle.Stop()
@@ -683,8 +745,12 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 	}
 	w.uimIndicationsReady.Store(true)
 	p.scheduleATRadioWarmup(w, "startup")
+	p.startWorkerStartupSyncLoop(w)
 
 	go func(worker *Worker) {
+		if worker.QMICore != nil {
+			return
+		}
 		select {
 		case <-p.ctx.Done():
 			return
@@ -698,6 +764,9 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 	}(w)
 
 	go func(worker *Worker) {
+		if worker.QMICore != nil {
+			return
+		}
 		// QMI Core 初始化可能需要 15-30 秒（重启后甚至更久）。
 		// 使用递增延迟重试，确保数据面在 QMI Core 就绪后被建立。
 		retryDelays := []time.Duration{3 * time.Second, 5 * time.Second, 7 * time.Second, 10 * time.Second, 15 * time.Second}
@@ -737,9 +806,10 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 				switch worker.smsMode {
 				case smsModeAT:
 				case smsModeQMI:
-					if worker.QMICore != nil {
+					if worker.QMICore != nil && worker.qmiControlTasksReady() {
 						if err := worker.CheckAllSMSQMI(); err != nil {
 							logger.Warn(fmt.Sprintf("[%s] QMI 轮询短信失败", worker.ID), "err", err)
+							p.requestQMICoreRecoveryForTransportFailure(worker, "qmi_sms_poll_transport_down", err)
 						}
 					}
 				case smsModeMBIM:

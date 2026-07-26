@@ -69,6 +69,10 @@ type liveSIMMetadataReader interface {
 	GetSIMMetadataLive(ctx context.Context) (*backend.SIMMetadata, error)
 }
 
+type qmiCoreRecoveryRequester interface {
+	RequestCoreRecovery(reason string) bool
+}
+
 var publicIPLookupWait = 6 * time.Second
 
 const (
@@ -102,8 +106,10 @@ type Worker struct {
 	QMICore     *qmicore.Manager
 	MBIMCore    *mbimcore.Manager
 	netOverride NetworkController
-	APDUArbiter *apduarbiter.Arbiter
-	qmiSMS      qmiSMSCore
+	// qmiRecoveryRequester is a test seam; production workers use QMICore.
+	qmiRecoveryRequester qmiCoreRecoveryRequester
+	APDUArbiter          *apduarbiter.Arbiter
+	qmiSMS               qmiSMSCore
 	// ESIMQMITransport 仅在未创建共享 QMI Core、但 eSIM 仍需走 QMI transport 时使用。
 	// 复用 QMICore/QMI Core 场景下为 nil。
 	ESIMQMITransport esim.QMIAPDUTransportLifecycle
@@ -148,6 +154,7 @@ type Worker struct {
 	healthGraceUntil          time.Time
 	healthSnapshot            HealthSnapshot
 	healthSyncInFlight        atomic.Bool
+	qmiControlReady           atomic.Bool
 
 	streamSubs          atomic.Int32 // 单设备的流订阅计数器
 	uimIndicationsReady atomic.Bool  // worker 完成启动注册后才处理 UIM 事件触发的重扫/重载
@@ -178,6 +185,7 @@ type Pool struct {
 	dataConnectHandlersMu     sync.RWMutex
 	dataConnectHandlers       []func(deviceID string)
 	rescanMu                  sync.Mutex
+	startupSyncSem            chan struct{}
 	missingWorkerRetryMu      sync.Mutex
 	missingWorkerRetries      map[string]missingWorkerRetryState
 	rescanAndReconnectForTest func() error
@@ -238,6 +246,7 @@ func NewPool(cfg *config.Config) *Pool {
 		switchTokens:          make(map[string]uint64),
 		vowifiUSSDSubs:        make(map[string]map[uint64]chan VoWiFiUSSDEvent),
 		rescanSources:         make(map[string]struct{}),
+		startupSyncSem:        make(chan struct{}, startupStateSyncConcurrency),
 		lifecycle:             newLifecycleCoordinator(),
 	}
 	p.transportRecovery = NewTransportRecoveryController(p)
@@ -872,6 +881,7 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		if !p.acceptsWorkerCallback(worker, generation) {
 			return
 		}
+		worker.markQMIControlUnavailable()
 		p.maybeScheduleTransportRebuild(worker, HealthLayerQMI, reason, err)
 	})
 	worker.QMICore.OnIPChanged(func() {
@@ -892,6 +902,7 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		}
 		switch event.State {
 		case qmicore.HealthEventHealthy:
+			worker.qmiControlReady.Store(true)
 			worker.RecordWatchdogEvent(WatchdogEvent{
 				Layer:     HealthLayerQMI,
 				State:     HealthStateHealthy,
@@ -909,6 +920,7 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 				At:        event.At,
 			})
 		case qmicore.HealthEventRecovering:
+			worker.markQMIControlUnavailable()
 			recoveryUntil := time.Now().Add(qmiHealthGraceAfterReset)
 			worker.RecordWatchdogEvent(WatchdogEvent{
 				Layer:         HealthLayerQMI,
@@ -1212,7 +1224,7 @@ func (p *Pool) endRebuildAttemptIfCurrent(deviceID string, attempt uint64) {
 // 如果启动流程在 deadline 内既没有成功完成、也没有被更新的尝试取代，
 // 看门狗会作废本次 attempt 并释放 rebuilding 标记，让设备重新可以被重试或删除；
 // 调用方应在自身正常返回时 close 掉返回的 stop channel 以避免看门狗误触发日志。
-func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline time.Duration) chan struct{} {
+func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline time.Duration, cancelAttempt ...context.CancelFunc) chan struct{} {
 	stop := make(chan struct{})
 	go func() {
 		timer := time.NewTimer(deadline)
@@ -1232,6 +1244,11 @@ func (p *Pool) startBootstrapWatchdog(deviceID string, attempt uint64, deadline 
 		}
 		p.mu.Unlock()
 		if isCurrent {
+			for _, cancel := range cancelAttempt {
+				if cancel != nil {
+					cancel()
+				}
+			}
 			logger.Warn("QMI worker 启动看门狗超时，作废当前 attempt 并释放 rebuilding 标记",
 				"device", deviceID,
 				"deadline", deadline.String())
@@ -1405,10 +1422,10 @@ func (p *Pool) StartAll() error {
 	if p == nil || p.cfg == nil {
 		return nil
 	}
-	p.startPoolBackgroundServicesOnce()
 
 	devices := append([]config.DeviceConfig(nil), p.cfg.Devices...)
 	limit := p.FreeDeviceLimit()
+	eligible := make([]config.DeviceConfig, 0, len(devices))
 	for i := range devices {
 		devCfg := devices[i]
 		if !FreeDeviceLimitAllowsConfiguredDevice(devices, devCfg.ID, limit) {
@@ -1417,8 +1434,9 @@ func (p *Pool) StartAll() error {
 				"limit", limit)
 			continue
 		}
-		go p.startConfiguredDeviceBootstrap(devCfg, "start_all")
+		eligible = append(eligible, devCfg)
 	}
+	go p.startConfiguredDeviceBootstrapBatch(eligible)
 	return nil
 }
 
@@ -1437,6 +1455,10 @@ func (p *Pool) startPoolBackgroundServicesOnce() {
 }
 
 func (p *Pool) startConfiguredDeviceBootstrap(devCfg config.DeviceConfig, reason string) {
+	p.startConfiguredDeviceBootstrapWithDiscovery(devCfg, reason, nil)
+}
+
+func (p *Pool) startConfiguredDeviceBootstrapWithDiscovery(devCfg config.DeviceConfig, reason string, discoveryCache *qmiBootstrapDiscoveryCache) {
 	if p == nil {
 		return
 	}
@@ -1445,7 +1467,7 @@ func (p *Pool) startConfiguredDeviceBootstrap(devCfg config.DeviceConfig, reason
 		return
 	default:
 	}
-	if _, err := p.AddWorkerFromConfig(devCfg); err != nil {
+	if _, err := p.addWorkerFromConfig(devCfg, discoveryCache); err != nil {
 		logger.Warn("配置设备异步启动失败，等待健康检查或重扫恢复",
 			"device", devCfg.ID,
 			"reason", reason,
@@ -2114,6 +2136,10 @@ func (p *Pool) runScheduledRescans() {
 }
 
 func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex WorkerDiscoveryIndex) []CompatibleModem {
+	return p.collectRescanHardwareForDevices(discovered, liveWorkerIndex, config.ListDevices(), nil)
+}
+
+func (p *Pool) collectRescanHardwareForDevices(discovered []QMIDevice, liveWorkerIndex WorkerDiscoveryIndex, managed []config.DeviceConfig, discoveryCache *qmiBootstrapDiscoveryCache) []CompatibleModem {
 	var hardware []CompatibleModem
 	for i := range discovered {
 		raw := discovered[i]
@@ -2149,6 +2175,10 @@ func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex Wor
 				}
 			}
 		}
+		discovered[i] = raw
+		if discoveryCache != nil {
+			discoveryCache.RememberIdentity(raw, imei)
+		}
 		hardware = append(hardware, CompatibleModem{
 			IMEI:          imei,
 			ControlPath:   raw.ControlPath,
@@ -2160,7 +2190,6 @@ func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex Wor
 		})
 	}
 
-	managed := config.ListDevices()
 	if configuredDevicesNeedCompatibleATDiscovery(managed) {
 		if compatList, err := DiscoverCompatibleModemsFromQMI(discovered); err == nil {
 			seen := map[string]bool{}

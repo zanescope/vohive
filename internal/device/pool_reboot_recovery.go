@@ -57,6 +57,7 @@ func (p *Pool) markQMIControlRecovered(worker *Worker, reason string) {
 	if p == nil || worker == nil {
 		return
 	}
+	worker.qmiControlReady.Store(true)
 	if reason = strings.TrimSpace(reason); reason == "" {
 		reason = "qmi_control_recovered"
 	}

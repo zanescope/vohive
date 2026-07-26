@@ -54,6 +54,10 @@ func runQMIStartCoreRetryAttempt(parent context.Context, startCore func(context.
 }
 
 func (p *Pool) startQMICoreWithStartupBudget(worker *Worker, reason string) error {
+	return p.startQMICoreWithStartupBudgetContext(p.ctx, worker, reason)
+}
+
+func (p *Pool) startQMICoreWithStartupBudgetContext(parent context.Context, worker *Worker, reason string) error {
 	if worker == nil || worker.QMICore == nil {
 		return nil
 	}
@@ -61,7 +65,7 @@ func (p *Pool) startQMICoreWithStartupBudget(worker *Worker, reason string) erro
 		p.lifecycle.BeginRecovery(worker.ID, LifecyclePhaseQMIStarting, reason, qmiLifecycleRecoveryTTL)
 	}
 
-	result := runQMIStartCoreAttempt(p.ctx, worker.QMICore.StartCoreContext, qmiCoreStartupInlineBudget)
+	result := runQMIStartCoreAttempt(parent, worker.QMICore.StartCoreContext, qmiCoreStartupInlineBudget)
 	if result.err == nil {
 		cleanupWorkerStartupSIMAuthLogicalChannels(worker)
 		if _, resetErr := p.resetExistingQMIDataConnectionBeforePreference(worker, reason); resetErr != nil {

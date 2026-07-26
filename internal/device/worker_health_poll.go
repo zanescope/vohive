@@ -50,10 +50,14 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 	if !p.isCurrentWorker(worker) {
 		return false
 	}
+	layer := healthLayerForWorker(worker)
+	if layer == HealthLayerQMI && worker.QMICore != nil && !worker.qmiControlTasksReady() {
+		logger.Debug("QMI control is not ready; skipping pool health probe", "device", worker.ID)
+		return false
+	}
 	p.refreshIPs(worker, false)
 	worker.cleanupFragmentCache(30 * time.Minute)
 
-	layer := healthLayerForWorker(worker)
 	if layer == HealthLayerMBIM && worker.MBIMCore != nil {
 		// MBIM Core 自带 30 秒探活、单飞 reopen 和 exhausted 回调；池级重复探活会与它竞争控制端点。
 		return false
@@ -88,7 +92,12 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 	}
 	// 传输确认已断开（broken pipe/EOF/connection closed 等）时，重连前不可能探活成功，
 	// 没有必要再等满 3 次观察窗口——跳过等待，第一次失败就直接触发恢复。
+	// Recovery is staged: reconnect QMI Core in place first; rebuild the Worker
+	// only when the Core refuses recovery or later exhausts its recovery budget.
 	transportDown := isQMI && healthErr != nil && qmiErrorIndicatesTransportDown(healthErr.Error())
+	if transportDown && p.requestQMICoreRecoveryForTransportFailure(worker, "qmi_transport_down", healthErr) {
+		return false
+	}
 	if isQMI && strings.TrimSpace(worker.Config.ControlDevice) != "" {
 		if failures < qmiHealthFailureThreshold && !transportDown {
 			logger.Warn("QMI 节点探活失败，进入连续失败观察窗口",
