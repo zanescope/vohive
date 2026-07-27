@@ -130,6 +130,7 @@ type Worker struct {
 	publicIP            publicIPRuntime
 	transientATOnce     sync.Once
 	transientATGate     chan struct{}
+	networkMu           sync.Mutex // 串行化同一 Worker 的数据连接启停
 	rotateMu            sync.Mutex // 防止并发换 IP
 	consecutiveFailures int        // 连续切换失败次数
 
@@ -2766,9 +2767,18 @@ func (w *Worker) StartNetwork() error {
 	if w == nil {
 		return fmt.Errorf("network_not_available")
 	}
+	w.networkMu.Lock()
+	defer w.networkMu.Unlock()
+
 	nc := w.NetworkController()
 	if nc == nil {
 		return fmt.Errorf("network_not_available")
+	}
+	if nc.IsConnected() {
+		if w.Pool != nil {
+			w.Pool.refreshIPs(w, false)
+		}
+		return nil
 	}
 	if w.QMICore != nil {
 		if err := w.EnsureQMIRegistration(context.Background(), true); err != nil {
@@ -2792,6 +2802,9 @@ func (w *Worker) StopNetwork() error {
 	if w == nil {
 		return fmt.Errorf("network_not_available")
 	}
+	w.networkMu.Lock()
+	defer w.networkMu.Unlock()
+
 	nc := w.NetworkController()
 	if nc == nil {
 		return fmt.Errorf("network_not_available")

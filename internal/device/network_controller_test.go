@@ -3,6 +3,7 @@ package device
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/zanescope/vohive/internal/backend"
@@ -15,11 +16,13 @@ type fakeController struct {
 	connectedChecks         int
 	disconnectOnSecondCheck bool
 	connErr                 error
+	connectCalls            int
 	rotated                 int
 	connectHook             func()
 }
 
 func (f *fakeController) Connect() error {
+	f.connectCalls++
 	if f.connectHook != nil {
 		f.connectHook()
 	}
@@ -184,5 +187,34 @@ func TestWorkerStartNetworkEnsuresMBIMRegistrationBeforeConnect(t *testing.T) {
 	}
 	if strings.Join(events, ",") != "attach,connect" {
 		t.Fatalf("events=%v want attach before connect", events)
+	}
+}
+
+func TestWorkerStartNetworkCoalescesConcurrentCalls(t *testing.T) {
+	firstConnectStarted := make(chan struct{})
+	releaseConnect := make(chan struct{})
+	var signalFirst sync.Once
+	fc := &fakeController{connectHook: func() {
+		signalFirst.Do(func() { close(firstConnectStarted) })
+		<-releaseConnect
+	}}
+	w := &Worker{
+		netOverride: fc,
+		Config:      config.DeviceConfig{NetworkEnabled: true},
+	}
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- w.StartNetwork() }()
+	<-firstConnectStarted
+	go func() { errCh <- w.StartNetwork() }()
+	close(releaseConnect)
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("StartNetwork() error = %v", err)
+		}
+	}
+	if fc.connectCalls != 1 {
+		t.Fatalf("controller.Connect calls=%d want 1", fc.connectCalls)
 	}
 }
