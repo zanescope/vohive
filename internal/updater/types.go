@@ -224,13 +224,8 @@ func (m ReleaseManifest) Validate(releaseTag string) error {
 		"config":   {declared: m.ConfigSchema, compiled: schemacontract.Config()},
 		"database": {declared: m.DatabaseSchema, compiled: schemacontract.Database()},
 	} {
-		schema := schemas.declared
-		if schema.Min < 0 || schema.Target < schema.Min || schema.Max < schema.Target {
-			return fmt.Errorf("%s schema range must satisfy 0 <= min <= target <= max", name)
-		}
-		supported := SchemaRange{Min: schemas.compiled.Min, Target: schemas.compiled.Target, Max: schemas.compiled.Max}
-		if schema != supported {
-			return fmt.Errorf("%s schema range %+v does not match updater capability %+v", name, schema, supported)
+		if err := validateManifestSchemaCompatibility(name, schemas.declared, schemas.compiled); err != nil {
+			return err
 		}
 	}
 	if len(m.Artifacts) == 0 {
@@ -268,6 +263,22 @@ func (m ReleaseManifest) Validate(releaseTag string) error {
 	}
 	return nil
 }
+
+func validateManifestSchemaCompatibility(name string, candidate SchemaRange, current schemacontract.Range) error {
+	if candidate.Min < 0 || candidate.Target < candidate.Min || candidate.Max < candidate.Target {
+		return fmt.Errorf("%s schema range must satisfy 0 <= min <= target <= max", name)
+	}
+	if current.Target < candidate.Min || current.Target > candidate.Max {
+		return fmt.Errorf(
+			"%s schema range %+v cannot consume current schema %d",
+			name,
+			candidate,
+			current.Target,
+		)
+	}
+	return nil
+}
+
 func (m ReleaseManifest) ArtifactFor(goos, goarch string) (Artifact, error) {
 	if goarch == "arm" {
 		goarch = "armv7"
