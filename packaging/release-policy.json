@@ -3,9 +3,9 @@
   "product": "vohive",
   "repository": "zanescope/vohive",
   "container_image": "ghcr.io/zanescope/vohive",
-  "min_updater_version": "v1.6.0",
-  "min_direct_upgrade": "v1.4.0",
-  "upgrade_via": [],
+  "min_updater_version": "v1.6.3",
+  "min_direct_upgrade": "v1.6.3",
+  "upgrade_via": ["v1.6.3"],
   "config_schema": {
     "min": 0,
     "target": 1,

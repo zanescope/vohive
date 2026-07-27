@@ -41,6 +41,8 @@ func (l *feishuLogger) Error(ctx context.Context, args ...interface{}) {
 type FeishuChannel struct {
 	client         *lark.Client
 	wsClient       *larkws.Client
+	lifecycleMu    sync.Mutex
+	wsCancel       context.CancelFunc
 	chatIDs        []string
 	allowedChatIDs map[string]struct{}
 	handlers       map[string]CommandHandler
@@ -140,6 +142,52 @@ func (f *FeishuChannel) Send(text string) error {
 	return lastErr
 }
 
+func feishuMessageChatID(msg *larkim.EventMessage) string {
+	if msg == nil || msg.ChatId == nil {
+		return ""
+	}
+	return strings.TrimSpace(*msg.ChatId)
+}
+
+func (f *FeishuChannel) sendToChat(chatID, text string) error {
+	if f == nil || f.client == nil {
+		return nil
+	}
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("Feishu chat ID is empty")
+	}
+	content, _ := json.Marshal(map[string]string{"text": text})
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType("chat_id").
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(chatID).
+			MsgType("text").
+			Content(string(content)).
+			Build()).
+		Build()
+
+	resp, err := f.client.Im.Message.Create(context.Background(), req)
+	if err != nil {
+		return err
+	}
+	if !resp.Success() {
+		return fmt.Errorf("Feishu API error %d: %s", resp.Code, resp.Msg)
+	}
+	return nil
+}
+
+func (f *FeishuChannel) fallbackReplyToOrigin(msg *larkim.EventMessage, text string) {
+	chatID := feishuMessageChatID(msg)
+	if chatID == "" {
+		logger.Warn("cannot fall back to direct Feishu send: source chat ID is missing")
+		return
+	}
+	if err := f.sendToChat(chatID, text); err != nil {
+		logger.Warn("failed to send Feishu reply to source chat", "chat_id", chatID, "err", err)
+	}
+}
+
 func (f *FeishuChannel) RegisterCommand(cmd string, handler CommandHandler) {
 	if f == nil {
 		return
@@ -164,14 +212,32 @@ func (f *FeishuChannel) Start() error {
 	})
 
 	// 创建 WS 长连接客户端
-	f.wsClient = larkws.NewClient(f.cfg.AppID, f.cfg.AppSecret,
+	wsClient := larkws.NewClient(f.cfg.AppID, f.cfg.AppSecret,
 		larkws.WithEventHandler(eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
 		larkws.WithLogger(&feishuLogger{}),
 	)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	f.lifecycleMu.Lock()
+	if f.wsCancel != nil {
+		f.wsCancel()
+	}
+	f.wsClient = wsClient
+	f.wsCancel = cancel
+	f.lifecycleMu.Unlock()
 	logger.Info("飞书 Bot WebSocket 长连接启动中...")
-	err := f.wsClient.Start(context.Background())
+	err := wsClient.Start(ctx)
+	f.lifecycleMu.Lock()
+	if f.wsClient == wsClient {
+		f.wsClient = nil
+		f.wsCancel = nil
+	}
+	f.lifecycleMu.Unlock()
+	if ctx.Err() != nil {
+		logger.Info("Feishu Bot WebSocket connection stopped")
+		return nil
+	}
 	if err != nil {
 		logger.Error("飞书 Bot WebSocket 连接失败", "err", err)
 	}
@@ -290,9 +356,9 @@ func (f *FeishuChannel) acceptMessageID(messageID string, now time.Time) bool {
 
 // replyToMessage 回复飞书消息（使用 reply API）
 func (f *FeishuChannel) replyToMessage(msg *larkim.EventMessage, text string) {
-	if msg.MessageId == nil {
+	if msg == nil || msg.MessageId == nil {
 		// 无法 reply 则直接发到群聊
-		f.Send(text)
+		f.fallbackReplyToOrigin(msg, text)
 		return
 	}
 
@@ -309,18 +375,26 @@ func (f *FeishuChannel) replyToMessage(msg *larkim.EventMessage, text string) {
 	resp, err := f.client.Im.Message.Reply(context.Background(), req)
 	if err != nil {
 		logger.Warn("飞书回复消息失败，尝试直接发送", "err", err)
-		f.Send(text)
+		f.fallbackReplyToOrigin(msg, text)
 		return
 	}
 	if !resp.Success() {
 		logger.Warn("飞书回复消息失败，尝试直接发送", "code", resp.Code, "msg", resp.Msg)
-		f.Send(text)
+		f.fallbackReplyToOrigin(msg, text)
 	}
 }
 
 func (f *FeishuChannel) Close() error {
 	if f == nil {
 		return nil
+	}
+	f.lifecycleMu.Lock()
+	cancel := f.wsCancel
+	f.wsCancel = nil
+	f.wsClient = nil
+	f.lifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	// larkws.Client 没有显式的 close 方法，websocket 在 context cancel 时自动关闭
 	logger.Info("飞书 Bot 已关闭")

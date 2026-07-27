@@ -1782,8 +1782,7 @@ func (s *Server) handleEsimListProfiles(c *gin.Context) {
 		return
 	}
 	if err := enrichESIMProfileNotes(profiles); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		logger.Warn("failed to enrich eSIM profile notes; returning profiles without notes", "device", id, "err", err)
 	}
 	c.JSON(http.StatusOK, profiles)
 }
@@ -2109,8 +2108,7 @@ func (s *Server) handleEsimGetOverview(c *gin.Context) {
 	}
 
 	if err := enrichESIMProfileNotes(overview.Profiles); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		logger.Warn("failed to enrich eSIM overview notes; returning overview without notes", "device", id, "err", err)
 	}
 	c.JSON(http.StatusOK, overview)
 }

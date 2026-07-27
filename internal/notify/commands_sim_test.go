@@ -3,6 +3,8 @@ package notify
 import (
 	"strings"
 	"testing"
+
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
 func TestNormalizeFeishuCommandText(t *testing.T) {
@@ -44,5 +46,20 @@ func TestFormatCommandSIMEntries(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("formatted SIM list missing %q: %s", want, got)
 		}
+	}
+}
+
+func TestFeishuMessageChatIDUsesOnlyOriginChat(t *testing.T) {
+	chatID := " oc_origin "
+	msg := &larkim.EventMessage{ChatId: &chatID}
+	if got := feishuMessageChatID(msg); got != "oc_origin" {
+		t.Fatalf("feishuMessageChatID()=%q", got)
+	}
+	if got := feishuMessageChatID(nil); got != "" {
+		t.Fatalf("feishuMessageChatID(nil)=%q", got)
+	}
+	msg.ChatId = nil
+	if got := feishuMessageChatID(msg); got != "" {
+		t.Fatalf("feishuMessageChatID(without chat)=%q", got)
 	}
 }

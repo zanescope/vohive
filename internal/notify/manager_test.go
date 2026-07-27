@@ -398,3 +398,44 @@ func webhookConfigForTest(url, template string) config.WebhookConfig {
 		TextTemplate: template,
 	}
 }
+
+func TestResolveNotificationSIMDisplayUsesSameIdentitySnapshot(t *testing.T) {
+	phoneCalls := 0
+	noteCalls := 0
+	phone, note, phoneErr, noteErr := resolveNotificationSIMDisplay(
+		" 460001234567890 ",
+		" 8986000000000000001 ",
+		true,
+		func(imsi, iccid string) (string, error) {
+			phoneCalls++
+			if imsi != "460001234567890" || iccid != "8986000000000000001" {
+				t.Fatalf("phone lookup identity=(%q,%q)", imsi, iccid)
+			}
+			return " 13800138000 ", nil
+		},
+		func(iccid string) (string, error) {
+			noteCalls++
+			if iccid != "8986000000000000001" {
+				t.Fatalf("note lookup ICCID=%q", iccid)
+			}
+			return " primary ", nil
+		},
+	)
+	if phoneErr != nil || noteErr != nil {
+		t.Fatalf("resolve errors=(%v,%v)", phoneErr, noteErr)
+	}
+	if phone != "13800138000" || note != "primary" {
+		t.Fatalf("display=(%q,%q)", phone, note)
+	}
+	if phoneCalls != 1 || noteCalls != 1 {
+		t.Fatalf("lookup calls=(%d,%d)", phoneCalls, noteCalls)
+	}
+
+	phone, note, phoneErr, noteErr = resolveNotificationSIMDisplay("imsi", "iccid", false, func(_, _ string) (string, error) { t.Fatal("phone lookup should not run"); return "", nil }, func(string) (string, error) { t.Fatal("note lookup should not run"); return "", nil })
+	if phoneErr != nil || noteErr != nil {
+		t.Fatalf("unusable identity errors=(%v,%v)", phoneErr, noteErr)
+	}
+	if phone != unknownNotificationLocalPhone || note != "" {
+		t.Fatalf("unusable identity display=(%q,%q)", phone, note)
+	}
+}

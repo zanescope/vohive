@@ -8,7 +8,7 @@ import (
 
 func TestSIMCardNoteRoundTripPreservesIdentity(t *testing.T) {
 	database := openSchemaTestDatabase(t, "sim-note.db")
-	if err := database.AutoMigrate(&SIMCard{}); err != nil {
+	if err := database.AutoMigrate(&SIMCard{}, &SIMSubscription{}); err != nil {
 		t.Fatal(err)
 	}
 	previousDB := DB
@@ -39,6 +39,15 @@ func TestSIMCardNoteRoundTripPreservesIdentity(t *testing.T) {
 	notes, err := GetSIMCardNotes([]string{card.ICCID, card.ICCID, ""})
 	if err != nil || notes[card.ICCID] != "主卡" {
 		t.Fatalf("GetSIMCardNotes()=(%v,%v)", notes, err)
+	}
+
+	imei := "860000000000001"
+	if err := UpsertSIMCardIdentity(card.ICCID, "460009876543210", "Updated Operator", &imei); err != nil {
+		t.Fatalf("UpsertSIMCardIdentity() error=%v", err)
+	}
+	got, err = GetSIMCardNote(card.ICCID)
+	if err != nil || got != notes[card.ICCID] {
+		t.Fatalf("note after identity upsert=(%q,%v)", got, err)
 	}
 	if cleared, err := SetSIMCardNote(card.ICCID, "  "); err != nil || cleared != "" {
 		t.Fatalf("clear note=(%q,%v)", cleared, err)

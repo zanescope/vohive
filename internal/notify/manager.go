@@ -29,6 +29,7 @@ type NotificationContext struct {
 const unknownNotificationLocalPhone = "--"
 
 type notificationPhoneLookup func(imsi, iccid string) (string, error)
+type notificationSIMNoteLookup func(iccid string) (string, error)
 
 func (c NotificationContext) DeviceLabel() string {
 	id := strings.TrimSpace(c.DeviceID)
@@ -217,10 +218,11 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 		source = "蜂窝"
 	}
 	deviceName := m.resolveDeviceName(deviceID)
+	localPhone, simNote := m.resolveDeviceSIMDisplay(deviceID)
 	msg := formatSMSNotification(
 		notificationDeviceDisplayName(deviceID, deviceName),
-		m.resolveDeviceLocalPhone(deviceID),
-		m.resolveDeviceSIMNote(deviceID),
+		localPhone,
+		simNote,
 		sender,
 		content,
 		source,
@@ -282,45 +284,47 @@ func resolveNotificationLocalPhone(imsi, iccid string, identityUsable bool, look
 	return phone, nil
 }
 
-func (m *Manager) resolveDeviceLocalPhone(deviceID string) string {
+func resolveNotificationSIMDisplay(
+	imsi, iccid string,
+	identityUsable bool,
+	phoneLookup notificationPhoneLookup,
+	noteLookup notificationSIMNoteLookup,
+) (string, string, error, error) {
+	phone, phoneErr := resolveNotificationLocalPhone(imsi, iccid, identityUsable, phoneLookup)
+	if !identityUsable || noteLookup == nil {
+		return phone, "", phoneErr, nil
+	}
+	iccid = strings.TrimSpace(iccid)
+	if iccid == "" {
+		return phone, "", phoneErr, nil
+	}
+	note, noteErr := noteLookup(iccid)
+	return phone, strings.TrimSpace(note), phoneErr, noteErr
+}
+
+func (m *Manager) resolveDeviceSIMDisplay(deviceID string) (string, string) {
 	if m == nil || m.pool == nil {
-		return unknownNotificationLocalPhone
+		return unknownNotificationLocalPhone, ""
 	}
 	worker := m.pool.GetWorker(strings.TrimSpace(deviceID))
 	if worker == nil {
-		return unknownNotificationLocalPhone
+		return unknownNotificationLocalPhone, ""
 	}
 	imsi, iccid, identityUsable := worker.SIMIdentityForPhoneLookup()
-	phone, err := resolveNotificationLocalPhone(
+	phone, note, phoneErr, noteErr := resolveNotificationSIMDisplay(
 		imsi,
 		iccid,
 		identityUsable,
 		db.GetPhoneNumberByIMSIOrICCID,
+		db.GetSIMCardNote,
 	)
-	if err != nil {
-		logger.Warn("读取通知本机号码失败", "device", deviceID, "err", err)
+	if phoneErr != nil {
+		logger.Warn("failed to read local phone for notification", "device", deviceID, "err", phoneErr)
 	}
-	return phone
-}
-
-func (m *Manager) resolveDeviceSIMNote(deviceID string) string {
-	if m == nil || m.pool == nil {
-		return ""
+	if noteErr != nil {
+		logger.Warn("failed to read SIM note for notification", "device", deviceID, "err", noteErr)
 	}
-	worker := m.pool.GetWorker(strings.TrimSpace(deviceID))
-	if worker == nil {
-		return ""
-	}
-	iccid := strings.TrimSpace(worker.GetCachedDeviceStatus().ICCID)
-	if iccid == "" {
-		return ""
-	}
-	note, err := db.GetSIMCardNote(iccid)
-	if err != nil {
-		logger.Warn("读取通知 SIM 备注失败", "device", deviceID, "err", err)
-		return ""
-	}
-	return strings.TrimSpace(note)
+	return phone, note
 }
 
 // NotifyRaw 发送原始文本通知到所有渠道
