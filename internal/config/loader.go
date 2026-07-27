@@ -38,6 +38,9 @@ func loadCurrent(path string) (*Config, error) {
 	if cfg.FreeDeviceLimit < 0 {
 		return nil, fmt.Errorf("free_device_limit cannot be negative (0 means unlimited)")
 	}
+	if err := validateStartupConfig(cfg.Startup); err != nil {
+		return nil, err
+	}
 	publicIPProbe, err := loadPublicIPProbeFromYAML(path)
 	if err != nil {
 		return nil, fmt.Errorf("public_ip_probe: %w", err)

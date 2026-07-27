@@ -9,8 +9,6 @@ import (
 	"github.com/zanescope/vohive/pkg/logger"
 )
 
-const configuredDeviceBootstrapConcurrency = 2
-
 type configuredDeviceBootstrapPlan struct {
 	devices   []config.DeviceConfig
 	discovery *qmiBootstrapDiscoveryCache
@@ -107,7 +105,12 @@ func (p *Pool) startConfiguredDeviceBootstrapBatch(devices []config.DeviceConfig
 	p.rescanMu.Unlock()
 	p.startPoolBackgroundServicesOnce()
 
-	runBoundedConfiguredDeviceBootstraps(p.ctx, plan.devices, configuredDeviceBootstrapConcurrency, func(cfg config.DeviceConfig) {
+	bootstrapConcurrency := p.cfg.EffectiveWorkerBootstrapConcurrency()
+	logger.Info("starting configured worker bootstrap batch",
+		"devices", len(plan.devices),
+		"worker_bootstrap_concurrency", bootstrapConcurrency,
+		"state_sync_concurrency", cap(p.startupSyncSem))
+	runBoundedConfiguredDeviceBootstraps(p.ctx, plan.devices, bootstrapConcurrency, func(cfg config.DeviceConfig) {
 		p.startConfiguredDeviceBootstrapWithDiscovery(cfg, "start_all", plan.discovery)
 	})
 }

@@ -10,9 +10,8 @@ import (
 )
 
 const (
-	startupStateSyncConcurrency = 2
-	startupStateSyncTimeout     = 20 * time.Second
-	startupStateSyncMaxDelay    = 60 * time.Second
+	startupStateSyncTimeout  = 20 * time.Second
+	startupStateSyncMaxDelay = 60 * time.Second
 )
 
 func (w *Worker) qmiControlTasksReady() bool {

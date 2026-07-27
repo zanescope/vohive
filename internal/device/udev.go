@@ -11,6 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const kernelUeventMulticastGroup = 1
+
 // UdevWatcher 监听 USB 设备热插拔事件
 type UdevWatcher struct {
 	pool     *Pool
@@ -59,7 +61,7 @@ func (w *UdevWatcher) Stop() {
 
 func (w *UdevWatcher) loop() {
 	// 创建 netlink 连接监听内核 uevent
-	conn, err := nl.Subscribe(unix.NETLINK_KOBJECT_UEVENT)
+	conn, err := nl.Subscribe(unix.NETLINK_KOBJECT_UEVENT, kernelUeventMulticastGroup)
 	if err != nil {
 		logger.Warn("udev 监听器启动失败，热插拔功能不可用", "err", err)
 		return

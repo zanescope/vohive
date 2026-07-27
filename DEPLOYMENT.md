@@ -215,6 +215,9 @@ web:
   username: admin
   password: "由安装器生成的随机密码"
 free_device_limit: 5
+startup:
+  worker_bootstrap_concurrency: 2
+  state_sync_concurrency: 2
 vowifi:
   enabled: false
 ```
@@ -227,6 +230,7 @@ vowifi:
 | `server` | 见下文 | Web/API 监听设置。 |
 | `web` | 首次安装生成 | 管理后台账号和密码；当前 schema 不允许留空。 |
 | `free_device_limit` | `5` | 可配置设备数量上限；`0` 表示不限制，负数会拒绝启动。 |
+| `startup` | 见下方 | 启动阶段的并发限制；两个值可独立配置，允许范围均为 `1`–`8`。 |
 | `devices` | `[]` | 设备身份和后端设置，建议通过设备管理页面维护。 |
 | `proxy.instances` | `[]` | SOCKS5/HTTP 代理实例，建议通过代理管理页面维护。 |
 | `vowifi` | `enabled: false` | VoWiFi 和可选 SIP 语音网关设置。 |
@@ -242,6 +246,8 @@ vowifi:
 | `web.username` | 首次安装为 `admin` | 管理后台用户名，不能为空。 |
 | `web.password` | 随机生成 | 管理后台密码，不能为空；首次登录后应立即修改。 |
 | `free_device_limit` | `5` | 新增设备时执行并发安全的数量检查；`0` 表示不限制。 |
+| `startup.worker_bootstrap_concurrency` | `2` | 服务冷启动时并行构建 Worker、启动控制面的数量；不控制热插拔 rescan。 |
+| `startup.state_sync_concurrency` | `2` | 并行读取设备/SIM 状态并应用启动策略的数量；提高该值也会提高并发数据拨号量。 |
 
 `config_schema` 是更新器和二进制之间的兼容契约。当前版本会把旧的 schema `0` 迁移到 `1`；配置版本高于当前二进制或低于最低支持版本时会拒绝启动，防止旧版本误读新配置。不要通过手工改数字绕过兼容检查。
 

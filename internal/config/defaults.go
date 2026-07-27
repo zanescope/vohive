@@ -14,6 +14,10 @@ func DefaultConfig() Config {
 	return Config{
 		ConfigSchema:    CurrentConfigSchema,
 		FreeDeviceLimit: DefaultFreeDeviceLimit,
+		Startup: StartupConfig{
+			WorkerBootstrapConcurrency: DefaultWorkerBootstrapConcurrency,
+			StateSyncConcurrency:       DefaultStartupStateSyncConcurrency,
+		},
 		Server: ServerConfig{
 			Port: "7575",
 		},

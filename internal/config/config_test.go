@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -296,6 +297,89 @@ free_device_limit: -1
 `))
 	if err == nil || !strings.Contains(err.Error(), "free_device_limit") {
 		t.Fatalf("Load() error = %v, want free_device_limit validation error", err)
+	}
+}
+
+func TestLoadStartupConcurrency(t *testing.T) {
+	tests := []struct {
+		name          string
+		content       string
+		wantBootstrap int
+		wantSync      int
+	}{
+		{
+			name:          "defaults",
+			content:       "server:\n  port: 7575",
+			wantBootstrap: DefaultWorkerBootstrapConcurrency,
+			wantSync:      DefaultStartupStateSyncConcurrency,
+		},
+		{
+			name: "configured independently",
+			content: `
+startup:
+  worker_bootstrap_concurrency: 4
+  state_sync_concurrency: 3
+`,
+			wantBootstrap: 4,
+			wantSync:      3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Load(writeTempConfig(t, tt.content))
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if got := cfg.EffectiveWorkerBootstrapConcurrency(); got != tt.wantBootstrap {
+				t.Fatalf("worker bootstrap concurrency = %d, want %d", got, tt.wantBootstrap)
+			}
+			if got := cfg.EffectiveStartupStateSyncConcurrency(); got != tt.wantSync {
+				t.Fatalf("startup state sync concurrency = %d, want %d", got, tt.wantSync)
+			}
+		})
+	}
+}
+
+func TestLoadStartupConcurrencyFromEnvironment(t *testing.T) {
+	t.Setenv("VOHIVE_STARTUP_WORKER_BOOTSTRAP_CONCURRENCY", "6")
+	t.Setenv("VOHIVE_STARTUP_STATE_SYNC_CONCURRENCY", "4")
+	cfg, err := Load(writeTempConfig(t, "server:\n  port: 7575"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.EffectiveWorkerBootstrapConcurrency(); got != 6 {
+		t.Fatalf("worker bootstrap concurrency = %d, want 6", got)
+	}
+	if got := cfg.EffectiveStartupStateSyncConcurrency(); got != 4 {
+		t.Fatalf("startup state sync concurrency = %d, want 4", got)
+	}
+}
+
+func TestLoadRejectsStartupConcurrencyOutsideRange(t *testing.T) {
+	tests := []struct {
+		name      string
+		bootstrap int
+		sync      int
+		wantField string
+	}{
+		{name: "bootstrap_zero", bootstrap: 0, sync: 2, wantField: "startup.worker_bootstrap_concurrency"},
+		{name: "bootstrap_above_max", bootstrap: MaxStartupConcurrency + 1, sync: 2, wantField: "startup.worker_bootstrap_concurrency"},
+		{name: "sync_zero", bootstrap: 2, sync: 0, wantField: "startup.state_sync_concurrency"},
+		{name: "sync_above_max", bootstrap: 2, sync: MaxStartupConcurrency + 1, wantField: "startup.state_sync_concurrency"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(writeTempConfig(t, fmt.Sprintf(`
+startup:
+  worker_bootstrap_concurrency: %d
+  state_sync_concurrency: %d
+`, tt.bootstrap, tt.sync)))
+			if err == nil || !strings.Contains(err.Error(), tt.wantField) {
+				t.Fatalf("Load() error = %v, want %s validation error", err, tt.wantField)
+			}
+		})
 	}
 }
 

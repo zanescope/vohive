@@ -34,6 +34,14 @@ func TestStartupStateSyncDelayIsBounded(t *testing.T) {
 	}
 }
 
+func TestNewPoolUsesConfiguredStartupStateSyncConcurrency(t *testing.T) {
+	p := NewPool(&config.Config{Startup: config.StartupConfig{StateSyncConcurrency: 4}})
+	defer p.cancel()
+	if got := cap(p.startupSyncSem); got != 4 {
+		t.Fatalf("startup sync semaphore capacity = %d, want 4", got)
+	}
+}
+
 func TestHealthSyncWaitsForQMIControlReadiness(t *testing.T) {
 	p := NewPool(&config.Config{})
 	defer p.cancel()

@@ -6,16 +6,20 @@ import (
 )
 
 const (
-	ESIMTransportAT            = "at"
-	ESIMTransportQMI           = "qmi"
-	ESIMTransportMBIM          = "mbim"
-	ModuleVendorQuectel        = "quectel"
-	ModuleVendorSIMCOM         = "simcom"
-	MBIMTransportAuto          = "auto"
-	MBIMTransportProxy         = "proxy"
-	MBIMTransportDirect        = "direct"
-	DefaultFreeDeviceLimit     = 5
-	DefaultWebhookTextTemplate = "{{device_label}} {{text}}"
+	ESIMTransportAT                    = "at"
+	ESIMTransportQMI                   = "qmi"
+	ESIMTransportMBIM                  = "mbim"
+	ModuleVendorQuectel                = "quectel"
+	ModuleVendorSIMCOM                 = "simcom"
+	MBIMTransportAuto                  = "auto"
+	MBIMTransportProxy                 = "proxy"
+	MBIMTransportDirect                = "direct"
+	DefaultFreeDeviceLimit             = 5
+	DefaultWorkerBootstrapConcurrency  = 2
+	DefaultStartupStateSyncConcurrency = 2
+	MinStartupConcurrency              = 1
+	MaxStartupConcurrency              = 8
+	DefaultWebhookTextTemplate         = "{{device_label}} {{text}}"
 )
 
 func NormalizeESIMTransport(in string) string {
@@ -91,6 +95,7 @@ func ResolveIPFamily(in string) (enableV4 bool, enableV6 bool, err error) {
 type Config struct {
 	ConfigSchema    int            `mapstructure:"config_schema"`
 	FreeDeviceLimit int            `mapstructure:"free_device_limit"` // 0 means unlimited
+	Startup         StartupConfig  `mapstructure:"startup"`
 	Server          ServerConfig   `mapstructure:"server"`
 	Devices         []DeviceConfig `mapstructure:"devices"`
 	Telegram        TelegramConfig `mapstructure:"telegram"`
@@ -105,6 +110,42 @@ type Config struct {
 	Proxy         ProxyConfig         `mapstructure:"proxy"`
 	VoWiFi        VoWiFiConfig        `mapstructure:"vowifi"`
 	PublicIPProbe PublicIPProbeConfig `mapstructure:"public_ip_probe"`
+}
+
+type StartupConfig struct {
+	WorkerBootstrapConcurrency int `mapstructure:"worker_bootstrap_concurrency"`
+	StateSyncConcurrency       int `mapstructure:"state_sync_concurrency"`
+}
+
+func validateStartupConfig(startup StartupConfig) error {
+	if startup.WorkerBootstrapConcurrency < MinStartupConcurrency || startup.WorkerBootstrapConcurrency > MaxStartupConcurrency {
+		return fmt.Errorf("startup.worker_bootstrap_concurrency must be between %d and %d", MinStartupConcurrency, MaxStartupConcurrency)
+	}
+	if startup.StateSyncConcurrency < MinStartupConcurrency || startup.StateSyncConcurrency > MaxStartupConcurrency {
+		return fmt.Errorf("startup.state_sync_concurrency must be between %d and %d", MinStartupConcurrency, MaxStartupConcurrency)
+	}
+	return nil
+}
+
+func effectiveStartupConcurrency(value, fallback int) int {
+	if value < MinStartupConcurrency || value > MaxStartupConcurrency {
+		return fallback
+	}
+	return value
+}
+
+func (c *Config) EffectiveWorkerBootstrapConcurrency() int {
+	if c == nil {
+		return DefaultWorkerBootstrapConcurrency
+	}
+	return effectiveStartupConcurrency(c.Startup.WorkerBootstrapConcurrency, DefaultWorkerBootstrapConcurrency)
+}
+
+func (c *Config) EffectiveStartupStateSyncConcurrency() int {
+	if c == nil {
+		return DefaultStartupStateSyncConcurrency
+	}
+	return effectiveStartupConcurrency(c.Startup.StateSyncConcurrency, DefaultStartupStateSyncConcurrency)
 }
 
 // ProxyConfig 定义代理服务配置
