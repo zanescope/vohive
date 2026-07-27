@@ -19,3 +19,9 @@ func TestUdevWatcherKeepsIgnoringNonWWANNetEvents(t *testing.T) {
 		t.Fatal("isModemEvent() = true, want false for eth0 net event")
 	}
 }
+
+func TestKernelUeventSubscriptionUsesMulticastGroupOne(t *testing.T) {
+	if kernelUeventMulticastGroup != 1 {
+		t.Fatalf("kernel uevent multicast group=%d want 1", kernelUeventMulticastGroup)
+	}
+}
