@@ -91,7 +91,6 @@ export type DeviceOverviewItem = {
   usb_path?: string
   local_phone?: string
   local_phone_source?: PhoneNumberSource
-  sim_note?: string
   e911_setup_available?: boolean
   active_esim_profile_name?: string
   network_enabled: boolean
@@ -241,7 +240,6 @@ export type EsimEUICCInfo = {
 export type EsimProfileItem = {
   iccid: string
   name: string
-  sim_note?: string
   service_provider_name: string
   state: number
   state_text: string

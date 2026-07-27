@@ -24,7 +24,7 @@ func TestUnknownCommandReplyUsesPlainTemplate(t *testing.T) {
 	t.Parallel()
 
 	got := unknownCommandReply("badcmd")
-	want := "未知指令 / badcmd\n提示    使用 /help 查看所有支持的指令"
+	want := "未知命令 / badcmd\n提示    请检查命令名或使用 /list、/status、/send 等已注册命令"
 	if got != want {
 		t.Fatalf("unknownCommandReply() = %q, want %q", got, want)
 	}

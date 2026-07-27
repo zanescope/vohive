@@ -17,14 +17,14 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"github.com/damonto/euicc-go/bertlv"
-	"github.com/damonto/euicc-go/driver"
-	"github.com/damonto/euicc-go/lpa"
-	sgp22 "github.com/damonto/euicc-go/v2"
 	"github.com/zanescope/vohive/internal/apduarbiter"
 	backendpkg "github.com/zanescope/vohive/internal/backend"
 	"github.com/zanescope/vohive/internal/modem"
 	"github.com/zanescope/vohive/pkg/logger"
+	"github.com/damonto/euicc-go/bertlv"
+	"github.com/damonto/euicc-go/driver"
+	"github.com/damonto/euicc-go/lpa"
+	sgp22 "github.com/damonto/euicc-go/v2"
 )
 
 // 支持的 ISD-R AID 列表
@@ -235,7 +235,6 @@ func buildDiscoveredEUICCInfo(aid []byte, eidStr string) EUICCInfo {
 type ProfileItem struct {
 	ICCID               string `json:"iccid"`
 	Name                string `json:"name"`
-	SIMNote             string `json:"sim_note,omitempty"`
 	ServiceProviderName string `json:"service_provider_name"`
 	State               int    `json:"state"` // 0=disabled, 1=enabled
 	StateText           string `json:"state_text"`
