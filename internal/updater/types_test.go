@@ -3,6 +3,8 @@ package updater
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/zanescope/vohive/internal/schemacontract"
 )
 
 func validTestManifest() ReleaseManifest {
@@ -11,14 +13,18 @@ func validTestManifest() ReleaseManifest {
 		Version: "v1.6.0", Channel: ChannelStable,
 		SourceRevision:    "0123456789abcdef0123456789abcdef01234567",
 		MinUpdaterVersion: "v1.0.0", MinDirectUpgrade: "v1.4.0",
-		ConfigSchema:   SchemaRange{Min: 0, Target: 1, Max: 1},
-		DatabaseSchema: SchemaRange{Min: 0, Target: 1, Max: 1},
+		ConfigSchema:   testSchemaRange(schemacontract.Config()),
+		DatabaseSchema: testSchemaRange(schemacontract.Database()),
 		Artifacts: []Artifact{{
 			Name: "vohive_v1.6.0_linux_amd64.tar.gz", GOOS: "linux", GOARCH: "amd64",
 			SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			Size:   42, Format: "tar.gz",
 		}},
 	}
+}
+
+func testSchemaRange(schema schemacontract.Range) SchemaRange {
+	return SchemaRange{Min: schema.Min, Target: schema.Target, Max: schema.Max}
 }
 
 func TestReleaseManifestValidate(t *testing.T) {
@@ -35,8 +41,13 @@ func TestReleaseManifestValidate(t *testing.T) {
 		{"invalid updater", func(m *ReleaseManifest) { m.MinUpdaterVersion = "dev" }},
 		{"reversed config range", func(m *ReleaseManifest) { m.ConfigSchema = SchemaRange{Min: 2, Target: 1, Max: 3} }},
 		{"target above max", func(m *ReleaseManifest) { m.DatabaseSchema = SchemaRange{Min: 0, Target: 2, Max: 1} }},
-		{"config differs from compiled capability", func(m *ReleaseManifest) { m.ConfigSchema = SchemaRange{Min: 0, Target: 2, Max: 2} }},
-		{"database differs from compiled capability", func(m *ReleaseManifest) { m.DatabaseSchema = SchemaRange{Min: 1, Target: 1, Max: 1} }},
+		{"config excludes current schema", func(m *ReleaseManifest) {
+			current := schemacontract.Config().Target
+			m.ConfigSchema = SchemaRange{Min: current + 1, Target: current + 1, Max: current + 1}
+		}},
+		{"database excludes current schema", func(m *ReleaseManifest) {
+			m.DatabaseSchema = SchemaRange{Min: 0, Target: 0, Max: 0}
+		}},
 		{"invalid artifact hash", func(m *ReleaseManifest) { m.Artifacts[0].SHA256 = "not-a-hash" }},
 		{"unsafe artifact name", func(m *ReleaseManifest) { m.Artifacts[0].Name = "../vohive" }},
 	}
@@ -48,6 +59,22 @@ func TestReleaseManifestValidate(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestManifestSchemaCompatibilityAllowsForwardMigration(t *testing.T) {
+	current := schemacontract.Range{Min: 0, Target: 1, Max: 1}
+	candidate := SchemaRange{Min: 0, Target: 2, Max: 2}
+	if err := validateManifestSchemaCompatibility("database", candidate, current); err != nil {
+		t.Fatalf("forward-compatible candidate rejected: %v", err)
+	}
+}
+
+func TestManifestSchemaCompatibilityRejectsUnsupportedCurrentSchema(t *testing.T) {
+	current := schemacontract.Range{Min: 0, Target: 2, Max: 2}
+	candidate := SchemaRange{Min: 0, Target: 1, Max: 1}
+	if err := validateManifestSchemaCompatibility("database", candidate, current); err == nil {
+		t.Fatal("candidate that cannot consume the current schema was accepted")
 	}
 }
 
