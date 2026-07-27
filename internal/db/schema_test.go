@@ -35,7 +35,7 @@ func TestDatabaseMigrationRecordsSchemaAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MigrateDatabase() error=%v", err)
 	}
-	if plan.CurrentSchema != 0 || plan.TargetSchema != 1 || len(plan.Steps) != 1 {
+	if plan.CurrentSchema != 0 || plan.TargetSchema != CurrentDatabaseSchema || len(plan.Steps) != 2 {
 		t.Fatalf("unexpected plan: %+v", plan)
 	}
 	current, err := InspectDatabaseSchema(database)
@@ -43,14 +43,14 @@ func TestDatabaseMigrationRecordsSchemaAndIsIdempotent(t *testing.T) {
 		t.Fatalf("InspectDatabaseSchema()=(%d,%v), want (%d,nil)", current, err, CurrentDatabaseSchema)
 	}
 	var count int64
-	if err := database.Model(&SchemaMigration{}).Count(&count).Error; err != nil || count != 1 {
-		t.Fatalf("schema migration count=(%d,%v), want (1,nil)", count, err)
+	if err := database.Model(&SchemaMigration{}).Count(&count).Error; err != nil || count != 2 {
+		t.Fatalf("schema migration count=(%d,%v), want (2,nil)", count, err)
 	}
 	second, err := MigrateDatabase(database)
 	if err != nil || second.NeedsMigration() {
 		t.Fatalf("second MigrateDatabase()=(%+v,%v), want no-op", second, err)
 	}
-	if err := database.Model(&SchemaMigration{}).Count(&count).Error; err != nil || count != 1 {
+	if err := database.Model(&SchemaMigration{}).Count(&count).Error; err != nil || count != 2 {
 		t.Fatalf("schema migration count after no-op=(%d,%v)", count, err)
 	}
 }
@@ -96,5 +96,53 @@ func TestLegacyDatabaseMigrationPreservesExistingRows(t *testing.T) {
 	}
 	if got.Alias != want.Alias {
 		t.Fatalf("Alias=%q want %q", got.Alias, want.Alias)
+	}
+}
+
+func TestDatabaseMigration1To2AddsSIMNoteAndPreservesRows(t *testing.T) {
+	database := openSchemaTestDatabase(t, "schema-1.db")
+	if err := database.Exec(`CREATE TABLE sim_cards (
+		iccid TEXT PRIMARY KEY,
+		imsi TEXT,
+		operator TEXT,
+		current_imei TEXT,
+		reg_status INTEGER,
+		reg_status_text TEXT,
+		lac TEXT,
+		cell_id TEXT,
+		apn TEXT,
+		ims_status INTEGER,
+		last_seen DATETIME,
+		created_at DATETIME,
+		updated_at DATETIME
+	)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Exec("INSERT INTO sim_cards (iccid, imsi, operator) VALUES (?, ?, ?)", "8986000000000000001", "460001234567890", "China Mobile").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AutoMigrate(&SchemaMigration{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&SchemaMigration{Version: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := MigrateDatabase(database)
+	if err != nil {
+		t.Fatalf("MigrateDatabase() error=%v", err)
+	}
+	if plan.CurrentSchema != 1 || len(plan.Steps) != 1 || plan.Steps[0].To != 2 {
+		t.Fatalf("unexpected plan: %+v", plan)
+	}
+	if !database.Migrator().HasColumn(&SIMCard{}, "note") {
+		t.Fatal("sim_cards.note was not added")
+	}
+	var card SIMCard
+	if err := database.Where("iccid = ?", "8986000000000000001").First(&card).Error; err != nil {
+		t.Fatalf("existing SIM row missing: %v", err)
+	}
+	if card.IMSI != "460001234567890" || card.Note != "" {
+		t.Fatalf("unexpected migrated row: %+v", card)
 	}
 }

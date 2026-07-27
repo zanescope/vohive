@@ -159,6 +159,51 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /cards/{iccid}/note:
+    patch:
+      tags: [devices]
+      summary: Update a SIM card note
+      parameters:
+        - in: path
+          name: iccid
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [note]
+              properties:
+                note:
+                  type: string
+                  maxLength: 100
+                  description: Single-line note; use an empty string to clear it.
+      responses:
+        '200':
+          description: SIM note updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  iccid:
+                    type: string
+                  note:
+                    type: string
+                  message:
+                    type: string
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
   /devices/{device_id}/status:
     get:
       tags: [dashboard]
@@ -2634,6 +2679,12 @@ components:
           type: string
         audio_device:
           type: string
+        local_phone:
+          type: string
+        local_phone_source:
+          type: string
+        sim_note:
+          type: string
         sms_enabled:
           type: boolean
         network_enabled:
@@ -3019,6 +3070,8 @@ components:
         iccid:
           type: string
         name:
+          type: string
+        sim_note:
           type: string
         service_provider_name:
           type: string
