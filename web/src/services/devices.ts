@@ -55,6 +55,13 @@ type UssdResponse = {
   channel?: string
 }
 
+export type SIMNoteActionResponse = {
+  status?: string
+  iccid?: string
+  note?: string
+  message?: string
+}
+
 export type PhoneNumberActionResponse = {
   status?: string
   local_phone?: string
@@ -155,6 +162,12 @@ export const devicesService = {
   setManualPhoneNumber(id: string, manualPhoneNumber: string) {
     return callService(async () => {
       const res = await api.patch<PhoneNumberActionResponse>(`/devices/${id}/phone-number`, { manual_phone_number: manualPhoneNumber })
+      return res.data
+    })
+  },
+  setSIMNote(iccid: string, note: string) {
+    return callService(async () => {
+      const res = await api.patch<SIMNoteActionResponse>(`/cards/${encodeURIComponent(iccid)}/note`, { note })
       return res.data
     })
   },

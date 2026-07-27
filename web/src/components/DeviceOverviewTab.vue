@@ -20,6 +20,7 @@ const props = defineProps<{
   e911Starting: boolean
   phoneNumberRefreshing: boolean
   phoneNumberSaving: boolean
+  simNoteSaving: boolean
 }>()
 
 const emit = defineEmits<{
@@ -27,6 +28,7 @@ const emit = defineEmits<{
   'refresh': []
   'refresh-phone-number': []
   'edit-phone-number': []
+  'edit-sim-note': []
 }>()
 
 const showSensitive = useSensitiveVisibility()
@@ -347,6 +349,21 @@ const networkPanelMessage = computed(() => {
         <FieldRow label="IMEI"      :value="device?.modem?.imei"   :sensitive="!showSensitive" monospace copyable />
         <FieldRow label="ICCID"     :value="device?.modem?.iccid"  :sensitive="!showSensitive" monospace copyable />
         <FieldRow label="IMSI"      :value="device?.modem?.imsi"   :sensitive="!showSensitive" monospace copyable />
+        <div class="flex items-start justify-between gap-3">
+          <span class="text-gray-500 flex-shrink-0">SIM备注</span>
+          <div class="min-w-0 flex items-center justify-end gap-2 text-right">
+            <span class="break-all">{{ device?.sim_note || '--' }}</span>
+            <el-button
+              size="small"
+              link
+              :loading="simNoteSaving"
+              :disabled="!device?.modem?.iccid"
+              @click="emit('edit-sim-note')"
+            >
+              编辑
+            </el-button>
+          </div>
+        </div>
         <FieldRow label="本机号码" :value="device?.local_phone || '--'"  :sensitive="!showSensitive" monospace copyable />
         <div class="flex items-center justify-end gap-1.5">
           <el-tag v-if="phoneNumberSourceLabel" size="small" type="info" effect="plain">

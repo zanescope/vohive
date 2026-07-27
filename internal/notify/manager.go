@@ -171,6 +171,8 @@ func (m *Manager) initChannels(cfg *config.Config) error {
 func (m *Manager) registerCommands() {
 	commands := map[string]CommandHandler{
 		"send":   m.handleCmdSendSMS,
+		"sim":    m.handleCmdSIM,
+		"help":   m.handleCmdHelp,
 		"status": m.handleCmdStatus,
 		"rotate": m.handleCmdRotate,
 		"list":   m.handleCmdList,
@@ -218,6 +220,7 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 	msg := formatSMSNotification(
 		notificationDeviceDisplayName(deviceID, deviceName),
 		m.resolveDeviceLocalPhone(deviceID),
+		m.resolveDeviceSIMNote(deviceID),
 		sender,
 		content,
 		source,
@@ -239,10 +242,14 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 	})
 }
 
-func formatSMSNotification(deviceDisplayName, localPhone, sender, content, source string, timestamp time.Time) string {
+func formatSMSNotification(deviceDisplayName, localPhone, simNote, sender, content, source string, timestamp time.Time) string {
 	localPhone = strings.TrimSpace(localPhone)
 	if localPhone == "" {
 		localPhone = unknownNotificationLocalPhone
+	}
+	simNote = strings.TrimSpace(simNote)
+	if simNote != "" {
+		localPhone += " (" + simNote + ")"
 	}
 	return fmt.Sprintf("收到新短信 / %s\n设备  %s\n本机  %s\n号码  %s\n时间  %s\n内容  %s",
 		source, deviceDisplayName, localPhone, sender, timestamp.Format("2006-01-02 15:04:05"), content)
@@ -294,6 +301,26 @@ func (m *Manager) resolveDeviceLocalPhone(deviceID string) string {
 		logger.Warn("读取通知本机号码失败", "device", deviceID, "err", err)
 	}
 	return phone
+}
+
+func (m *Manager) resolveDeviceSIMNote(deviceID string) string {
+	if m == nil || m.pool == nil {
+		return ""
+	}
+	worker := m.pool.GetWorker(strings.TrimSpace(deviceID))
+	if worker == nil {
+		return ""
+	}
+	iccid := strings.TrimSpace(worker.GetCachedDeviceStatus().ICCID)
+	if iccid == "" {
+		return ""
+	}
+	note, err := db.GetSIMCardNote(iccid)
+	if err != nil {
+		logger.Warn("读取通知 SIM 备注失败", "device", deviceID, "err", err)
+		return ""
+	}
+	return strings.TrimSpace(note)
 }
 
 // NotifyRaw 发送原始文本通知到所有渠道

@@ -105,13 +105,15 @@ func TestFormatSMSNotificationIncludesLocalPhone(t *testing.T) {
 		name       string
 		source     string
 		localPhone string
+		simNote    string
 		want       string
 	}{
 		{
 			name:       "cellular known number",
 			source:     "蜂窝",
 			localPhone: " +8613900000000 ",
-			want:       "收到新短信 / 蜂窝\n设备  wwan0\n本机  +8613900000000\n号码  +8613800000000\n时间  2026-04-13 12:00:00\n内容  hello",
+			simNote:    "香港卡",
+			want:       "收到新短信 / 蜂窝\n设备  wwan0\n本机  +8613900000000 (香港卡)\n号码  +8613800000000\n时间  2026-04-13 12:00:00\n内容  hello",
 		},
 		{
 			name:   "vowifi unknown number",
@@ -121,7 +123,7 @@ func TestFormatSMSNotificationIncludesLocalPhone(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := formatSMSNotification("wwan0", tt.localPhone, "+8613800000000", "hello", tt.source, ts)
+			got := formatSMSNotification("wwan0", tt.localPhone, tt.simNote, "+8613800000000", "hello", tt.source, ts)
 			if got != tt.want {
 				t.Fatalf("formatSMSNotification()=%q, want %q", got, tt.want)
 			}

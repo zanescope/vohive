@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/zanescope/vohive/internal/config"
 	"github.com/zanescope/vohive/pkg/logger"
@@ -37,11 +39,14 @@ func (l *feishuLogger) Error(ctx context.Context, args ...interface{}) {
 // FeishuChannel 实现 Channel 接口的飞书通知渠道
 // 使用飞书开放平台 Bot + WebSocket 长连接
 type FeishuChannel struct {
-	client   *lark.Client
-	wsClient *larkws.Client
-	chatIDs  []string
-	handlers map[string]CommandHandler
-	cfg      config.FeishuConfig
+	client         *lark.Client
+	wsClient       *larkws.Client
+	chatIDs        []string
+	allowedChatIDs map[string]struct{}
+	handlers       map[string]CommandHandler
+	seenMu         sync.Mutex
+	seenMessages   map[string]time.Time
+	cfg            config.FeishuConfig
 }
 
 // NewFeishuChannel 根据配置创建飞书渠道
@@ -85,10 +90,12 @@ func NewFeishuChannel(cfg config.FeishuConfig) (*FeishuChannel, error) {
 	logger.Info("飞书 Bot 客户端已创建", "app_id", cfg.AppID)
 
 	return &FeishuChannel{
-		client:   client,
-		chatIDs:  chatIDs,
-		handlers: make(map[string]CommandHandler),
-		cfg:      cfg,
+		client:         client,
+		chatIDs:        chatIDs,
+		allowedChatIDs: seen,
+		handlers:       make(map[string]CommandHandler),
+		seenMessages:   make(map[string]time.Time),
+		cfg:            cfg,
 	}, nil
 }
 
@@ -188,36 +195,55 @@ func (f *FeishuChannel) handleMessageEvent(event *larkim.P2MessageReceiveV1) {
 	}
 
 	msg := event.Event.Message
-	msgType := msg.MessageType
-	if msgType == nil || *msgType != "text" {
-		return // 仅处理文本消息
+	if !f.isAllowedChat(msg) {
+		return
+	}
+	if msg.MessageType == nil || *msg.MessageType != "text" || msg.Content == nil {
+		return
 	}
 
-	// 解析消息内容（飞书文本消息格式：{"text":"内容"}）
 	var textContent struct {
 		Text string `json:"text"`
-	}
-	if msg.Content == nil {
-		return
 	}
 	if err := json.Unmarshal([]byte(*msg.Content), &textContent); err != nil {
 		return
 	}
 
-	text := strings.TrimSpace(textContent.Text)
-	if !strings.HasPrefix(text, "/") {
-		return // 不是命令消息
+	chatType := ""
+	if msg.ChatType != nil {
+		chatType = strings.TrimSpace(*msg.ChatType)
+	}
+	mentionKeys := make([]string, 0, len(msg.Mentions))
+	for _, mention := range msg.Mentions {
+		if mention != nil && mention.Key != nil {
+			mentionKeys = append(mentionKeys, strings.TrimSpace(*mention.Key))
+		}
+	}
+	isGroup := chatType == "group" || chatType == "topic_group"
+	text, ok := normalizeFeishuCommandText(textContent.Text, mentionKeys, isGroup)
+	if !ok {
+		return
 	}
 
-	// 解析命令和参数
 	parts := strings.Fields(text)
-	command := strings.TrimPrefix(parts[0], "/")
-	var args []string
-	if len(parts) > 1 {
-		args = parts[1:]
+	if len(parts) == 0 {
+		return
+	}
+	command := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
+	args := append([]string(nil), parts[1:]...)
+	messageID := ""
+	if msg.MessageId != nil {
+		messageID = strings.TrimSpace(*msg.MessageId)
+	}
+	if !f.acceptMessageID(messageID, time.Now()) {
+		return
 	}
 
-	logger.Info("收到飞书命令", "command", command, "args", args)
+	chatID := ""
+	if msg.ChatId != nil {
+		chatID = strings.TrimSpace(*msg.ChatId)
+	}
+	logger.Info("收到飞书指令", "command", command, "arg_count", len(args), "chat_id", chatID, "chat_type", chatType)
 
 	handler, ok := f.handlers[command]
 	if !ok {
@@ -225,15 +251,41 @@ func (f *FeishuChannel) handleMessageEvent(event *larkim.P2MessageReceiveV1) {
 		return
 	}
 
-	ctx := &feishuCommandContext{
-		channel: f,
-		msg:     msg,
-	}
-
-	response := handler(ctx, args)
-	if response != "" {
+	ctx := &feishuCommandContext{channel: f, msg: msg}
+	if response := handler(ctx, args); response != "" {
 		ctx.Reply(response)
 	}
+}
+
+func (f *FeishuChannel) isAllowedChat(msg *larkim.EventMessage) bool {
+	if f == nil || msg == nil || msg.ChatId == nil {
+		return false
+	}
+	_, ok := f.allowedChatIDs[strings.TrimSpace(*msg.ChatId)]
+	return ok
+}
+
+func (f *FeishuChannel) acceptMessageID(messageID string, now time.Time) bool {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return true
+	}
+	const ttl = 10 * time.Minute
+	f.seenMu.Lock()
+	defer f.seenMu.Unlock()
+	if f.seenMessages == nil {
+		f.seenMessages = make(map[string]time.Time)
+	}
+	for id, seenAt := range f.seenMessages {
+		if now.Sub(seenAt) > ttl {
+			delete(f.seenMessages, id)
+		}
+	}
+	if seenAt, exists := f.seenMessages[messageID]; exists && now.Sub(seenAt) <= ttl {
+		return false
+	}
+	f.seenMessages[messageID] = now
+	return true
 }
 
 // replyToMessage 回复飞书消息（使用 reply API）
