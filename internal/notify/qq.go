@@ -46,12 +46,12 @@ func NewQQChannel(cfg config.QQConfig) (*QQChannel, error) {
 		AppSecret:   strings.TrimSpace(cfg.AppSecret),
 		DefaultKind: qqbot.PlainText, // 固定为纯文本
 	}, qqbot.WithPrefix("/"), // 固定为 /，与 TG Bot 统一
-		qqbot.WithUnknownCommand(func(ctx context.Context, c qqbot.Conversation, _ qqbot.ParsedCommand) error {
+		qqbot.WithUnknownCommand(func(ctx context.Context, c qqbot.Conversation, parsed qqbot.ParsedCommand) error {
 			channel.logIncoming(c.Incoming())
 			if !channel.isAllowed(c.Incoming()) {
 				return nil
 			}
-			_, err := c.RespondText(ctx, "未知命令")
+			_, err := c.RespondText(ctx, unknownCommandReply(parsed.Name))
 			return err
 		}))
 	if err != nil {

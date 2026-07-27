@@ -262,7 +262,7 @@ func writeTestPolicy(t *testing.T, dir string) string {
   "min_direct_upgrade": "v1.4.0",
   "upgrade_via": [],
   "config_schema": {"min": 0, "target": 1, "max": 1},
-  "database_schema": {"min": 0, "target": 1, "max": 1}
+  "database_schema": {"min": 0, "target": 2, "max": 2}
 }`
 	if err := os.WriteFile(path, []byte(policy), 0o644); err != nil {
 		t.Fatal(err)
@@ -292,6 +292,6 @@ func testPolicy() releasePolicy {
 		MinDirectUpgrade:  "v1.4.0",
 		UpgradeVia:        []string{},
 		ConfigSchema:      schemaRange{Min: 0, Target: 1, Max: 1},
-		DatabaseSchema:    schemaRange{Min: 0, Target: 1, Max: 1},
+		DatabaseSchema:    schemaRange{Min: 0, Target: 2, Max: 2},
 	}
 }

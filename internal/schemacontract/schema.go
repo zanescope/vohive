@@ -16,7 +16,7 @@ const (
 	ConfigMax    = ConfigTarget
 
 	DatabaseMin    = 0
-	DatabaseTarget = 1
+	DatabaseTarget = 2
 	DatabaseMax    = DatabaseTarget
 )
 

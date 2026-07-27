@@ -367,6 +367,7 @@ type deviceMgmtOverviewLiteItem struct {
 	AudioDevice            string             `json:"audio_device,omitempty"`
 	LocalPhone             string             `json:"local_phone,omitempty"`
 	LocalPhoneSource       string             `json:"local_phone_source"`
+	SIMNote                string             `json:"sim_note,omitempty"`
 	E911SetupAvailable     bool               `json:"e911_setup_available,omitempty"`
 	ActiveESIMProfileName  string             `json:"active_esim_profile_name,omitempty"`
 	SMSEnabled             bool               `json:"sms_enabled"`
@@ -596,6 +597,7 @@ func (s *Server) buildOverviewLiteItemFromWorkerWithModem(w *device.Worker, cfg 
 		AudioDevice:            cfg.AudioDevice,
 		LocalPhone:             phoneSnapshot.PhoneNumber,
 		LocalPhoneSource:       phoneSnapshot.PhoneNumberSource,
+		SIMNote:                overviewSIMNote(status.ICCID),
 		E911SetupAvailable:     e911.SetupAvailable(modemStatus),
 		SMSEnabled:             cfg.SMSEnabled,
 		NetworkEnabled:         cfg.NetworkEnabled,
@@ -652,6 +654,7 @@ type overviewStreamEmitVersion struct {
 	Phase            string
 	TunnelReady      bool
 	IMSReady         bool
+	SIMNote          string
 	SMSReady         bool
 	LastErrorClass   string
 	Network          overviewStreamNetworkVersion
@@ -664,6 +667,7 @@ func newOverviewStreamEmitVersion(item deviceMgmtOverviewLiteItem) overviewStrea
 		LifecycleReason:  item.LifecycleReason,
 		LocalPhone:       item.LocalPhone,
 		LocalPhoneSource: item.LocalPhoneSource,
+		SIMNote:          item.SIMNote,
 	}
 	v.Network = newOverviewStreamNetworkVersion(item)
 	if item.VoWiFiRuntime != nil {
@@ -738,6 +742,14 @@ func overviewLocalPhoneSnapshot(imsi, iccid string) db.PhoneNumberSnapshot {
 		return empty
 	}
 	return snapshot
+}
+
+func overviewSIMNote(iccid string) string {
+	note, err := db.GetSIMCardNote(strings.TrimSpace(iccid))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(note)
 }
 
 func (s *Server) handleDeviceMgmtList(c *gin.Context) {
@@ -1769,6 +1781,9 @@ func (s *Server) handleEsimListProfiles(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if err := enrichESIMProfileNotes(profiles); err != nil {
+		logger.Warn("failed to enrich eSIM profile notes; returning profiles without notes", "device", id, "err", err)
+	}
 	c.JSON(http.StatusOK, profiles)
 }
 
@@ -2092,6 +2107,9 @@ func (s *Server) handleEsimGetOverview(c *gin.Context) {
 		return
 	}
 
+	if err := enrichESIMProfileNotes(overview.Profiles); err != nil {
+		logger.Warn("failed to enrich eSIM overview notes; returning overview without notes", "device", id, "err", err)
+	}
 	c.JSON(http.StatusOK, overview)
 }
 
