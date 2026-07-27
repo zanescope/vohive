@@ -75,7 +75,6 @@ const reconnectingVoWiFi = ref(false)
 const e911Starting = ref(false)
 const phoneNumberRefreshing = ref(false)
 const phoneNumberSaving = ref(false)
-const simNoteSaving = ref(false)
 const e911WebsheetOpen = ref(false)
 const e911Websheet = ref<CarrierWebsheetInfo | null>(null)
 const deleting = ref(false)
@@ -908,39 +907,6 @@ async function editLocalPhoneNumber() {
     phoneNumberSaving.value = false
   }
 }
-
-async function editSIMNote() {
-  const detail = selectedDetail.value
-  const iccid = String(detail?.modem?.iccid || '').trim()
-  if (!iccid || simNoteSaving.value) return
-  const value = await ElMessageBox.prompt(
-    '备注跟随 ICCID，可用于区分实体 SIM 和 eSIM Profile。留空可清除备注。',
-    '编辑 SIM 备注',
-    {
-      inputValue: detail?.sim_note || '',
-      inputPlaceholder: '例如：香港流量卡',
-      inputValidator: (input: string) => [...String(input || '')].length <= 100 || '备注最多 100 个字符',
-      confirmButtonText: '保存',
-      cancelButtonText: '取消'
-    }
-  ).then(({ value }) => String(value ?? '')).catch(() => null)
-  if (value === null) return
-
-  simNoteSaving.value = true
-  try {
-    const result = await devicesService.setSIMNote(iccid, value)
-    if (!result.ok) throw new Error(result.error.message || '保存 SIM 备注失败')
-    if (selectedDetail.value?.modem?.iccid === iccid) {
-      selectedDetail.value = { ...selectedDetail.value, sim_note: result.data.note || '' }
-    }
-    ElMessage.success(result.data.message || 'SIM 备注已更新')
-  } catch (e: unknown) {
-    const err = toAppError(e)
-    ElMessage.error(err.message || '保存 SIM 备注失败')
-  } finally {
-    simNoteSaving.value = false
-  }
-}
 const rebooting = ref(false)
 async function rebootModem() {
   const id = String(selectedId.value || '').trim()
@@ -1396,10 +1362,8 @@ usePollingScheduler(async () => {
                   :e911-starting="e911Starting"
                   :phone-number-refreshing="phoneNumberRefreshing"
                   :phone-number-saving="phoneNumberSaving"
-                  :sim-note-saving="simNoteSaving"
                   @refresh-phone-number="refreshLocalPhoneNumber"
                   @edit-phone-number="editLocalPhoneNumber"
-                  @edit-sim-note="editSIMNote"
                   @setup-e911="openE911Websheet"
                 />
                 <TrafficAnalysisPanel

@@ -329,7 +329,6 @@ func (s *Server) newRouter() *gin.Engine {
 		api.GET("/cards/policies", s.handleListCardPolicies)
 		api.GET("/cards/:iccid/policy", s.handleGetCardPolicy)
 		api.PUT("/cards/:iccid/policy", s.handlePutCardPolicy)
-		api.PATCH("/cards/:iccid/note", s.handlePatchSIMNote)
 
 		api.GET("/devices/:device_id/operator_selection/scan", s.handleDeviceMgmtOperatorScan)              // 扫描运营商
 		api.GET("/devices/:device_id/operator_selection/scan/stream", s.handleDeviceMgmtOperatorScanStream) // SSE 扫描运营商

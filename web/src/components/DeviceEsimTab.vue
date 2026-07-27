@@ -44,7 +44,6 @@ const profiles = ref<EsimEUICCProfiles[]>([])
 const switching = ref<string | null>(null)
 const deleting = ref<string | null>(null)
 const renaming = ref<string | null>(null)
-const noteSaving = ref<string | null>(null)
 const showSensitive = useSensitiveVisibility()
 const renameValue = ref('')
 const notifications = ref<EsimNotificationItem[]>([])
@@ -270,38 +269,6 @@ async function switchProfile(iccid: string, currentState: number, aidHex: string
 }
 
 // 开始编辑名称
-async function editSIMNote(iccid: string, currentNote: string) {
-  if (!iccid || noteSaving.value) return
-  const value = await ElMessageBox.prompt(
-    '备注跟随 ICCID，与 eSIM Profile 名称相互独立。留空可清除备注。',
-    '编辑 SIM 备注',
-    {
-      inputValue: currentNote || '',
-      inputPlaceholder: '例如：备用香港卡',
-      inputValidator: (input: string) => [...String(input || '')].length <= 100 || '备注最多 100 个字符',
-      confirmButtonText: '保存',
-      cancelButtonText: '取消'
-    }
-  ).then(({ value }) => String(value ?? '')).catch(() => null)
-  if (value === null) return
-
-  noteSaving.value = iccid
-  try {
-    const result = await devicesService.setSIMNote(iccid, value)
-    if (!result.ok) throw new Error(result.error.message || '保存 SIM 备注失败')
-    const note = result.data.note || ''
-    profiles.value = profiles.value.map((group) => ({
-      ...group,
-      profiles: group.profiles.map((profile) => profile.iccid === iccid ? { ...profile, sim_note: note } : profile)
-    }))
-    ElMessage.success(result.data.message || 'SIM 备注已更新')
-  } catch (e: unknown) {
-    ElMessage.error(errorMessage(e, '保存 SIM 备注失败'))
-  } finally {
-    noteSaving.value = null
-  }
-}
-
 function startRename(iccid: string, currentName: string) {
   renaming.value = iccid
   renameValue.value = currentName
@@ -638,7 +605,6 @@ onBeforeUnmount(() => {
               <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5 ml-4 flex flex-wrap items-center gap-x-2 gap-y-1 transition-all">
                 <span>{{ p.service_provider_name }}</span>
                 <span :class="{ 'blur-sm select-none': !showSensitive }">{{ p.iccid }}</span>
-                <span v-if="p.sim_note">备注：{{ p.sim_note }}</span>
               </div>
             </template>
             <!-- 编辑名称模式 -->
@@ -670,14 +636,6 @@ onBeforeUnmount(() => {
               plain
             >
               切换
-            </el-button>
-            <el-button
-              size="small"
-              :loading="noteSaving === p.iccid"
-              @click="editSIMNote(p.iccid, p.sim_note || '')"
-              plain
-            >
-              备注
             </el-button>
             <el-button
               size="small"

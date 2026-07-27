@@ -41,9 +41,8 @@ type Device struct {
 type SIMCard struct {
 	ICCID         string    `gorm:"column:iccid;primaryKey" json:"iccid"`
 	IMSI          string    `json:"imsi"`
-	Operator      string    `json:"operator"`     // 运营商
-	CurrentIMEI   *string   `json:"current_imei"` // 当前所在的设备
-	Note          string    `gorm:"column:note;not null;default:''" json:"note"`
+	Operator      string    `json:"operator"`        // 运营商
+	CurrentIMEI   *string   `json:"current_imei"`    // 当前所在的设备
 	RegStatus     int       `json:"reg_status"`      // 网络注册状态 (0-5)
 	RegStatusText string    `json:"reg_status_text"` // 注册状态文本
 	LAC           string    `json:"lac"`             // 位置区代码
