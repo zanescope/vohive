@@ -130,6 +130,9 @@ func ValidateYAML(data []byte) error {
 	if err := v.Unmarshal(&cfg); err != nil {
 		return fmt.Errorf("decode config: %w", err)
 	}
+	if err := validateStartupConfig(cfg.Startup); err != nil {
+		return err
+	}
 	schema, err := InspectYAML(data)
 	if err != nil {
 		return err

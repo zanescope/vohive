@@ -247,7 +247,7 @@ func NewPool(cfg *config.Config) *Pool {
 		switchTokens:          make(map[string]uint64),
 		vowifiUSSDSubs:        make(map[string]map[uint64]chan VoWiFiUSSDEvent),
 		rescanSources:         make(map[string]struct{}),
-		startupSyncSem:        make(chan struct{}, startupStateSyncConcurrency),
+		startupSyncSem:        make(chan struct{}, cfg.EffectiveStartupStateSyncConcurrency()),
 		lifecycle:             newLifecycleCoordinator(),
 	}
 	p.transportRecovery = NewTransportRecoveryController(p)
