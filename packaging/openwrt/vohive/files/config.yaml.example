@@ -13,13 +13,17 @@ vowifi:
   enabled: false
 
 # Public IP probes fall back in order, with at most four HTTPS endpoints per
-# address family. Empty lists use the built-in defaults. Mainland China users
-# may put trusted self-hosted dual-stack echo endpoints first.
+# address family. Empty lists use the built-in defaults. The third-party
+# endpoints below are commonly reachable in mainland China but have no
+# availability or compatibility guarantee; prefer trusted self-hosted endpoints
+# for production.
 # public_ip_probe:
 #   ipv4_urls:
-#     - https://your-ipv4-endpoint.example
+#     - https://4.ipw.cn
+#     - https://ipv4.ddnspod.com
 #   ipv6_urls:
-#     - https://your-ipv6-endpoint.example
+#     - https://6.ipw.cn
+#     - https://ipv6.ddnspod.com
 
 # Optional Linux host IPv4 route failover. Select ordered candidate devices in
 # Web device settings; leaving every device unchecked disables it. The primary
