@@ -355,7 +355,7 @@ devices:
 | `module_vendor` | `quectel`；可选 `quectel`、`simcom` | AT 指令方言。 |
 | `proxy_port` | `0` | 兼容的设备代理端口；新代理实例优先配置在 `proxy.instances`。 |
 | `mbim_transport` | `auto`；可选 `auto`、`proxy`、`direct` | MBIM 控制通道打开方式。 |
-| `qmi_use_proxy` | `false` | 是否通过 libqmi `qmi-proxy` 打开 QMI 控制口。 |
+| `qmi_use_proxy` | `false` | 是否通过 libqmi `qmi-proxy` 打开 QMI 控制口；它不能替代下方的 ModemManager 所有权隔离。 |
 | `qmi_proxy_path` | 空 | 自定义 qmi-proxy abstract socket 名称。 |
 | `qmi_proxy_executable` | 空 | 自定义 qmi-proxy 可执行文件路径。 |
 | `esim_transport` | `at`；可选 `at`、`qmi`、`mbim` | 兼容字段；设置 `device_backend` 时会优先从后端推导。 |
@@ -366,6 +366,78 @@ devices:
 | `baud_rate`、`data_bits`、`stop_bits`、`parity` | 设备管理页面设置 | AT 串口参数；`parity` 使用 `N`、`O` 或 `E`。 |
 
 `usb_path`、`at_port`、`manage_port`、`interface`、`qmi_device`、`control_device` 和 `audio_device` 是运行时发现结果，不会从配置文件加载，也不应手工持久化。APN、IP 版本、网络开关、飞行模式、VoWiFi 和短信策略当前按 ICCID 保存在数据库的卡策略中，不再从 `devices` 节点读取。
+
+#### ModemManager 所有权隔离
+
+同一个 QMI 控制口只能由一套设备管理栈负责。`qmi_use_proxy: true` 可以让多个 QMI 客户端共享 `qmi-proxy`，但不能让 VoHive 与 ModemManager 安全地共管同一台设备。如果 `qmi-proxy` 由 `ModemManager.service` 启动，ModemManager 崩溃、停止或重启时，systemd 可能同时清理该 proxy，导致共享它的全部 VoHive QMI 客户端收到 EOF。
+
+VoHive 会在打开实际控制口前检查占用进程的 cgroup 与父进程链。确认占用者属于 ModemManager 时会记录 `qmi_modemmanager_conflict=true` 和 `action=isolate_modemmanager_from_vohive_devices` 的非阻断告警；告警不会自动停止服务，也不会修改主机规则。
+
+**专用 VoHive 主机**
+
+如果这台主机上的蜂窝设备全部由 VoHive 管理，在维护窗口中停用并 mask ModemManager：
+
+```bash
+sudo systemctl stop vohive.service
+sudo systemctl disable --now ModemManager.service
+sudo systemctl mask ModemManager.service
+sudo systemctl start vohive.service
+```
+
+`mask` 用于阻止 ModemManager 被 D-Bus 或其他服务重新激活。需要恢复 ModemManager 时执行：
+
+```bash
+sudo systemctl stop vohive.service
+sudo systemctl unmask ModemManager.service
+sudo systemctl enable --now ModemManager.service
+```
+
+**混合用途主机**
+
+如果主机还需要 ModemManager 管理其他蜂窝设备，不要全局停用它。应只让 ModemManager 忽略交给 VoHive 的设备：
+
+1. 查询目标设备的唯一 USB 序列号和物理路径：
+
+   ```bash
+   sudo udevadm info --attribute-walk --name=/dev/cdc-wdm0
+   ```
+
+2. 创建 `/etc/udev/rules.d/78-mm-vohive.rules`。优先按唯一 `serial` 匹配；没有唯一序列号时，改用稳定的 USB 物理端口 `KERNELS`：
+
+   ```udev
+   ACTION!="add|change|move|bind", GOTO="mm_vohive_end"
+
+   # 首选：唯一 USB 序列号
+   SUBSYSTEMS=="usb", ATTRS{idVendor}=="2c7c", ATTRS{serial}=="REPLACE_WITH_UNIQUE_SERIAL", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+   # 备选：固定 USB 物理端口；启用时删除上面的 serial 规则
+   # SUBSYSTEMS=="usb", KERNELS=="1-2.3", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+   LABEL="mm_vohive_end"
+   ```
+
+   不要只按 `ATTRS{idVendor}=="2c7c"` 屏蔽，否则 ModemManager 会忽略主机上的全部 Quectel 设备。每台交给 VoHive 的设备都应有一条精确规则；规则需要对该设备关联的 `cdc-wdm` 与 `tty` 端口都生效。
+
+3. 在维护窗口应用规则。为了避免触发所有 USB 设备，优先逐台重新插拔目标设备，不要直接对全系统执行无条件 `udevadm trigger`：
+
+   ```bash
+   sudo systemctl stop vohive.service
+   sudo udevadm control --reload
+   # 逐台重新插拔交给 VoHive 的设备
+   sudo systemctl restart ModemManager.service
+   sudo systemctl start vohive.service
+   ```
+
+4. 验证目标控制口已有 ignore 标记，并确认 `mmcli -L` 不再列出这些设备：
+
+   ```bash
+   sudo udevadm info -q property -n /dev/cdc-wdm0
+   mmcli -L
+   ```
+
+   `udevadm info` 输出中应包含 `ID_MM_DEVICE_IGNORE=1`。关联的 AT/诊断端口也应检查同一标记。
+
+容器部署同样必须在宿主机完成隔离；容器内设置 `qmi_use_proxy` 无法改变宿主机的 ModemManager 所有权。规则文件命名、动作范围与设备级 ignore 标签遵循 [ModemManager 官方端口与设备检测文档](https://modemmanager.org/docs/modemmanager/port-and-device-detection/)。
 
 `devices[].esim_switch` 是高级兼容参数，零值保持原有行为：
 
