@@ -48,6 +48,11 @@ func DiscoveryClientOptionsForControlDevice(controlDevice string) (qmiq.ClientOp
 }
 
 func clientOpenModeSummary(cfg config.DeviceConfig) []any {
+	fields, _ := clientOpenModeSummaryAndDecision(cfg)
+	return fields
+}
+
+func clientOpenModeSummaryAndDecision(cfg config.DeviceConfig) ([]any, qmiTransportDecision) {
 	opts, decision := clientOptionsFromDeviceConfig(cfg)
 	controlDevice := strings.TrimSpace(cfg.ControlDevice)
 	if controlDevice == "" {
@@ -76,7 +81,17 @@ func clientOpenModeSummary(cfg config.DeviceConfig) []any {
 			"qmi_proxy_executable", opts.ProxyExecutable,
 		)
 	}
-	return fields
+	if len(decision.ModemManagerHolders) > 0 {
+		holderPIDs := make([]int, 0, len(decision.ModemManagerHolders))
+		for _, holder := range decision.ModemManagerHolders {
+			holderPIDs = append(holderPIDs, holder.PID)
+		}
+		fields = append(fields,
+			"qmi_modemmanager_conflict", true,
+			"qmi_modemmanager_holder_pids", holderPIDs,
+		)
+	}
+	return fields, decision
 }
 
 func qmiTransportName(useProxy bool) string {
@@ -92,6 +107,7 @@ type qmiTransportDecision struct {
 	HolderCount          int
 	HolderScanUnknown    bool
 	HolderScanError      string
+	ModemManagerHolders  []qmiControlDeviceHolder
 }
 
 func decideQMITransport(cfg config.DeviceConfig, backend string) qmiTransportDecision {
@@ -108,6 +124,11 @@ func decideQMITransport(cfg config.DeviceConfig, backend string) qmiTransportDec
 		} else {
 			decision.HolderCount = len(holders.Holders)
 			decision.HolderScanUnknown = holders.Unknown
+			for _, holder := range holders.Holders {
+				if holder.ModemManagerOwned {
+					decision.ModemManagerHolders = append(decision.ModemManagerHolders, holder)
+				}
+			}
 		}
 	}
 

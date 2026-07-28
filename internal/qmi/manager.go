@@ -853,7 +853,8 @@ func New(cfg config.DeviceConfig, modemDev *qmimanager.ModemDevice) *Manager {
 	qmiCfg := buildQMIManagerConfig(cfg, device)
 
 	// 创建 QMI 管理器
-	openFields := clientOpenModeSummary(cfg)
+	openFields, transportDecision := clientOpenModeSummaryAndDecision(cfg)
+	warnModemManagerQMIConflict(cfg, transportDecision)
 	if qmiCfg.ClientOptions.UseProxy {
 		logger.Info("QMI client 将优先通过 qmi-proxy 打开控制口", openFields...)
 	} else {

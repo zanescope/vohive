@@ -200,6 +200,41 @@ func TestClientOpenModeSummaryReportsProxy(t *testing.T) {
 	if got["qmi_proxy_executable"] != proxyExecutable {
 		t.Fatalf("qmi_proxy_executable=%v, want %s", got["qmi_proxy_executable"], proxyExecutable)
 	}
+	if _, ok := got["qmi_modemmanager_conflict"]; ok {
+		t.Fatalf("unexpected ModemManager conflict in ordinary proxy summary: %v", got)
+	}
+}
+
+func TestClientOpenModeSummaryReportsModemManagerConflict(t *testing.T) {
+	restore := stubQMIControlDeviceHolders(t, qmiControlDeviceHolders{
+		Holders: []qmiControlDeviceHolder{{
+			PID:                     2468,
+			Command:                 "/usr/libexec/qmi-proxy",
+			Cgroup:                  "0::/system.slice/ModemManager.service",
+			ModemManagerOwned:       true,
+			ModemManagerOwnerReason: "holder_cgroup",
+		}},
+	})
+	defer restore()
+
+	fields, decision := clientOpenModeSummaryAndDecision(config.DeviceConfig{
+		ID:            "dev-qmi",
+		ControlDevice: "/dev/cdc-wdm0",
+		DeviceBackend: "qmi",
+	})
+	got := fieldsToMap(fields)
+
+	if got["qmi_modemmanager_conflict"] != true {
+		t.Fatalf("qmi_modemmanager_conflict=%v, want true", got["qmi_modemmanager_conflict"])
+	}
+	pids, ok := got["qmi_modemmanager_holder_pids"].([]int)
+	if !ok || len(pids) != 1 || pids[0] != 2468 {
+		t.Fatalf("qmi_modemmanager_holder_pids=%v, want [2468]", got["qmi_modemmanager_holder_pids"])
+	}
+	if len(decision.ModemManagerHolders) != 1 ||
+		decision.ModemManagerHolders[0].ModemManagerOwnerReason != "holder_cgroup" {
+		t.Fatalf("decision conflicts=%+v, want one holder_cgroup", decision.ModemManagerHolders)
+	}
 }
 
 func TestClientOpenModeSummaryReportsRawMode(t *testing.T) {
