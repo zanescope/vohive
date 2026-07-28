@@ -32,7 +32,7 @@ func commandEmptyBlock(title, result string) string {
 }
 
 func unknownCommandReply(command string) string {
-	return fmt.Sprintf("未知命令 / %s\n提示    请检查命令名或使用 /list、/status、/send 等已注册命令", strings.TrimSpace(command))
+	return fmt.Sprintf("未知指令 / %s\n提示    使用 /help 查看所有支持的指令", strings.TrimSpace(command))
 }
 
 func commandValidationBlock(title string, fields ...string) string {

@@ -96,6 +96,12 @@ func PlanDatabaseMigration(database *gorm.DB) (DatabaseMigrationPlan, error) {
 				To:          1,
 				Description: "create the explicit VoHive schema and migrate legacy tables",
 			})
+		case 1:
+			plan.Steps = append(plan.Steps, DatabaseMigrationStep{
+				From:        1,
+				To:          2,
+				Description: "add ICCID-scoped SIM notes",
+			})
 		default:
 			return plan, fmt.Errorf("%w: no migration from schema %d", ErrDatabaseSchemaUnsupported, version)
 		}
@@ -116,6 +122,10 @@ func MigrateDatabase(database *gorm.DB) (DatabaseMigrationPlan, error) {
 			case 0:
 				if err := migrateDatabaseSchema0To1(tx); err != nil {
 					return fmt.Errorf("migrate database schema 0 to 1: %w", err)
+				}
+			case 1:
+				if err := migrateDatabaseSchema1To2(tx); err != nil {
+					return fmt.Errorf("migrate database schema 1 to 2: %w", err)
 				}
 			default:
 				return fmt.Errorf("%w: no migration from schema %d", ErrDatabaseSchemaUnsupported, step.From)
@@ -186,4 +196,20 @@ func migrateDatabaseSchema0To1(tx *gorm.DB) error {
 		return err
 	}
 	return RunICCIDReKeyMigration(tx)
+}
+
+func migrateDatabaseSchema1To2(tx *gorm.DB) error {
+	if tx == nil {
+		return fmt.Errorf("migrate database schema 1 to 2: nil database")
+	}
+	if !tx.Migrator().HasTable(&SIMCard{}) {
+		return tx.AutoMigrate(&SIMCard{})
+	}
+	if tx.Migrator().HasColumn(&SIMCard{}, "note") {
+		return nil
+	}
+	if err := tx.Exec("ALTER TABLE sim_cards ADD COLUMN note TEXT NOT NULL DEFAULT ''").Error; err != nil {
+		return fmt.Errorf("add sim_cards.note: %w", err)
+	}
+	return nil
 }
