@@ -25,6 +25,7 @@ func (m *Manager) handleCmdHelp(_ CommandContext, _ []string) string {
 		"",
 		"SIM 与短信",
 		"/sim [设备ID]  列出可用 SIM/eSIM 卡",
+		"/simcheck [设备ID]  检测 SIM 可用性和欠费状态",
 		"/send [设备ID] [手机号] [短信内容]  发送短信",
 		"/sms [设备ID]  查看最近短信",
 		"",

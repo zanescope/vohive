@@ -1049,11 +1049,33 @@ async function deleteDevice() {
   }
 }
 
+function nextDefaultDeviceId(): string {
+  const used = new Set(
+    devices.value
+      .map(device => String(device.id || '').trim().toLowerCase())
+      .filter(Boolean)
+  )
+  let sequence = 1
+  for (const id of used) {
+    const match = /^device(\d+)$/i.exec(id)
+    if (!match) continue
+    const parsed = Number(match[1])
+    if (Number.isSafeInteger(parsed) && parsed >= sequence) {
+      sequence = parsed + 1
+    }
+  }
+  for (;;) {
+    const candidate = `device${String(sequence).padStart(2, '0')}`
+    if (!used.has(candidate.toLowerCase())) return candidate
+    sequence += 1
+  }
+}
+
 function openAddDialog() {
   addDialogOpen.value = true
   addSelected.value = null
   addConfig.value = {
-    id: '',
+    id: nextDefaultDeviceId(),
     name: '',
     interface: '',
     modem_imei: '',

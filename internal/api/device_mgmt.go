@@ -97,9 +97,6 @@ func deviceConfigFromDTO(d deviceConfigDTO) config.DeviceConfig {
 
 func deviceConfigFromDTOWithBase(d deviceConfigDTO, base *config.DeviceConfig) config.DeviceConfig {
 	id := strings.TrimSpace(d.ID)
-	if id == "" {
-		id = strings.TrimSpace(d.Interface)
-	}
 	qmiUseProxy := false
 	qmiProxyPath := ""
 	qmiProxyExecutable := ""
@@ -144,6 +141,30 @@ func deviceConfigFromDTOWithBase(d deviceConfigDTO, base *config.DeviceConfig) c
 		VoWiFiEnabled:         d.VoWiFiEnabled,
 		DeviceBackend:         d.DeviceBackend,
 		ModuleVendor:          config.NormalizeModuleVendor(d.ModuleVendor),
+	}
+}
+
+func nextDefaultDeviceID(devices []config.DeviceConfig) string {
+	used := make(map[string]struct{}, len(devices))
+	nextSequence := 1
+	for _, device := range devices {
+		id := strings.ToLower(strings.TrimSpace(device.ID))
+		if id == "" {
+			continue
+		}
+		used[id] = struct{}{}
+		if strings.HasPrefix(id, "device") {
+			if sequence, err := strconv.Atoi(strings.TrimPrefix(id, "device")); err == nil && sequence >= nextSequence {
+				nextSequence = sequence + 1
+			}
+		}
+	}
+	for {
+		candidate := fmt.Sprintf("device%02d", nextSequence)
+		if _, exists := used[strings.ToLower(candidate)]; !exists {
+			return candidate
+		}
+		nextSequence++
 	}
 }
 
@@ -1554,12 +1575,12 @@ func (s *Server) handleDeviceMgmtAddDevice(c *gin.Context) {
 	}
 	hostNetworkBackup := req.Config.HostNetworkBackup != nil && *req.Config.HostNetworkBackup
 
+	managedDevices := config.ListDevices()
 	newCfg := deviceConfigFromDTO(req.Config)
 	newCfg = deviceConfigForAdd(newCfg)
 	newCfg, forcedWarning := normalizeManagedDeviceConfig(newCfg)
 	if strings.TrimSpace(newCfg.ID) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "必须填写 id"})
-		return
+		newCfg.ID = nextDefaultDeviceID(managedDevices)
 	}
 	if err := validateManagedNetworkConfig(newCfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
@@ -1577,7 +1598,7 @@ func (s *Server) handleDeviceMgmtAddDevice(c *gin.Context) {
 		})
 		return
 	}
-	if err := validateFreeDeviceConfigLimit(config.ListDevices(), s.pool.FreeDeviceLimit()); err != nil {
+	if err := validateFreeDeviceConfigLimit(managedDevices, s.pool.FreeDeviceLimit()); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
