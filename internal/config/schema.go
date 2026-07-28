@@ -133,6 +133,9 @@ func ValidateYAML(data []byte) error {
 	if err := validateStartupConfig(cfg.Startup); err != nil {
 		return err
 	}
+	if err := validateHostFailoverConfig(cfg.HostFailover); err != nil {
+		return err
+	}
 	schema, err := InspectYAML(data)
 	if err != nil {
 		return err

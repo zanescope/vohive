@@ -19,6 +19,12 @@ const (
 	DefaultStartupStateSyncConcurrency = 2
 	MinStartupConcurrency              = 1
 	MaxStartupConcurrency              = 8
+	DefaultHostFailoverProbeInterval   = 5
+	DefaultHostFailoverProbeTimeout    = 8
+	DefaultHostFailoverFailureCount    = 3
+	DefaultHostFailoverRecoveryCount   = 5
+	DefaultHostFailoverMinBackupTime   = 30
+	DefaultHostFailoverRouteMetric     = 5
 	DefaultWebhookTextTemplate         = "{{device_label}} {{text}}"
 )
 
@@ -93,15 +99,16 @@ func ResolveIPFamily(in string) (enableV4 bool, enableV6 bool, err error) {
 }
 
 type Config struct {
-	ConfigSchema    int            `mapstructure:"config_schema"`
-	FreeDeviceLimit int            `mapstructure:"free_device_limit"` // 0 means unlimited
-	Startup         StartupConfig  `mapstructure:"startup"`
-	Server          ServerConfig   `mapstructure:"server"`
-	Devices         []DeviceConfig `mapstructure:"devices"`
-	Telegram        TelegramConfig `mapstructure:"telegram"`
-	Feishu          FeishuConfig   `mapstructure:"feishu"`
-	QQ              QQConfig       `mapstructure:"qq"`
-	Webhook         WebhookConfig  `mapstructure:"webhook"`
+	ConfigSchema    int                `mapstructure:"config_schema"`
+	FreeDeviceLimit int                `mapstructure:"free_device_limit"` // 0 means unlimited
+	Startup         StartupConfig      `mapstructure:"startup"`
+	HostFailover    HostFailoverConfig `mapstructure:"host_network_failover"`
+	Server          ServerConfig       `mapstructure:"server"`
+	Devices         []DeviceConfig     `mapstructure:"devices"`
+	Telegram        TelegramConfig     `mapstructure:"telegram"`
+	Feishu          FeishuConfig       `mapstructure:"feishu"`
+	QQ              QQConfig           `mapstructure:"qq"`
+	Webhook         WebhookConfig      `mapstructure:"webhook"`
 
 	Bark          BarkConfig          `mapstructure:"bark"`
 	Email         EmailConfig         `mapstructure:"email"`
@@ -115,6 +122,21 @@ type Config struct {
 type StartupConfig struct {
 	WorkerBootstrapConcurrency int `mapstructure:"worker_bootstrap_concurrency"`
 	StateSyncConcurrency       int `mapstructure:"state_sync_concurrency"`
+}
+
+// HostFailoverConfig controls opt-in IPv4 default-route failover for the
+// VoHive host. CandidateDeviceIDs is ordered: the first connected candidate
+// that passes an interface-bound public probe wins. PrimaryInterface is an
+// optional override; when empty, the non-candidate default route is discovered.
+type HostFailoverConfig struct {
+	PrimaryInterface     string   `mapstructure:"primary_interface"`
+	CandidateDeviceIDs   []string `mapstructure:"candidate_device_ids"`
+	ProbeIntervalSeconds int      `mapstructure:"probe_interval_seconds"`
+	ProbeTimeoutSeconds  int      `mapstructure:"probe_timeout_seconds"`
+	FailureThreshold     int      `mapstructure:"failure_threshold"`
+	RecoveryThreshold    int      `mapstructure:"recovery_threshold"`
+	MinimumBackupSeconds int      `mapstructure:"minimum_backup_seconds"`
+	MaximumRouteMetric   int      `mapstructure:"maximum_route_metric"`
 }
 
 func validateStartupConfig(startup StartupConfig) error {

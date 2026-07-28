@@ -27,62 +27,67 @@ import (
 )
 
 type deviceConfigDTO struct {
-	ID                    string  `json:"id"`
-	Name                  string  `json:"name"`
-	ModemIMEI             string  `json:"modem_imei"`
-	USBPath               string  `json:"usb_path"`
-	ATPort                string  `json:"at_port"`
-	ProxyPort             int     `json:"proxy_port"`
-	Interface             string  `json:"interface"`
-	ControlDevice         string  `json:"control_device,omitempty"`
-	QMIUseProxy           *bool   `json:"qmi_use_proxy,omitempty"`
-	QMIProxyPath          *string `json:"qmi_proxy_path,omitempty"`
-	QMIProxyExecutable    *string `json:"qmi_proxy_executable,omitempty"`
-	ESIMTransport         string  `json:"esim_transport,omitempty"`
-	BaudRate              int     `json:"baud_rate,omitempty"`
-	DataBits              int     `json:"data_bits,omitempty"`
-	StopBits              int     `json:"stop_bits,omitempty"`
-	Parity                string  `json:"parity,omitempty"`
-	OperatorSelectionMode string  `json:"operator_selection_mode,omitempty"`
-	OperatorSelectionPLMN string  `json:"operator_selection_plmn,omitempty"`
-	OperatorSelectionRAT  string  `json:"operator_selection_rat,omitempty"`
-	SMSEnabled            bool    `json:"sms_enabled"`
-	APN                   string  `json:"apn,omitempty"`
-	IPVersion             string  `json:"ip_version,omitempty"`
-	NetworkEnabled        bool    `json:"network_enabled"`
-	VoWiFiEnabled         bool    `json:"vowifi_enabled"`
-	DeviceBackend         string  `json:"device_backend,omitempty"`
-	ModuleVendor          string  `json:"module_vendor,omitempty"`
+	ID                        string  `json:"id"`
+	Name                      string  `json:"name"`
+	ModemIMEI                 string  `json:"modem_imei"`
+	USBPath                   string  `json:"usb_path"`
+	ATPort                    string  `json:"at_port"`
+	ProxyPort                 int     `json:"proxy_port"`
+	Interface                 string  `json:"interface"`
+	ControlDevice             string  `json:"control_device,omitempty"`
+	QMIUseProxy               *bool   `json:"qmi_use_proxy,omitempty"`
+	QMIProxyPath              *string `json:"qmi_proxy_path,omitempty"`
+	QMIProxyExecutable        *string `json:"qmi_proxy_executable,omitempty"`
+	ESIMTransport             string  `json:"esim_transport,omitempty"`
+	BaudRate                  int     `json:"baud_rate,omitempty"`
+	DataBits                  int     `json:"data_bits,omitempty"`
+	StopBits                  int     `json:"stop_bits,omitempty"`
+	Parity                    string  `json:"parity,omitempty"`
+	OperatorSelectionMode     string  `json:"operator_selection_mode,omitempty"`
+	OperatorSelectionPLMN     string  `json:"operator_selection_plmn,omitempty"`
+	OperatorSelectionRAT      string  `json:"operator_selection_rat,omitempty"`
+	SMSEnabled                bool    `json:"sms_enabled"`
+	APN                       string  `json:"apn,omitempty"`
+	IPVersion                 string  `json:"ip_version,omitempty"`
+	NetworkEnabled            bool    `json:"network_enabled"`
+	VoWiFiEnabled             bool    `json:"vowifi_enabled"`
+	DeviceBackend             string  `json:"device_backend,omitempty"`
+	ModuleVendor              string  `json:"module_vendor,omitempty"`
+	HostNetworkBackup         *bool   `json:"host_network_backup,omitempty"`
+	HostNetworkBackupPriority int     `json:"host_network_backup_priority,omitempty"`
 }
 
 func deviceConfigToDTO(c config.DeviceConfig) deviceConfigDTO {
+	hostNetworkBackupPriority := config.GetConfig().HostFailover.CandidatePosition(c.ID)
 	return deviceConfigDTO{
-		ID:                    c.ID,
-		Name:                  c.Name,
-		ModemIMEI:             c.ModemIMEI,
-		USBPath:               c.USBPath,
-		ATPort:                c.ATPort,
-		ProxyPort:             c.ProxyPort,
-		Interface:             c.Interface,
-		ControlDevice:         c.ControlDevice,
-		QMIUseProxy:           boolPtr(c.QMIUseProxy),
-		QMIProxyPath:          stringPtr(c.QMIProxyPath),
-		QMIProxyExecutable:    stringPtr(c.QMIProxyExecutable),
-		ESIMTransport:         config.NormalizeESIMTransport(c.ESIMTransport),
-		BaudRate:              c.BaudRate,
-		DataBits:              c.DataBits,
-		StopBits:              c.StopBits,
-		Parity:                c.Parity,
-		OperatorSelectionMode: c.OperatorSelectionMode,
-		OperatorSelectionPLMN: c.OperatorSelectionPLMN,
-		OperatorSelectionRAT:  c.OperatorSelectionRAT,
-		SMSEnabled:            c.SMSEnabled,
-		APN:                   c.APN,
-		IPVersion:             c.IPVersion,
-		NetworkEnabled:        c.NetworkEnabled,
-		VoWiFiEnabled:         c.VoWiFiEnabled,
-		DeviceBackend:         c.DeviceBackend,
-		ModuleVendor:          config.NormalizeModuleVendor(c.ModuleVendor),
+		ID:                        c.ID,
+		Name:                      c.Name,
+		ModemIMEI:                 c.ModemIMEI,
+		USBPath:                   c.USBPath,
+		ATPort:                    c.ATPort,
+		ProxyPort:                 c.ProxyPort,
+		Interface:                 c.Interface,
+		ControlDevice:             c.ControlDevice,
+		QMIUseProxy:               boolPtr(c.QMIUseProxy),
+		QMIProxyPath:              stringPtr(c.QMIProxyPath),
+		QMIProxyExecutable:        stringPtr(c.QMIProxyExecutable),
+		ESIMTransport:             config.NormalizeESIMTransport(c.ESIMTransport),
+		BaudRate:                  c.BaudRate,
+		DataBits:                  c.DataBits,
+		StopBits:                  c.StopBits,
+		Parity:                    c.Parity,
+		OperatorSelectionMode:     c.OperatorSelectionMode,
+		OperatorSelectionPLMN:     c.OperatorSelectionPLMN,
+		OperatorSelectionRAT:      c.OperatorSelectionRAT,
+		SMSEnabled:                c.SMSEnabled,
+		APN:                       c.APN,
+		IPVersion:                 c.IPVersion,
+		NetworkEnabled:            c.NetworkEnabled,
+		VoWiFiEnabled:             c.VoWiFiEnabled,
+		DeviceBackend:             c.DeviceBackend,
+		ModuleVendor:              config.NormalizeModuleVendor(c.ModuleVendor),
+		HostNetworkBackup:         boolPtr(hostNetworkBackupPriority > 0),
+		HostNetworkBackupPriority: hostNetworkBackupPriority,
 	}
 }
 
@@ -1420,7 +1425,7 @@ func (s *Server) handleDeviceMgmtUpdateDevice(c *gin.Context) {
 	newCfg.APN = effAPN
 
 	requiresRestart := deviceConfigRequiresRestart(oldCfg, newCfg)
-	if err := config.UpdateDeviceInFile(s.configPath, newCfg.ID, newCfg); err != nil {
+	if err := config.UpdateDeviceInFileWithHostNetworkBackup(s.configPath, newCfg.ID, newCfg, req.Config.HostNetworkBackup); err != nil {
 		logger.Error("写入设备配置失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "写入配置失败: " + err.Error()})
 		return
@@ -1547,6 +1552,8 @@ func (s *Server) handleDeviceMgmtAddDevice(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "参数错误"})
 		return
 	}
+	hostNetworkBackup := req.Config.HostNetworkBackup != nil && *req.Config.HostNetworkBackup
+
 	newCfg := deviceConfigFromDTO(req.Config)
 	newCfg = deviceConfigForAdd(newCfg)
 	newCfg, forcedWarning := normalizeManagedDeviceConfig(newCfg)
@@ -1590,7 +1597,7 @@ func (s *Server) handleDeviceMgmtAddDevice(c *gin.Context) {
 		newCfg = enrichedCfg
 	}
 
-	if err := config.AddDeviceInFileWithLimit(s.configPath, newCfg, s.pool.FreeDeviceLimit()); err != nil {
+	if err := config.AddDeviceInFileWithLimitAndHostNetworkBackup(s.configPath, newCfg, s.pool.FreeDeviceLimit(), hostNetworkBackup); err != nil {
 		var limitErr *config.DeviceLimitError
 		if errors.As(err, &limitErr) {
 			c.JSON(http.StatusConflict, gin.H{"status": "error", "message": device.FreeDeviceAddLimitMessage(limitErr.Limit)})

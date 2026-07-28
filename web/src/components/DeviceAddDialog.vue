@@ -196,6 +196,18 @@ watch(
           <el-option label="SIMCOM" value="simcom" />
         </el-select>
       </div>
+      <div
+        class="flex items-center justify-between p-3 rounded-xl border border-gray-200 bg-gray-50 sm:col-span-2"
+        :class="addConfig.host_network_backup ? 'border-emerald-300 bg-emerald-50' : ''"
+      >
+        <div>
+          <div class="text-sm font-bold text-gray-800">作为主机备用网络</div>
+          <div class="text-xs text-gray-500">
+            主机出口自动检测；勾选后追加到候选列表末尾，没有任何候选设备时功能关闭。
+          </div>
+        </div>
+        <el-switch v-model="addConfig.host_network_backup" />
+      </div>
     </div>
 
     <template #footer>

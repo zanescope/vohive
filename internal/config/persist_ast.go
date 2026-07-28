@@ -66,14 +66,20 @@ func updateWebCredentialsAST(path, username, password string) error {
 }
 
 func updateDevicesAST(path string, mutate func(*yaml.Node) (*yaml.Node, error)) error {
+	return updateDevicesAndRootAST(path, func(_ *yaml.Node, devices *yaml.Node) error {
+		_, err := mutate(devices)
+		return err
+	})
+}
+
+func updateDevicesAndRootAST(path string, mutate func(*yaml.Node, *yaml.Node) error) error {
 	err := patchConfigFile(path, func(root *yaml.Node) error {
 		devices := getMapValue(root, "devices")
 		if devices == nil || devices.Kind != yaml.SequenceNode {
 			devices = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
 			setMapNode(root, "devices", devices)
 		}
-		_, err := mutate(devices)
-		return err
+		return mutate(root, devices)
 	})
 	if err != nil {
 		return err

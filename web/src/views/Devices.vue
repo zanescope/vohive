@@ -110,7 +110,8 @@ const addConfig = ref<DeviceConfigDTO>({
   at_port: '',
   control_device: '',
   device_backend: 'at',
-  module_vendor: 'quectel'
+  module_vendor: 'quectel',
+  host_network_backup: false
 })
 
 const discovering = ref(false)
@@ -1061,7 +1062,8 @@ function openAddDialog() {
     at_port: '',
     control_device: '',
     device_backend: 'at',
-    module_vendor: 'quectel'
+    module_vendor: 'quectel',
+    host_network_backup: false
   }
   refreshDiscoveredForAdd()
 }

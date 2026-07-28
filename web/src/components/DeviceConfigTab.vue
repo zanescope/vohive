@@ -94,6 +94,28 @@ watch(
         <label class="text-xs font-bold text-gray-500 uppercase tracking-wider">控制设备</label>
         <el-input :model-value="activeControlDevice || ''" disabled placeholder="由系统自动探测" />
       </div>
+      <div
+        class="ui-panel-muted p-3 lg:col-span-2"
+        :class="editConfig.host_network_backup ? 'border border-emerald-300 bg-emerald-50/50 dark:bg-emerald-900/20' : ''"
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div>
+            <div class="text-sm font-bold text-gray-800 dark:text-gray-100">作为主机备用网络</div>
+            <div class="text-xs text-gray-500 dark:text-gray-400">
+              系统自动检测主机出口；断网时允许此设备承担主机流量，多台设备按勾选先后依次尝试。
+            </div>
+            <div v-if="editConfig.host_network_backup" class="text-xs text-emerald-700 dark:text-emerald-300 mt-1">
+              {{ editConfig.host_network_backup_priority
+                ? `当前候选顺序：第 ${editConfig.host_network_backup_priority} 位`
+                : '保存后将追加到候选列表末尾' }}
+            </div>
+            <div v-else class="text-xs text-gray-400 mt-1">
+              所有设备均未勾选时，主机备用网络功能关闭。
+            </div>
+          </div>
+          <el-switch v-model="editConfig.host_network_backup" />
+        </div>
+      </div>
       <div class="ui-panel-muted p-3 space-y-2">
         <div class="flex items-center justify-between">
           <div>
