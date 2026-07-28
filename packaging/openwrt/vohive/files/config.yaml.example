@@ -21,6 +21,7 @@ vowifi:
 #   ipv4_urls:
 #     - https://4.ipw.cn
 #     - https://ipv4.ddnspod.com
+#     - https://ip.3322.net  # rate-limited; keep as the last fallback
 #   ipv6_urls:
 #     - https://6.ipw.cn
 #     - https://ipv6.ddnspod.com
