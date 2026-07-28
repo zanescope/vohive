@@ -3,6 +3,7 @@ package notify
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zanescope/vohive/internal/config"
@@ -16,6 +17,10 @@ import (
 type Manager struct {
 	pool     *device.Pool
 	channels []Channel // 所有已启用的通知渠道
+
+	simCheckMu       sync.Mutex
+	pendingSIMChecks map[string]*pendingSIMCheck
+	simCheckTimeout  time.Duration
 }
 
 type NotificationContext struct {
@@ -171,16 +176,17 @@ func (m *Manager) initChannels(cfg *config.Config) error {
 // registerCommands 向所有已启用渠道注册同一组命令处理器
 func (m *Manager) registerCommands() {
 	commands := map[string]CommandHandler{
-		"send":   m.handleCmdSendSMS,
-		"sim":    m.handleCmdSIM,
-		"help":   m.handleCmdHelp,
-		"status": m.handleCmdStatus,
-		"rotate": m.handleCmdRotate,
-		"list":   m.handleCmdList,
-		"sms":    m.handleCmdSMSInbox,
-		"esim":   m.handleCmdEsim,
-		"switch": m.handleCmdSwitch,
-		"vocall": m.handleCmdCall,
+		"send":     m.handleCmdSendSMS,
+		"sim":      m.handleCmdSIM,
+		"simcheck": m.handleCmdSIMCheck,
+		"help":     m.handleCmdHelp,
+		"status":   m.handleCmdStatus,
+		"rotate":   m.handleCmdRotate,
+		"list":     m.handleCmdList,
+		"sms":      m.handleCmdSMSInbox,
+		"esim":     m.handleCmdEsim,
+		"switch":   m.handleCmdSwitch,
+		"vocall":   m.handleCmdCall,
 	}
 
 	for _, ch := range m.channels {
@@ -192,6 +198,7 @@ func (m *Manager) registerCommands() {
 
 // Close 关闭所有通知渠道
 func (m *Manager) Close() {
+	m.cancelPendingSIMChecks()
 	for _, ch := range m.channels {
 		_ = ch.Close()
 	}
@@ -242,6 +249,7 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 		DeviceName: deviceName,
 		Timestamp:  timestamp,
 	})
+	m.completePendingSIMCheck(deviceID, sender, content)
 }
 
 func formatSMSNotification(deviceDisplayName, localPhone, simNote, sender, content, source string, timestamp time.Time) string {
