@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/zanescope/vohive/internal/updater"
@@ -26,7 +28,8 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	ctx := context.Background()
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	var err error
 	switch args[0] {
 	case "status":
