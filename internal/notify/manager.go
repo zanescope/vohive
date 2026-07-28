@@ -227,7 +227,7 @@ func (m *Manager) NotifySMSWithSource(deviceID, sender, content, source string, 
 	deviceName := m.resolveDeviceName(deviceID)
 	localPhone, simNote := m.resolveDeviceSIMDisplay(deviceID)
 	msg := formatSMSNotification(
-		notificationDeviceDisplayName(deviceID, deviceName),
+		notificationSMSDeviceDisplayName(deviceID, deviceName),
 		localPhone,
 		simNote,
 		sender,
@@ -270,6 +270,18 @@ func notificationDeviceDisplayName(deviceID, deviceName string) string {
 		return name
 	}
 	return strings.TrimSpace(deviceID)
+}
+
+func notificationSMSDeviceDisplayName(deviceID, deviceName string) string {
+	id := strings.TrimSpace(deviceID)
+	name := strings.TrimSpace(deviceName)
+	if id != "" && name != "" {
+		return id + " / " + name
+	}
+	if id != "" {
+		return id
+	}
+	return name
 }
 
 func resolveNotificationLocalPhone(imsi, iccid string, identityUsable bool, lookup notificationPhoneLookup) (string, error) {

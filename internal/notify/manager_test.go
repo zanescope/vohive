@@ -150,6 +150,26 @@ func TestNotificationDeviceDisplayNamePrefersNameAndFallsBackToID(t *testing.T) 
 	}
 }
 
+func TestNotificationSMSDeviceDisplayNameUsesIDThenOptionalName(t *testing.T) {
+	tests := []struct {
+		name       string
+		deviceID   string
+		deviceName string
+		want       string
+	}{
+		{name: "configured name", deviceID: " wwan0 ", deviceName: " Living Room SIM ", want: "wwan0 / Living Room SIM"},
+		{name: "missing name", deviceID: " wwan0 ", want: "wwan0"},
+		{name: "missing id", deviceName: " Living Room SIM ", want: "Living Room SIM"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := notificationSMSDeviceDisplayName(tt.deviceID, tt.deviceName); got != tt.want {
+				t.Fatalf("notificationSMSDeviceDisplayName()=%q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveNotificationLocalPhoneUsesCoherentIdentityKeys(t *testing.T) {
 	tests := []struct {
 		name      string

@@ -136,7 +136,7 @@ watch(
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
       <div class="space-y-1">
         <label class="text-xs font-bold text-gray-500 uppercase tracking-wider">ID</label>
-        <el-input v-model="addConfig.id" placeholder="例如 ec20_3" />
+        <el-input v-model="addConfig.id" placeholder="默认 device01，可自定义" />
       </div>
       <div class="space-y-1">
         <label class="text-xs font-bold text-gray-500 uppercase tracking-wider">名称</label>
