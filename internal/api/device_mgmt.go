@@ -114,7 +114,7 @@ func deviceConfigFromDTOWithBase(d deviceConfigDTO, base *config.DeviceConfig) c
 	if d.QMIProxyExecutable != nil {
 		qmiProxyExecutable = strings.TrimSpace(*d.QMIProxyExecutable)
 	}
-	return config.DeviceConfig{
+	result := config.DeviceConfig{
 		ID:                    id,
 		Name:                  strings.TrimSpace(d.Name),
 		ModemIMEI:             strings.TrimSpace(d.ModemIMEI),
@@ -142,6 +142,10 @@ func deviceConfigFromDTOWithBase(d deviceConfigDTO, base *config.DeviceConfig) c
 		DeviceBackend:         d.DeviceBackend,
 		ModuleVendor:          config.NormalizeModuleVendor(d.ModuleVendor),
 	}
+	if base != nil {
+		result = preserveDeviceConfigFieldsOutsideWebForm(result, *base)
+	}
+	return result
 }
 
 func nextDefaultDeviceID(devices []config.DeviceConfig) string {
@@ -1445,7 +1449,14 @@ func (s *Server) handleDeviceMgmtUpdateDevice(c *gin.Context) {
 	newCfg.IPVersion = effIP
 	newCfg.APN = effAPN
 
-	requiresRestart := deviceConfigRequiresRestart(oldCfg, newCfg)
+	// Compare persistent device intent rather than the display DTO: the DTO also
+	// contains runtime attachment paths, runtime policy, and canonical spellings
+	// for defaults omitted from compact YAML. Those representation-only fields
+	// must not make a host-network backup selection touch the Worker.
+	oldIntentCfg := deviceConfigForChangeDetection(oldCfg)
+	newIntentCfg := deviceConfigForChangeDetection(newCfg)
+	deviceConfigChanged := deviceConfigIntentChanged(oldIntentCfg, newIntentCfg)
+	requiresRestart := deviceConfigChanged && deviceConfigRequiresRestart(oldIntentCfg, newIntentCfg)
 	if err := config.UpdateDeviceInFileWithHostNetworkBackup(s.configPath, newCfg.ID, newCfg, req.Config.HostNetworkBackup); err != nil {
 		logger.Error("写入设备配置失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "写入配置失败: " + err.Error()})
@@ -1453,20 +1464,26 @@ func (s *Server) handleDeviceMgmtUpdateDevice(c *gin.Context) {
 	}
 
 	worker := s.pool.GetWorker(id)
-	s.pool.UpdateWorkerConfig(id, newCfg, !requiresRestart)
+	deviceConfigApply := s.configApply
+	if deviceConfigApply == nil {
+		deviceConfigApply = s.pool
+	}
+	if deviceConfigChanged {
+		deviceConfigApply.UpdateWorkerConfig(id, newCfg, !requiresRestart)
+	}
 
 	// 检测 DeviceBackend 状态变化，或 VoWiFi 从开启变为关闭都需要彻底重建 Worker 释放残余句柄
-	needsRebuild := oldCfg.DeviceBackend != newCfg.DeviceBackend ||
-		config.NormalizeModuleVendor(oldCfg.ModuleVendor) != config.NormalizeModuleVendor(newCfg.ModuleVendor) ||
-		qmiProxyConfigChanged(oldCfg, newCfg) ||
-		(!newCfg.VoWiFiEnabled && oldCfg.VoWiFiEnabled) ||
-		(worker != nil && managedNetworkConfigChanged(oldCfg, newCfg))
-	shouldApplyNetworkNow := worker != nil || needsRebuild
+	needsRebuild := deviceConfigChanged && (oldIntentCfg.DeviceBackend != newIntentCfg.DeviceBackend ||
+		config.NormalizeModuleVendor(oldIntentCfg.ModuleVendor) != config.NormalizeModuleVendor(newIntentCfg.ModuleVendor) ||
+		qmiProxyConfigChanged(oldIntentCfg, newIntentCfg) ||
+		(!newIntentCfg.VoWiFiEnabled && oldIntentCfg.VoWiFiEnabled) ||
+		(worker != nil && managedNetworkConfigChanged(oldIntentCfg, newIntentCfg)))
+	shouldApplyNetworkNow := deviceConfigChanged && (worker != nil || needsRebuild)
 
 	warningMessage := forcedWarning
 	if needsRebuild {
 		logger.Info("配置保存触发底盘或 VoWiFi 停止变更，将彻底重建 Worker", "device", id)
-		if err := s.pool.RebuildWorker(id); err != nil {
+		if err := deviceConfigApply.RebuildWorker(id); err != nil {
 			logger.Error("重建 Worker 失败", "device", id, "err", err)
 			warningMessage = joinWarningMessages(warningMessage, "配置已保存，但运行时重建失败: "+err.Error())
 		}
@@ -1498,7 +1515,7 @@ func (s *Server) handleDeviceMgmtUpdateDevice(c *gin.Context) {
 	}
 
 	if shouldApplyNetworkNow && !newCfg.VoWiFiEnabled && !s.pool.IsVoWiFiActive(id) {
-		if err := s.pool.ApplyConfiguredNetwork(id); err != nil {
+		if err := deviceConfigApply.ApplyConfiguredNetwork(id); err != nil {
 			logger.Warn("配置保存后自动应用网络偏好失败", "device", id, "err", err)
 			warningMessage = joinWarningMessages(warningMessage, "配置已保存，但自动应用网络失败: "+err.Error())
 		}

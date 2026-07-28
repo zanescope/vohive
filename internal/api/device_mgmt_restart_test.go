@@ -126,3 +126,93 @@ func TestDeviceConfigMBIMManagedNetworkChangesRequiresRebuild(t *testing.T) {
 		t.Fatal("managedNetworkConfigChanged()=true for identical configs, want false")
 	}
 }
+
+func TestDeviceConfigChangeDetectionIgnoresRuntimeAttachment(t *testing.T) {
+	old := config.DeviceConfig{
+		ID:            "device02",
+		Name:          "device02",
+		ModemIMEI:     "866069053675384",
+		DeviceBackend: "qmi",
+	}
+	next := old
+	next.ESIMTransport = config.ESIMTransportAT
+	next.ModuleVendor = config.ModuleVendorQuectel
+	next.MBIMTransport = config.MBIMTransportAuto
+	next.SMSEnabled = true
+	next.USBPath = "/sys/bus/usb/devices/1-2"
+	next.ATPort = "/dev/ttyUSB6"
+	next.ManagePort = "/dev/ttyUSB6"
+	next.Interface = "wwan1"
+	next.QMIDevice = "/dev/cdc-wdm1"
+	next.ControlDevice = "/dev/cdc-wdm1"
+	next.AudioDevice = "hw:2,0"
+
+	if deviceConfigIntentChanged(old, next) {
+		t.Fatal("runtime-discovered attachment made the device config look changed")
+	}
+
+	oldIntent := deviceConfigForChangeDetection(old)
+	nextIntent := deviceConfigForChangeDetection(next)
+	if deviceConfigRequiresRestart(oldIntent, nextIntent) {
+		t.Fatal("runtime-discovered attachment requested a restart")
+	}
+	if managedNetworkConfigChanged(oldIntent, nextIntent) {
+		t.Fatal("runtime-discovered attachment requested a Worker rebuild")
+	}
+}
+
+func TestDeviceConfigChangeDetectionKeepsPersistedIntent(t *testing.T) {
+	old := config.DeviceConfig{
+		ID:            "device02",
+		Name:          "device02",
+		ModemIMEI:     "866069053675384",
+		DeviceBackend: "qmi",
+		ModuleVendor:  "quectel",
+	}
+	next := old
+	next.Name = "backup modem"
+
+	if !deviceConfigIntentChanged(old, next) {
+		t.Fatal("persisted name change was ignored")
+	}
+}
+
+func TestPreserveDeviceConfigFieldsOutsideWebForm(t *testing.T) {
+	usbNetMode := 2
+	old := config.DeviceConfig{
+		ID:            "device02",
+		Name:          "device02",
+		ModemIMEI:     "866069053675384",
+		MBIMTransport: "auto",
+		DeviceBackend: "qmi",
+		ModuleVendor:  "quectel",
+		USBNetMode:    &usbNetMode,
+		ESIMSwitch: config.ESIMSwitchConfig{
+			UseRefreshTrue:     true,
+			EventGatedConverge: true,
+			ReinitWindowMS:     12000,
+		},
+	}
+	next := old
+	next.MBIMTransport = ""
+	next.USBNetMode = nil
+	next.ESIMSwitch = config.ESIMSwitchConfig{}
+	next.USBPath = "/sys/bus/usb/devices/1-2"
+	next.ATPort = "/dev/ttyUSB6"
+	next.Interface = "wwan1"
+	next.ControlDevice = "/dev/cdc-wdm1"
+	next = preserveDeviceConfigFieldsOutsideWebForm(next, old)
+
+	if next.MBIMTransport != old.MBIMTransport {
+		t.Fatalf("MBIMTransport = %q, want %q", next.MBIMTransport, old.MBIMTransport)
+	}
+	if next.USBNetMode != old.USBNetMode {
+		t.Fatal("USBNetMode was not preserved")
+	}
+	if next.ESIMSwitch != old.ESIMSwitch {
+		t.Fatalf("ESIMSwitch = %+v, want %+v", next.ESIMSwitch, old.ESIMSwitch)
+	}
+	if deviceConfigIntentChanged(old, next) {
+		t.Fatal("display-only runtime paths made a host-backup-only save look like a device config change")
+	}
+}

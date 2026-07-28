@@ -81,6 +81,7 @@ type Server struct {
 	notifyMgr   *notify.Manager
 	websheets   *vwebsheet.Broker
 	updates     updater.Coordinator
+	configApply deviceConfigApplyRuntime
 
 	httpSrvMu sync.Mutex
 	httpSrv   *http.Server
@@ -96,6 +97,12 @@ type Server struct {
 
 type realtimeTrafficSubscriber interface {
 	Subscribe(ctx context.Context, deviceID string) (<-chan proxytraffic.RealtimeSnapshot, func())
+}
+
+type deviceConfigApplyRuntime interface {
+	UpdateWorkerConfig(string, config.DeviceConfig, bool) bool
+	RebuildWorker(string) error
+	ApplyConfiguredNetwork(string) error
 }
 
 // handleLiveness reports whether the HTTP process can serve requests. It must

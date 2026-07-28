@@ -1,6 +1,54 @@
 package api
 
-import "github.com/zanescope/vohive/internal/config"
+import (
+	"reflect"
+
+	"github.com/zanescope/vohive/internal/config"
+)
+
+// deviceConfigForChangeDetection removes fields that are discovered at runtime
+// and are only echoed to the Web UI for display. Device persistence deliberately
+// never loads these fields, so comparing a submitted DTO against the persisted
+// config without normalizing them makes a partial Web save look like a device
+// behavior change.
+func deviceConfigForChangeDetection(cfg config.DeviceConfig) config.DeviceConfig {
+	// Runtime-discovered attachment.
+	cfg.USBPath = ""
+	cfg.ATPort = ""
+	cfg.ManagePort = ""
+	cfg.Interface = ""
+	cfg.QMIDevice = ""
+	cfg.ControlDevice = ""
+	cfg.AudioDevice = ""
+
+	// Card policy and SMS runtime state are not device-file intent.
+	cfg.APN = ""
+	cfg.NetworkEnabled = false
+	cfg.IPVersion = ""
+	cfg.VoWiFiEnabled = false
+	cfg.AirplaneEnabled = false
+	cfg.SMSEnabled = false
+
+	// GET emits canonical Web defaults even when the compact YAML omits them.
+	// Compare their effective meaning instead of their serialized spelling.
+	cfg.ESIMTransport = config.NormalizeESIMTransport(cfg.ESIMTransport)
+	cfg.ModuleVendor = config.NormalizeModuleVendor(cfg.ModuleVendor)
+	cfg.MBIMTransport = config.NormalizeMBIMTransport(cfg.MBIMTransport)
+	return cfg
+}
+
+func deviceConfigIntentChanged(old config.DeviceConfig, next config.DeviceConfig) bool {
+	old = deviceConfigForChangeDetection(old)
+	next = deviceConfigForChangeDetection(next)
+	return !reflect.DeepEqual(old, next)
+}
+
+func preserveDeviceConfigFieldsOutsideWebForm(next config.DeviceConfig, base config.DeviceConfig) config.DeviceConfig {
+	next.MBIMTransport = base.MBIMTransport
+	next.USBNetMode = base.USBNetMode
+	next.ESIMSwitch = base.ESIMSwitch
+	return next
+}
 
 func deviceConfigRequiresRestart(old config.DeviceConfig, next config.DeviceConfig) bool {
 	if config.NormalizeIMEI(old.ModemIMEI) != config.NormalizeIMEI(next.ModemIMEI) {
