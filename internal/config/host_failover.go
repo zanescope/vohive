@@ -15,6 +15,18 @@ const (
 	maxHostFailoverRouteMetric   = 4096
 )
 
+// CandidatePosition returns the one-based Web selection order for a device.
+// Zero means the device is not allowed to carry host fallback traffic.
+func (cfg HostFailoverConfig) CandidatePosition(deviceID string) int {
+	deviceID = strings.TrimSpace(deviceID)
+	for index, candidateID := range cfg.CandidateDeviceIDs {
+		if strings.TrimSpace(candidateID) == deviceID {
+			return index + 1
+		}
+	}
+	return 0
+}
+
 func validateHostFailoverConfig(cfg HostFailoverConfig) error {
 	if cfg.ProbeIntervalSeconds < minHostFailoverProbeInterval || cfg.ProbeIntervalSeconds > maxHostFailoverProbeInterval {
 		return fmt.Errorf("host_network_failover.probe_interval_seconds must be between %d and %d",
@@ -36,14 +48,8 @@ func validateHostFailoverConfig(cfg HostFailoverConfig) error {
 	if cfg.MaximumRouteMetric < 1 || cfg.MaximumRouteMetric > maxHostFailoverRouteMetric {
 		return fmt.Errorf("host_network_failover.maximum_route_metric must be between 1 and %d", maxHostFailoverRouteMetric)
 	}
-	if !cfg.Enabled {
-		return nil
-	}
-	if strings.TrimSpace(cfg.PrimaryInterface) == "" {
-		return fmt.Errorf("host_network_failover.primary_interface is required when enabled")
-	}
 	if len(cfg.CandidateDeviceIDs) == 0 {
-		return fmt.Errorf("host_network_failover.candidate_device_ids must contain at least one device when enabled")
+		return nil
 	}
 	seen := make(map[string]struct{}, len(cfg.CandidateDeviceIDs))
 	for index, raw := range cfg.CandidateDeviceIDs {

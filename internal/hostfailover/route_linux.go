@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -30,7 +31,7 @@ func (m *linuxRouteManager) Reconcile() error {
 	var errs []error
 	for i := range routes {
 		route := routes[i]
-		if !isOwnedDefaultRoute(route) {
+		if !isOwnedFailoverRoute(route) {
 			continue
 		}
 		if err := netlink.RouteDel(&route); err != nil && !errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.ENOENT) {
@@ -40,57 +41,142 @@ func (m *linuxRouteManager) Reconcile() error {
 	return errors.Join(errs...)
 }
 
-func (m *linuxRouteManager) Activate(primaryInterface, candidateInterface string, maximumMetric int) (RouteLease, error) {
-	primary, err := netlink.LinkByName(primaryInterface)
-	if err != nil {
-		return RouteLease{}, fmt.Errorf("find primary interface %q: %w", primaryInterface, err)
+func (m *linuxRouteManager) ResolvePrimary(excludedInterfaces []string) (string, error) {
+	excludedIndexes := make(map[int]struct{}, len(excludedInterfaces))
+	for _, interfaceName := range excludedInterfaces {
+		link, err := netlink.LinkByName(strings.TrimSpace(interfaceName))
+		if err == nil && link != nil && link.Attrs() != nil {
+			excludedIndexes[link.Attrs().Index] = struct{}{}
+		}
 	}
+
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		return "", fmt.Errorf("list IPv4 routes: %w", err)
+	}
+	linkIndex := bestPrimaryRouteLinkIndex(routes, excludedIndexes)
+	if linkIndex == 0 {
+		return "", fmt.Errorf("no non-candidate IPv4 default route")
+	}
+	link, err := netlink.LinkByIndex(linkIndex)
+	if err != nil {
+		return "", fmt.Errorf("resolve primary route link %d: %w", linkIndex, err)
+	}
+	if link == nil || link.Attrs() == nil || strings.TrimSpace(link.Attrs().Name) == "" {
+		return "", fmt.Errorf("primary route link %d has no interface name", linkIndex)
+	}
+	return strings.TrimSpace(link.Attrs().Name), nil
+}
+
+func bestPrimaryRouteLinkIndex(routes []netlink.Route, excludedIndexes map[int]struct{}) int {
+	bestIndex := 0
+	bestMetric := 0
+	for _, route := range routes {
+		if !isMainIPv4Default(route) || route.Protocol == ownedRouteProtocol {
+			continue
+		}
+		consider := func(linkIndex int) {
+			if linkIndex <= 0 {
+				return
+			}
+			if _, excluded := excludedIndexes[linkIndex]; excluded {
+				return
+			}
+			if bestIndex == 0 || route.Priority < bestMetric || (route.Priority == bestMetric && linkIndex < bestIndex) {
+				bestIndex = linkIndex
+				bestMetric = route.Priority
+			}
+		}
+		consider(route.LinkIndex)
+		for _, hop := range route.MultiPath {
+			if hop != nil {
+				consider(hop.LinkIndex)
+			}
+		}
+	}
+	return bestIndex
+}
+
+func (m *linuxRouteManager) Activate(primaryInterface, candidateInterface string, maximumMetric int) (RouteLease, error) {
 	candidate, err := netlink.LinkByName(candidateInterface)
 	if err != nil {
 		return RouteLease{}, fmt.Errorf("find candidate interface %q: %w", candidateInterface, err)
 	}
-	if primary.Attrs().Index == candidate.Attrs().Index {
-		return RouteLease{}, fmt.Errorf("primary and candidate interfaces must be different")
+
+	var primary netlink.Link
+	if primaryInterface = strings.TrimSpace(primaryInterface); primaryInterface != "" {
+		resolvedPrimary, lookupErr := netlink.LinkByName(primaryInterface)
+		if lookupErr != nil {
+			var notFound netlink.LinkNotFoundError
+			if !errors.As(lookupErr, &notFound) {
+				return RouteLease{}, fmt.Errorf("find primary interface %q: %w", primaryInterface, lookupErr)
+			}
+		} else {
+			primary = resolvedPrimary
+			if primary.Attrs().Index == candidate.Attrs().Index {
+				return RouteLease{}, fmt.Errorf("primary and candidate interfaces must be different")
+			}
+		}
 	}
 
 	base, err := bestDefaultRoute(candidate)
 	if err != nil {
 		return RouteLease{}, err
 	}
-	metric, err := promotionMetric(primary, maximumMetric)
+	routes, err := promotionRoutes(base, candidate.Attrs().Index, primary, maximumMetric)
 	if err != nil {
 		return RouteLease{}, err
 	}
-
-	route := promotedRoute(base, candidate.Attrs().Index, metric)
-	if err := netlink.RouteAdd(&route); err != nil {
-		return RouteLease{}, fmt.Errorf("add promoted default route: %w", err)
+	added := make([]netlink.Route, 0, len(routes))
+	cleanup := func() {
+		for index := len(added) - 1; index >= 0; index-- {
+			route := added[index]
+			_ = netlink.RouteDel(&route)
+		}
+	}
+	for index := range routes {
+		if err := netlink.RouteAdd(&routes[index]); err != nil {
+			cleanup()
+			return RouteLease{}, fmt.Errorf("add promoted route: %w", err)
+		}
+		added = append(added, routes[index])
 	}
 
-	selected, err := netlink.RouteGet(net.ParseIP("1.1.1.1"))
-	if err != nil {
-		_ = netlink.RouteDel(&route)
-		return RouteLease{}, fmt.Errorf("verify promoted default route: %w", err)
+	for _, target := range []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("129.0.0.1")} {
+		selected, err := netlink.RouteGet(target)
+		if err != nil {
+			cleanup()
+			return RouteLease{}, fmt.Errorf("verify promoted route: %w", err)
+		}
+		if !routeListUsesLink(selected, candidate.Attrs().Index) {
+			cleanup()
+			return RouteLease{}, fmt.Errorf("promoted route did not become the IPv4 path for %s", target)
+		}
 	}
-	if !routeListUsesLink(selected, candidate.Attrs().Index) {
-		_ = netlink.RouteDel(&route)
-		return RouteLease{}, fmt.Errorf("promoted route did not become the IPv4 default path")
-	}
-	return RouteLease{CandidateInterface: candidateInterface, platform: route}, nil
+	return RouteLease{CandidateInterface: candidateInterface, platform: routes}, nil
 }
 
 func (m *linuxRouteManager) Deactivate(lease RouteLease) error {
-	route, ok := lease.platform.(netlink.Route)
+	routes, ok := lease.platform.([]netlink.Route)
 	if !ok {
-		return fmt.Errorf("invalid Linux route lease")
+		route, legacy := lease.platform.(netlink.Route)
+		if !legacy {
+			return fmt.Errorf("invalid Linux route lease")
+		}
+		routes = []netlink.Route{route}
 	}
-	if !isOwnedDefaultRoute(route) {
-		return fmt.Errorf("refusing to delete a route not owned by VoHive")
+	var errs []error
+	for index := range routes {
+		route := routes[index]
+		if !isOwnedFailoverRoute(route) {
+			errs = append(errs, fmt.Errorf("refusing to delete a route not owned by VoHive"))
+			continue
+		}
+		if err := netlink.RouteDel(&route); err != nil && !errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.ENOENT) {
+			errs = append(errs, err)
+		}
 	}
-	if err := netlink.RouteDel(&route); err != nil && !errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.ENOENT) {
-		return err
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func bestDefaultRoute(link netlink.Link) (netlink.Route, error) {
@@ -115,10 +201,28 @@ func bestDefaultRoute(link netlink.Link) (netlink.Route, error) {
 	return *best, nil
 }
 
-func promotionMetric(primary netlink.Link, maximum int) (int, error) {
+func promotionRoutes(base netlink.Route, linkIndex int, primary netlink.Link, maximum int) ([]netlink.Route, error) {
 	if maximum < 1 {
-		return 0, fmt.Errorf("maximum route metric must be positive")
+		return nil, fmt.Errorf("maximum route metric must be positive")
 	}
+	if primary == nil {
+		return []netlink.Route{promotedRoute(base, linkIndex, maximum)}, nil
+	}
+	primaryMetric, err := primaryDefaultMetric(primary)
+	if err != nil {
+		return nil, err
+	}
+	if primaryMetric == 0 {
+		return promotedTakeoverRoutes(base, linkIndex, maximum), nil
+	}
+	metric, err := safePromotionMetric(primaryMetric, maximum)
+	if err != nil {
+		return nil, err
+	}
+	return []netlink.Route{promotedRoute(base, linkIndex, metric)}, nil
+}
+
+func primaryDefaultMetric(primary netlink.Link) (int, error) {
 	routes, err := netlink.RouteList(primary, netlink.FAMILY_V4)
 	if err != nil {
 		return 0, fmt.Errorf("list primary routes: %w", err)
@@ -132,7 +236,7 @@ func promotionMetric(primary netlink.Link, maximum int) (int, error) {
 			primaryMetric = route.Priority
 		}
 	}
-	return safePromotionMetric(primaryMetric, maximum)
+	return primaryMetric, nil
 }
 
 func safePromotionMetric(primaryMetric, maximum int) (int, error) {
@@ -179,6 +283,14 @@ func promotedRoute(base netlink.Route, linkIndex, metric int) netlink.Route {
 	}
 }
 
+func promotedTakeoverRoutes(base netlink.Route, linkIndex, metric int) []netlink.Route {
+	low := promotedRoute(base, linkIndex, metric)
+	low.Dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(1, 32)}
+	high := promotedRoute(base, linkIndex, metric)
+	high.Dst = &net.IPNet{IP: net.IPv4(128, 0, 0, 0), Mask: net.CIDRMask(1, 32)}
+	return []netlink.Route{low, high}
+}
+
 func routeListUsesLink(routes []netlink.Route, linkIndex int) bool {
 	for _, route := range routes {
 		if route.LinkIndex == linkIndex {
@@ -193,8 +305,28 @@ func routeListUsesLink(routes []netlink.Route, linkIndex int) bool {
 	return false
 }
 
-func isOwnedDefaultRoute(route netlink.Route) bool {
-	return route.Protocol == ownedRouteProtocol && isMainIPv4Default(route)
+func isOwnedFailoverRoute(route netlink.Route) bool {
+	if route.Protocol != ownedRouteProtocol {
+		return false
+	}
+	if route.Table != 0 && route.Table != unix.RT_TABLE_MAIN {
+		return false
+	}
+	if route.Family != 0 && route.Family != netlink.FAMILY_V4 {
+		return false
+	}
+	if route.Dst == nil {
+		return true
+	}
+	ones, bits := route.Dst.Mask.Size()
+	if bits != 32 || (ones != 0 && ones != 1) {
+		return false
+	}
+	network := route.Dst.IP.To4()
+	if network == nil || ones == 0 {
+		return network != nil
+	}
+	return (network[0] == 0 || network[0] == 128) && network[1] == 0 && network[2] == 0 && network[3] == 0
 }
 
 func isMainIPv4Default(route netlink.Route) bool {

@@ -20,10 +20,14 @@ func (s *fakeCandidateSource) Candidates([]string) []Candidate {
 }
 
 type fakeRouteManager struct {
-	reconciles  int
-	activations []string
-	deactivates []string
-	activateErr error
+	reconciles          int
+	activations         []string
+	deactivates         []string
+	activationPrimaries []string
+	activateErr         error
+	primaryInterface    string
+	resolveErr          error
+	excluded            [][]string
 }
 
 func (m *fakeRouteManager) Reconcile() error {
@@ -31,11 +35,20 @@ func (m *fakeRouteManager) Reconcile() error {
 	return nil
 }
 
-func (m *fakeRouteManager) Activate(_, candidate string, _ int) (RouteLease, error) {
+func (m *fakeRouteManager) ResolvePrimary(excludedInterfaces []string) (string, error) {
+	m.excluded = append(m.excluded, append([]string(nil), excludedInterfaces...))
+	if m.resolveErr != nil {
+		return "", m.resolveErr
+	}
+	return m.primaryInterface, nil
+}
+
+func (m *fakeRouteManager) Activate(primary, candidate string, _ int) (RouteLease, error) {
 	if m.activateErr != nil {
 		return RouteLease{}, m.activateErr
 	}
 	m.activations = append(m.activations, candidate)
+	m.activationPrimaries = append(m.activationPrimaries, primary)
 	return RouteLease{CandidateInterface: candidate, platform: candidate}, nil
 }
 
@@ -75,11 +88,13 @@ func testOptions(primary ProbeFunc, source CandidateSource, routes RouteManager,
 		RecoveryThreshold:  2,
 		MinimumBackupTime:  10 * time.Second,
 		MaximumRouteMetric: 5,
-		PrimaryProbe:       primary,
-		CandidateSource:    source,
-		RouteManager:       routes,
-		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now:                now,
+		PrimaryProbe: func(ctx context.Context, _ string) error {
+			return primary(ctx)
+		},
+		CandidateSource: source,
+		RouteManager:    routes,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:             now,
 	}
 }
 
@@ -96,6 +111,113 @@ func TestNewRejectsCandidatesThatNormalizeToEmpty(t *testing.T) {
 	options.MinimumBackupTime = -time.Second
 	if _, err := New(options); err == nil {
 		t.Fatal("negative minimum backup time was accepted")
+	}
+}
+
+func TestManagerDynamicallyEnablesAndDisablesFromCandidateProvider(t *testing.T) {
+	now := time.Unix(1000, 0)
+	deviceIDs := []string(nil)
+	source := &fakeCandidateSource{candidates: []Candidate{{
+		DeviceID: "modem-a", Interface: "wwan9", Connected: true, Probe: fixedProbe(nil),
+	}}}
+	routes := &fakeRouteManager{}
+	options := testOptions(fixedProbe(errProbeFailed), source, routes, func() time.Time { return now })
+	options.CandidateDeviceIDs = nil
+	options.CandidateDeviceIDsProvider = func() []string {
+		return append([]string(nil), deviceIDs...)
+	}
+	options.FailureThreshold = 1
+	manager, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(routes.activations) != 0 {
+		t.Fatal("disabled manager mutated routes")
+	}
+
+	deviceIDs = []string{"modem-a"}
+	if err := manager.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := routes.activations; len(got) != 1 || got[0] != "wwan9" {
+		t.Fatalf("activations = %v, want [wwan9]", got)
+	}
+
+	deviceIDs = nil
+	if err := manager.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := routes.deactivates; len(got) != 1 || got[0] != "wwan9" {
+		t.Fatalf("deactivates = %v, want [wwan9]", got)
+	}
+}
+
+func TestManagerAutoDiscoversPrimaryAndExcludesCandidateInterfaces(t *testing.T) {
+	now := time.Unix(1000, 0)
+	source := &fakeCandidateSource{candidates: []Candidate{
+		{DeviceID: "modem-a", Interface: "wwan9", Connected: true, Probe: fixedProbe(nil)},
+		{DeviceID: "modem-b", Interface: "wwan10", Connected: true, Probe: fixedProbe(nil)},
+	}}
+	routes := &fakeRouteManager{primaryInterface: "eth0"}
+	options := testOptions(fixedProbe(nil), source, routes, func() time.Time { return now })
+	options.PrimaryInterface = ""
+	probedInterface := ""
+	options.PrimaryProbe = func(_ context.Context, interfaceName string) error {
+		probedInterface = interfaceName
+		return nil
+	}
+	manager, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if probedInterface != "eth0" {
+		t.Fatalf("probed interface = %q, want eth0", probedInterface)
+	}
+	if len(routes.excluded) != 1 {
+		t.Fatalf("resolve calls = %d, want 1", len(routes.excluded))
+	}
+	got := routes.excluded[0]
+	if len(got) != 2 || got[0] != "wwan9" || got[1] != "wwan10" {
+		t.Fatalf("excluded interfaces = %v, want [wwan9 wwan10]", got)
+	}
+}
+
+func TestManagerCanActivateWhenHostStartsWithoutPrimaryRoute(t *testing.T) {
+	now := time.Unix(1000, 0)
+	source := &fakeCandidateSource{candidates: []Candidate{{
+		DeviceID: "modem-a", Interface: "wwan9", Connected: true, Probe: fixedProbe(nil),
+	}}}
+	routes := &fakeRouteManager{resolveErr: errors.New("no primary route")}
+	options := testOptions(fixedProbe(nil), source, routes, func() time.Time { return now })
+	options.PrimaryInterface = ""
+	options.FailureThreshold = 1
+	primaryProbeCalls := 0
+	options.PrimaryProbe = func(context.Context, string) error {
+		primaryProbeCalls++
+		return nil
+	}
+	manager, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if primaryProbeCalls != 0 {
+		t.Fatalf("primary probe calls = %d, want 0 without an interface", primaryProbeCalls)
+	}
+	if got := routes.activations; len(got) != 1 || got[0] != "wwan9" {
+		t.Fatalf("activations = %v, want [wwan9]", got)
+	}
+	if got := routes.activationPrimaries; len(got) != 1 || got[0] != "" {
+		t.Fatalf("activation primaries = %v, want empty auto-discovery fallback", got)
 	}
 }
 

@@ -7,33 +7,25 @@ import (
 
 func TestDefaultHostFailoverConfigIsDisabledAndValid(t *testing.T) {
 	cfg := DefaultConfig().HostFailover
-	if cfg.Enabled {
-		t.Fatal("host failover must be opt-in")
+	if len(cfg.CandidateDeviceIDs) != 0 {
+		t.Fatal("host failover must be disabled when no devices are selected")
 	}
 	if err := validateHostFailoverConfig(cfg); err != nil {
 		t.Fatalf("default config is invalid: %v", err)
 	}
 }
 
-func TestValidateHostFailoverRequiresPrimaryAndCandidatesWhenEnabled(t *testing.T) {
+func TestValidateHostFailoverAllowsAutoDiscoveredPrimary(t *testing.T) {
 	cfg := DefaultConfig().HostFailover
-	cfg.Enabled = true
+	cfg.CandidateDeviceIDs = []string{"modem-1"}
 
-	err := validateHostFailoverConfig(cfg)
-	if err == nil || !strings.Contains(err.Error(), "primary_interface") {
-		t.Fatalf("error = %v, want missing primary_interface", err)
-	}
-
-	cfg.PrimaryInterface = "eth0"
-	err = validateHostFailoverConfig(cfg)
-	if err == nil || !strings.Contains(err.Error(), "candidate_device_ids") {
-		t.Fatalf("error = %v, want missing candidate_device_ids", err)
+	if err := validateHostFailoverConfig(cfg); err != nil {
+		t.Fatalf("auto-discovered primary config rejected: %v", err)
 	}
 }
 
 func TestValidateHostFailoverAcceptsOrderedCandidates(t *testing.T) {
 	cfg := DefaultConfig().HostFailover
-	cfg.Enabled = true
 	cfg.PrimaryInterface = "eth0"
 	cfg.CandidateDeviceIDs = []string{"wwan9", "wwan2"}
 
@@ -44,7 +36,6 @@ func TestValidateHostFailoverAcceptsOrderedCandidates(t *testing.T) {
 
 func TestValidateHostFailoverRejectsDuplicateCandidates(t *testing.T) {
 	cfg := DefaultConfig().HostFailover
-	cfg.Enabled = true
 	cfg.PrimaryInterface = "eth0"
 	cfg.CandidateDeviceIDs = []string{"wwan9", " wwan9 "}
 

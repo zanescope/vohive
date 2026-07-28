@@ -21,15 +21,13 @@ vowifi:
 #   ipv6_urls:
 #     - https://your-ipv6-endpoint.example
 
-# Optional Linux host IPv4 default-route failover. Candidate values are stable
-# VoHive device IDs, not runtime wwan interface names. The system DNS resolver
-# must remain reachable through the selected cellular route.
+# Optional Linux host IPv4 route failover. Select ordered candidate devices in
+# Web device settings; leaving every device unchecked disables it. The primary
+# interface is auto-discovered from the non-candidate default route. Set the
+# optional override only when automatic selection is unsuitable. The system DNS
+# resolver must remain reachable through the selected cellular route.
 # host_network_failover:
-#   enabled: true
-#   primary_interface: eth0
-#   candidate_device_ids:
-#     - modem-9
-#     - modem-2
+#   primary_interface: eth0  # optional override
 #   probe_interval_seconds: 5
 #   probe_timeout_seconds: 8
 #   failure_threshold: 3

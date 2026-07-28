@@ -2531,6 +2531,14 @@ components:
         module_vendor:
           type: string
           enum: [quectel, simcom]
+        host_network_backup:
+          type: boolean
+          description: 是否允许该设备作为主机备用网络候选；从 false 改为 true 时追加到候选列表末尾，全部设备为 false 时关闭功能。主出口自动发现，无需预设 primary_interface。
+        host_network_backup_priority:
+          type: integer
+          readOnly: true
+          minimum: 1
+          description: 当前候选顺序；未选中时省略。
 
     DeviceMgmtListModem:
       type: object

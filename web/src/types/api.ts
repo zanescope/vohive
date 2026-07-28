@@ -149,6 +149,8 @@ export type DeviceConfigDTO = {
   vowifi_enabled?: boolean
   device_backend?: 'at' | 'qmi' | 'mbim'
   module_vendor?: 'quectel' | 'simcom'
+  host_network_backup?: boolean
+  host_network_backup_priority?: number
   operator_selection_mode?: string
   operator_selection_plmn?: string
   operator_selection_rat?: string

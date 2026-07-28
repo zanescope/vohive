@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/zanescope/vohive/internal/config"
 	"github.com/zanescope/vohive/internal/hostfailover"
 )
 
@@ -13,8 +14,9 @@ type contextualPublicIPProber interface {
 }
 
 // Candidates implements hostfailover.CandidateSource. The returned order is
-// exactly the configured device-ID order; only runtime interface names are
-// used, so USB re-enumeration cannot silently select the wrong modem.
+// exactly the configured device-ID order. Runtime interface names are preferred;
+// the persisted name is retained only for excluding an offline candidate from
+// automatic primary-interface discovery.
 func (p *Pool) Candidates(deviceIDs []string) []hostfailover.Candidate {
 	if p == nil {
 		return nil
@@ -27,11 +29,17 @@ func (p *Pool) Candidates(deviceIDs []string) []hostfailover.Candidate {
 		controller NetworkController
 	}
 	snapshots := make([]snapshot, 0, len(deviceIDs))
+	configuredInterfaces := make(map[string]string, len(deviceIDs))
+	for _, deviceConfig := range config.ListDevices() {
+		configuredInterfaces[strings.TrimSpace(deviceConfig.ID)] = strings.TrimSpace(deviceConfig.Interface)
+	}
+
 	p.mu.RLock()
 	for _, rawID := range deviceIDs {
 		deviceID := strings.TrimSpace(rawID)
 		worker := p.workers[deviceID]
 		if worker == nil {
+			snapshots = append(snapshots, snapshot{id: deviceID, iface: configuredInterfaces[deviceID]})
 			continue
 		}
 		controller := worker.NetworkController()

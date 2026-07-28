@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -336,47 +337,57 @@ func main() {
 
 	var hostFailoverCancel context.CancelFunc
 	var hostFailoverDone <-chan struct{}
-	if cfg.HostFailover.Enabled {
-		routeManager, routeErr := hostfailover.NewRouteManager()
-		if routeErr != nil {
-			logger.Error("主机网络故障切换不可用", "err", routeErr)
+	routeManager, routeErr := hostfailover.NewRouteManager()
+	if routeErr != nil {
+		logger.Error("主机网络故障切换不可用", "err", routeErr)
+	} else {
+		var primaryProbeInterface string
+		var primaryProbe *netprobe.Prober
+		monitor, monitorErr := hostfailover.New(hostfailover.Options{
+			PrimaryInterface: cfg.HostFailover.PrimaryInterface,
+			CandidateDeviceIDsProvider: func() []string {
+				current := config.GetConfig()
+				return append([]string(nil), current.HostFailover.CandidateDeviceIDs...)
+			},
+			ProbeInterval:      time.Duration(cfg.HostFailover.ProbeIntervalSeconds) * time.Second,
+			ProbeTimeout:       time.Duration(cfg.HostFailover.ProbeTimeoutSeconds) * time.Second,
+			FailureThreshold:   cfg.HostFailover.FailureThreshold,
+			RecoveryThreshold:  cfg.HostFailover.RecoveryThreshold,
+			MinimumBackupTime:  time.Duration(cfg.HostFailover.MinimumBackupSeconds) * time.Second,
+			MaximumRouteMetric: cfg.HostFailover.MaximumRouteMetric,
+			PrimaryProbe: func(ctx context.Context, interfaceName string) error {
+				interfaceName = strings.TrimSpace(interfaceName)
+				if interfaceName == "" {
+					return fmt.Errorf("primary host interface is unavailable")
+				}
+				if primaryProbe == nil || primaryProbeInterface != interfaceName {
+					primaryProbe = netprobe.New(netprobe.Config{
+						Interface: interfaceName,
+						IPv4URLs:  cfg.PublicIPProbe.IPv4URLs,
+						Timeout:   time.Duration(cfg.HostFailover.ProbeTimeoutSeconds) * time.Second,
+					})
+					primaryProbeInterface = interfaceName
+				}
+				_, err := primaryProbe.ProbeResult(ctx, netprobe.FamilyV4)
+				return err
+			},
+			CandidateSource: pool,
+			RouteManager:    routeManager,
+			Logger:          slog.Default(),
+		})
+		if monitorErr != nil {
+			logger.Error("主机网络故障切换初始化失败", "err", monitorErr)
 		} else {
-			primaryProbe := netprobe.New(netprobe.Config{
-				Interface: cfg.HostFailover.PrimaryInterface,
-				IPv4URLs:  cfg.PublicIPProbe.IPv4URLs,
-				Timeout:   time.Duration(cfg.HostFailover.ProbeTimeoutSeconds) * time.Second,
-			})
-			monitor, monitorErr := hostfailover.New(hostfailover.Options{
-				PrimaryInterface:   cfg.HostFailover.PrimaryInterface,
-				CandidateDeviceIDs: cfg.HostFailover.CandidateDeviceIDs,
-				ProbeInterval:      time.Duration(cfg.HostFailover.ProbeIntervalSeconds) * time.Second,
-				ProbeTimeout:       time.Duration(cfg.HostFailover.ProbeTimeoutSeconds) * time.Second,
-				FailureThreshold:   cfg.HostFailover.FailureThreshold,
-				RecoveryThreshold:  cfg.HostFailover.RecoveryThreshold,
-				MinimumBackupTime:  time.Duration(cfg.HostFailover.MinimumBackupSeconds) * time.Second,
-				MaximumRouteMetric: cfg.HostFailover.MaximumRouteMetric,
-				PrimaryProbe: func(ctx context.Context) error {
-					_, err := primaryProbe.ProbeResult(ctx, netprobe.FamilyV4)
-					return err
-				},
-				CandidateSource: pool,
-				RouteManager:    routeManager,
-				Logger:          slog.Default(),
-			})
-			if monitorErr != nil {
-				logger.Error("主机网络故障切换初始化失败", "err", monitorErr)
-			} else {
-				failoverCtx, cancel := context.WithCancel(context.Background())
-				done := make(chan struct{})
-				hostFailoverCancel = cancel
-				hostFailoverDone = done
-				go func() {
-					defer close(done)
-					if err := monitor.Run(failoverCtx); err != nil {
-						logger.Error("主机网络故障切换已停止", "err", err)
-					}
-				}()
-			}
+			failoverCtx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			hostFailoverCancel = cancel
+			hostFailoverDone = done
+			go func() {
+				defer close(done)
+				if err := monitor.Run(failoverCtx); err != nil {
+					logger.Error("主机网络故障切换已停止", "err", err)
+				}
+			}()
 		}
 	}
 

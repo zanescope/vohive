@@ -126,9 +126,9 @@ type StartupConfig struct {
 
 // HostFailoverConfig controls opt-in IPv4 default-route failover for the
 // VoHive host. CandidateDeviceIDs is ordered: the first connected candidate
-// that passes an interface-bound public probe wins.
+// that passes an interface-bound public probe wins. PrimaryInterface is an
+// optional override; when empty, the non-candidate default route is discovered.
 type HostFailoverConfig struct {
-	Enabled              bool     `mapstructure:"enabled"`
 	PrimaryInterface     string   `mapstructure:"primary_interface"`
 	CandidateDeviceIDs   []string `mapstructure:"candidate_device_ids"`
 	ProbeIntervalSeconds int      `mapstructure:"probe_interval_seconds"`
