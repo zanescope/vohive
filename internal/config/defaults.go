@@ -18,6 +18,14 @@ func DefaultConfig() Config {
 			WorkerBootstrapConcurrency: DefaultWorkerBootstrapConcurrency,
 			StateSyncConcurrency:       DefaultStartupStateSyncConcurrency,
 		},
+		HostFailover: HostFailoverConfig{
+			ProbeIntervalSeconds: DefaultHostFailoverProbeInterval,
+			ProbeTimeoutSeconds:  DefaultHostFailoverProbeTimeout,
+			FailureThreshold:     DefaultHostFailoverFailureCount,
+			RecoveryThreshold:    DefaultHostFailoverRecoveryCount,
+			MinimumBackupSeconds: DefaultHostFailoverMinBackupTime,
+			MaximumRouteMetric:   DefaultHostFailoverRouteMetric,
+		},
 		Server: ServerConfig{
 			Port: "7575",
 		},

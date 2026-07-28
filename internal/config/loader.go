@@ -41,6 +41,9 @@ func loadCurrent(path string) (*Config, error) {
 	if err := validateStartupConfig(cfg.Startup); err != nil {
 		return nil, err
 	}
+	if err := validateHostFailoverConfig(cfg.HostFailover); err != nil {
+		return nil, err
+	}
 	publicIPProbe, err := loadPublicIPProbeFromYAML(path)
 	if err != nil {
 		return nil, fmt.Errorf("public_ip_probe: %w", err)

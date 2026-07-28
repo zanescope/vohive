@@ -231,6 +231,7 @@ vowifi:
 | `web` | 首次安装生成 | 管理后台账号和密码；当前 schema 不允许留空。 |
 | `free_device_limit` | `5` | 可配置设备数量上限；`0` 表示不限制，负数会拒绝启动。 |
 | `startup` | 见下方 | 启动阶段的并发限制；两个值可独立配置，允许范围均为 `1`–`8`。 |
+| `host_network_failover` | `enabled: false` | Linux 主机默认出口故障切换；启用后按设备 ID 顺序选择一台真实可联网的蜂窝设备。 |
 | `devices` | `[]` | 设备身份和后端设置，建议通过设备管理页面维护。 |
 | `proxy.instances` | `[]` | SOCKS5/HTTP 代理实例，建议通过代理管理页面维护。 |
 | `vowifi` | `enabled: false` | VoWiFi 和可选 SIP 语音网关设置。 |
@@ -273,6 +274,56 @@ public_ip_probe:
 HTTP 请求与 DNS 查询都绑定设备网卡。单个承载连续探测失败时先指数退避，最多进行 6 次快速尝试；之后改为每 10 分钟低频检查，避免 SIM 欠费或网络不可用时持续请求和刷屏。数据承载重连、地址变化或手动刷新会立即重新探测。
 
 中国大陆网络可能无法稳定访问内置国际探测源，可把受信任的境内双栈 HTTPS 回显端点放在各自列表首位。HTTPS 探测依赖系统 CA 根证书；官方容器镜像已内置证书，OpenWrt 或直接运行发布二进制时需安装 `ca-bundle` 或系统等价的 `ca-certificates`，不能关闭 TLS 校验规避错误。
+
+#### 6.3.1 主机网络故障切换
+
+该功能只适用于直接管理 Linux 主机路由的原生部署，默认关闭。下面示例表示：绑定 `eth0` 检查主网，连续失败后依次尝试 `modem-9`、`modem-2`，只让第一台通过网卡绑定公网 IPv4 探测的设备接管主机默认出口。
+
+```yaml
+host_network_failover:
+  enabled: true
+  primary_interface: eth0
+  candidate_device_ids:
+    - modem-9
+    - modem-2
+  probe_interval_seconds: 5
+  probe_timeout_seconds: 8
+  failure_threshold: 3
+  recovery_threshold: 5
+  minimum_backup_seconds: 30
+  maximum_route_metric: 5
+```
+
+| 字段 | 默认值 | 约束与说明 |
+| --- | --- | --- |
+| `enabled` | `false` | 必须显式开启；关闭时不探测主网，也不修改主机路由。 |
+| `primary_interface` | 空 | 启用时必填，例如 `eth0`、`enp1s0`；用于绑定故障与恢复探测。 |
+| `candidate_device_ids` | `[]` | 启用时至少一个；使用稳定的 VoHive 设备 ID，不填写易变的 `wwan*` 接口名，列表顺序就是选择优先级。 |
+| `probe_interval_seconds` | `5` | `2`–`300`；每轮主网/备用网健康检查间隔。 |
+| `probe_timeout_seconds` | `8` | `1`–`60`；单次绑定网卡公网探测超时。 |
+| `failure_threshold` | `3` | `1`–`20`；主网连续失败次数，默认约 15 秒后开始切换。 |
+| `recovery_threshold` | `5` | `1`–`20`；主网连续恢复次数，防止短暂成功导致来回切换。 |
+| `minimum_backup_seconds` | `30` | `0`–`3600`；备用出口启用后的最短保持时间。 |
+| `maximum_route_metric` | `5` | `1`–`4096`；备用路由允许使用的最大 metric；程序会在必要时自动取比主路由更小的安全值。 |
+
+安全边界：
+
+- 当前只接管主机的 IPv4 默认出口，不改变 IPv6，也不影响局域网直连路由。
+- “设备已连接”不等于“设备能上网”。候选必须同时存在运行中的 Worker、已建立数据承载，并通过绑定其运行时网卡的公网 IPv4 探测。
+- 任一时刻只提升一台设备。程序复制该设备已存在的 QMI/MBIM 默认路由，以专用协议标记创建临时低 metric 路由；主网恢复、服务正常停止或服务重启时只删除自己拥有的路由，绝不执行全局 route flush。
+- 主网默认路由的 metric 必须大于 `0`。如果系统使用无 metric 的静态默认路由（内核显示为 `metric 0`），程序会拒绝接管，避免形成不可控的等价多路径；请先在 NetworkManager、systemd-networkd 或 netplan 中为主路由设置明确的正数 metric。
+- 当前不会重写 `/etc/resolv.conf` 或接管 systemd-resolved。主机 DNS 服务器必须能同时经主网和蜂窝出口访问（例如部署者认可的公共 DNS）；否则路由切换后 IP 访问可用，但域名解析仍可能失败。
+- 该开关会改变整台主机的新建出站连接，可能消耗 SIM 流量。不要把全部模组自动加入候选；只列出允许承担主机流量、套餐与稳定性合适的设备。
+
+启用前先确认设备 ID、主接口和主路由 metric：
+
+```sh
+ip -4 route show default
+sudo systemctl restart vohive.service
+journalctl -u vohive.service -f | grep -E 'host network failover|primary host network'
+```
+
+实机验收至少覆盖：断开主网后只出现一条 VoHive 临时备用路由、主机能经所选模组访问公网、其他模组不被提升、主网恢复后临时路由消失，以及 VoHive 在备用期间重启后不残留旧路由。
 
 ### 6.4 设备参数
 

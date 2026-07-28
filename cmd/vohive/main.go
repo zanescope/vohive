@@ -18,6 +18,8 @@ import (
 	"github.com/zanescope/vohive/internal/config"
 	"github.com/zanescope/vohive/internal/db"
 	"github.com/zanescope/vohive/internal/device"
+	"github.com/zanescope/vohive/internal/hostfailover"
+	"github.com/zanescope/vohive/internal/netprobe"
 	"github.com/zanescope/vohive/internal/notify"
 	proxyserver "github.com/zanescope/vohive/internal/proxy/server"
 	"github.com/zanescope/vohive/internal/proxy/traffic"
@@ -332,6 +334,52 @@ func main() {
 	// 5. 启动工作器 (代理, 短信, 健康检查)
 	_ = pool.StartAll()
 
+	var hostFailoverCancel context.CancelFunc
+	var hostFailoverDone <-chan struct{}
+	if cfg.HostFailover.Enabled {
+		routeManager, routeErr := hostfailover.NewRouteManager()
+		if routeErr != nil {
+			logger.Error("主机网络故障切换不可用", "err", routeErr)
+		} else {
+			primaryProbe := netprobe.New(netprobe.Config{
+				Interface: cfg.HostFailover.PrimaryInterface,
+				IPv4URLs:  cfg.PublicIPProbe.IPv4URLs,
+				Timeout:   time.Duration(cfg.HostFailover.ProbeTimeoutSeconds) * time.Second,
+			})
+			monitor, monitorErr := hostfailover.New(hostfailover.Options{
+				PrimaryInterface:   cfg.HostFailover.PrimaryInterface,
+				CandidateDeviceIDs: cfg.HostFailover.CandidateDeviceIDs,
+				ProbeInterval:      time.Duration(cfg.HostFailover.ProbeIntervalSeconds) * time.Second,
+				ProbeTimeout:       time.Duration(cfg.HostFailover.ProbeTimeoutSeconds) * time.Second,
+				FailureThreshold:   cfg.HostFailover.FailureThreshold,
+				RecoveryThreshold:  cfg.HostFailover.RecoveryThreshold,
+				MinimumBackupTime:  time.Duration(cfg.HostFailover.MinimumBackupSeconds) * time.Second,
+				MaximumRouteMetric: cfg.HostFailover.MaximumRouteMetric,
+				PrimaryProbe: func(ctx context.Context) error {
+					_, err := primaryProbe.ProbeResult(ctx, netprobe.FamilyV4)
+					return err
+				},
+				CandidateSource: pool,
+				RouteManager:    routeManager,
+				Logger:          slog.Default(),
+			})
+			if monitorErr != nil {
+				logger.Error("主机网络故障切换初始化失败", "err", monitorErr)
+			} else {
+				failoverCtx, cancel := context.WithCancel(context.Background())
+				done := make(chan struct{})
+				hostFailoverCancel = cancel
+				hostFailoverDone = done
+				go func() {
+					defer close(done)
+					if err := monitor.Run(failoverCtx); err != nil {
+						logger.Error("主机网络故障切换已停止", "err", err)
+					}
+				}()
+			}
+		}
+	}
+
 	trafficSampler := traffic.New(traffic.Options{Pool: pool, Mgr: proxyMgr})
 	trafficSampler.Start()
 	realtimeTraffic := traffic.NewRealtimeManager(traffic.RealtimeOptions{Pool: pool})
@@ -421,6 +469,15 @@ func main() {
 		}
 
 		trafficSampler.Stop()
+
+		if hostFailoverCancel != nil {
+			hostFailoverCancel()
+			select {
+			case <-hostFailoverDone:
+			case <-shutdownCtx.Done():
+				logger.Warn("等待主机网络故障切换清理超时")
+			}
+		}
 
 		if err := proxyMgr.Shutdown(shutdownCtx); err != nil {
 			logger.Error("关闭代理实例时出错", "err", err)
