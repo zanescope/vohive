@@ -93,9 +93,8 @@ func (c *TransportRecoveryController) SetWorkerGeneration(deviceID string, gener
 		return
 	}
 	c.mu.Lock()
-	if c.workerGenerations[deviceID] != generation {
-		delete(c.rebuildTimes, deviceID)
-	}
+	// Rebuild history is keyed by the stable device ID and intentionally
+	// survives Worker generations. Generation only gates stale callbacks.
 	c.workerGenerations[deviceID] = generation
 	c.mu.Unlock()
 }

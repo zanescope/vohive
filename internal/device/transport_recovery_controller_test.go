@@ -151,18 +151,28 @@ func TestAllowRebuildSlidingWindow(t *testing.T) {
 	}
 }
 
-func TestAllowRebuildResetOnGenerationChange(t *testing.T) {
+func TestAllowRebuildPersistsAcrossWorkerGenerations(t *testing.T) {
 	c := NewTransportRecoveryController(nil)
 	now := time.Now()
 	dev := "dev-2"
+	c.SetWorkerGeneration(dev, 1)
 	for i := 0; i < rebuildMaxInWindow; i++ {
-		c.allowRebuildAt(dev, now)
+		if !c.allowRebuildAt(dev, now) {
+			t.Fatalf("attempt %d should be allowed", i+1)
+		}
 	}
 	if c.allowRebuildAt(dev, now) {
 		t.Fatal("should be capped before generation change")
 	}
-	c.SetWorkerGeneration(dev, 42)
-	if !c.allowRebuildAt(dev, now) {
-		t.Fatal("generation change should clear the rebuild window")
+	c.SetWorkerGeneration(dev, 2)
+	if c.allowRebuildAt(dev, now) {
+		t.Fatal("generation change must not clear the stable-device rebuild window")
+	}
+	c.SetWorkerGeneration(dev, 3)
+	if c.allowRebuildAt(dev, now) {
+		t.Fatal("repeated generation changes must not bypass the rebuild cap")
+	}
+	if !c.allowRebuildAt(dev, now.Add(rebuildWindow+time.Second)) {
+		t.Fatal("expired stable-device rebuild history should be pruned")
 	}
 }
