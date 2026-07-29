@@ -232,12 +232,61 @@ func (w *Worker) ackRawSMSQMI(info qmicore.RawSMSIndication, reason string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := smsCore.AckRawSMS(ctx, info, true); err != nil {
+	startedAt := time.Now()
+	result, err := ackRawSMSWithResult(ctx, smsCore, info, true)
+	ackLatency := time.Since(startedAt)
+	if err != nil {
+		hasFailureCause := result != nil && result.HasFailureCause
+		var failureCause uint8
+		failureCauseName := "not_reported"
+		if hasFailureCause {
+			failureCause = result.FailureCause
+			failureCauseName = qmiSMSAckFailureCauseName(failureCause)
+		}
 		logger.Warn(fmt.Sprintf("[%s] QMI 原始短信 ACK 失败", w.ID),
 			"transaction_id", info.TransactionID,
 			"reason", reason,
+			"ack_latency", ackLatency,
+			"protocol", qmiRawSMSAckProtocolName(info.Format),
+			"format", info.Format,
+			"ack_required", info.AckRequired,
+			"has_failure_cause", hasFailureCause,
+			"failure_cause", failureCause,
+			"failure_cause_name", failureCauseName,
 			"err", err,
 		)
+	}
+}
+
+func ackRawSMSWithResult(
+	ctx context.Context,
+	smsCore qmiSMSCore,
+	info qmicore.RawSMSIndication,
+	success bool,
+) (*qmi.WMSAckResult, error) {
+	if resultCore, ok := smsCore.(qmiSMSAckResultCore); ok {
+		return resultCore.AckRawSMSWithResult(ctx, info, success)
+	}
+	return nil, smsCore.AckRawSMS(ctx, info, success)
+}
+
+func qmiRawSMSAckProtocolName(format uint8) string {
+	if format == 0x00 {
+		return "cdma"
+	}
+	return "wcdma"
+}
+
+func qmiSMSAckFailureCauseName(cause uint8) string {
+	switch cause {
+	case 0:
+		return "no_network_response"
+	case 1:
+		return "network_released_link"
+	case 2:
+		return "not_sent"
+	default:
+		return "unknown"
 	}
 }
 

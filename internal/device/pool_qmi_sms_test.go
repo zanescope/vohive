@@ -5,12 +5,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
 	qmimanager "github.com/zanescope/quectel-qmi-go/pkg/manager"
 	"github.com/zanescope/quectel-qmi-go/pkg/qmi"
 	qmicore "github.com/zanescope/vohive/internal/qmi"
+	"github.com/zanescope/vohive/pkg/logger"
 	"github.com/zanescope/vohive/pkg/smscodec"
 )
 
@@ -29,6 +31,8 @@ type qmiSMSCoreStub struct {
 	listCalls   []string
 	deleteCalls []string
 	ackCalls    []qmicore.RawSMSIndication
+	ackResult   *qmi.WMSAckResult
+	ackErr      error
 }
 
 func (s *qmiSMSCoreStub) key(storage uint8, index uint32) string {
@@ -80,11 +84,20 @@ func (s *qmiSMSCoreStub) WMSDeleteMessage(ctx context.Context, storageType uint8
 	return nil
 }
 
-func (s *qmiSMSCoreStub) AckRawSMS(ctx context.Context, info qmicore.RawSMSIndication, success bool) error {
+func (s *qmiSMSCoreStub) recordRawSMSAck(info qmicore.RawSMSIndication, success bool) {
 	if success {
 		s.ackCalls = append(s.ackCalls, info)
 	}
-	return nil
+}
+
+func (s *qmiSMSCoreStub) AckRawSMS(ctx context.Context, info qmicore.RawSMSIndication, success bool) error {
+	s.recordRawSMSAck(info, success)
+	return s.ackErr
+}
+
+func (s *qmiSMSCoreStub) AckRawSMSWithResult(ctx context.Context, info qmicore.RawSMSIndication, success bool) (*qmi.WMSAckResult, error) {
+	s.recordRawSMSAck(info, success)
+	return s.ackResult, s.ackErr
 }
 
 const qmiRawSMSFixtureFullPDU = "0791448720003023400ED0E7B4D97C0E9BCD000062500221230140A00500036A0402CAA0B49B5E96BBCB741DE81C369B5DECFC8B2E0FDBCBEC3099FC76CF158A6198CD9E83C6EF391D1488B960AF76DA5DA79741F437A81D5E9741613719242F8FCB697BD905A296F1F439282C2F8366303888FE06CDCB6E32485CA783CCF27219447F83E4E571396D2FBB40C4303D0C4ACF416374587E2E9341613A480683BF9A429742617CCB41000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
@@ -298,5 +311,65 @@ func TestHandleRawSMSQMIAcksDecodeFailure(t *testing.T) {
 	}
 	if stub.ackCalls[0].TransactionID != 0x55667788 {
 		t.Fatalf("ack transaction=0x%x, want 0x55667788", stub.ackCalls[0].TransactionID)
+	}
+}
+
+func TestAckRawSMSQMILogPreservesFailureCauseResult(t *testing.T) {
+	logger.Setup(logger.LogConfig{Debug: true, Filename: filepath.Join(t.TempDir(), "app.log")})
+
+	ackErr := errors.New("send ack failed: QMI error 0x0054")
+	stub := &qmiSMSCoreStub{
+		ackResult: &qmi.WMSAckResult{
+			HasFailureCause: true,
+			FailureCause:    2,
+		},
+		ackErr: ackErr,
+	}
+	worker := &Worker{ID: "wwan0", Pool: &Pool{}, qmiSMS: stub}
+	ch := logger.GlobalBroadcaster.Subscribe()
+	defer logger.GlobalBroadcaster.Unsubscribe(ch)
+
+	worker.ackRawSMSQMI(qmicore.RawSMSIndication{
+		AckRequired:   true,
+		TransactionID: ^uint32(0),
+		Format:        0x06,
+	}, "processed")
+
+	if len(stub.ackCalls) != 1 {
+		t.Fatalf("ackCalls=%d, want 1", len(stub.ackCalls))
+	}
+	if stub.ackCalls[0].TransactionID != ^uint32(0) {
+		t.Fatalf("ack transaction=0x%x, want 0xffffffff", stub.ackCalls[0].TransactionID)
+	}
+
+	entry := waitLogEntry(t, ch, func(entry logger.LogEntry) bool {
+		return entry.Message == "[wwan0] QMI 原始短信 ACK 失败"
+	})
+	fields := readLogFields(t, entry)
+	if fields["transaction_id"] != float64(^uint32(0)) || fields["ack_required"] != true {
+		t.Fatalf("unexpected ACK identity fields: %v", fields)
+	}
+	if fields["protocol"] != "wcdma" || fields["format"] != float64(0x06) {
+		t.Fatalf("unexpected protocol fields: %v", fields)
+	}
+	if fields["has_failure_cause"] != true || fields["failure_cause"] != float64(2) || fields["failure_cause_name"] != "not_sent" {
+		t.Fatalf("unexpected failure cause fields: %v", fields)
+	}
+	if _, ok := fields["ack_latency"]; !ok {
+		t.Fatalf("missing ack_latency: %v", fields)
+	}
+}
+
+func TestQMISMSAckFailureCauseName(t *testing.T) {
+	tests := map[uint8]string{
+		0:    "no_network_response",
+		1:    "network_released_link",
+		2:    "not_sent",
+		0xff: "unknown",
+	}
+	for cause, want := range tests {
+		if got := qmiSMSAckFailureCauseName(cause); got != want {
+			t.Errorf("cause=%d name=%q want %q", cause, got, want)
+		}
 	}
 }

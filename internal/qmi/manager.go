@@ -2320,19 +2320,39 @@ func (m *Manager) OnVoiceUSSDNoWaitResult(handler func(*qmi.VoiceUSSDNoWaitIndic
 	return nil
 }
 
-func (m *Manager) AckRawSMS(ctx context.Context, info RawSMSIndication, success bool) error {
-	if m == nil || m.qmiMgr == nil {
-		return fmt.Errorf("qmi_manager_not_available")
-	}
+type rawSMSAckSender interface {
+	WMSSendAck(context.Context, qmi.WMSAckRequest) (*qmi.WMSAckResult, error)
+}
+
+func sendRawSMSAck(
+	ctx context.Context,
+	sender rawSMSAckSender,
+	info RawSMSIndication,
+	success bool,
+) (*qmi.WMSAckResult, error) {
 	protocol := qmi.WMSMessageProtocolWCDMA
 	if info.Format == 0x00 {
 		protocol = qmi.WMSMessageProtocolCDMA
 	}
-	_, err := m.qmiMgr.WMSSendAck(ctx, qmi.WMSAckRequest{
+	return sender.WMSSendAck(ctx, qmi.WMSAckRequest{
 		TransactionID: info.TransactionID,
 		Protocol:      protocol,
 		Success:       success,
 	})
+}
+
+// AckRawSMSWithResult sends a raw SMS ACK and preserves the optional WMS
+// failure-cause result even when the modem also returns a QMI error.
+func (m *Manager) AckRawSMSWithResult(ctx context.Context, info RawSMSIndication, success bool) (*qmi.WMSAckResult, error) {
+	if m == nil || m.qmiMgr == nil {
+		return nil, fmt.Errorf("qmi_manager_not_available")
+	}
+	return sendRawSMSAck(ctx, m.qmiMgr, info, success)
+}
+
+// AckRawSMS retains the original error-only API for existing callers.
+func (m *Manager) AckRawSMS(ctx context.Context, info RawSMSIndication, success bool) error {
+	_, err := m.AckRawSMSWithResult(ctx, info, success)
 	return err
 }
 

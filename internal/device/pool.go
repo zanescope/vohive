@@ -56,6 +56,10 @@ type qmiSMSCore interface {
 	AckRawSMS(ctx context.Context, info qmicore.RawSMSIndication, success bool) error
 }
 
+type qmiSMSAckResultCore interface {
+	AckRawSMSWithResult(ctx context.Context, info qmicore.RawSMSIndication, success bool) (*qmi.WMSAckResult, error)
+}
+
 type liveSIMIdentityReader interface {
 	GetICCIDLive(ctx context.Context) (string, error)
 	GetIMSILive(ctx context.Context) (string, error)
