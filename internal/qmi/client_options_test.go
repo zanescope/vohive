@@ -68,7 +68,7 @@ func TestClientOptionsFromDeviceConfigDefaultsQMIBackendToDirectWhenControlDevic
 	}
 }
 
-func TestClientOptionsFromDeviceConfigUsesProxyForQMIBackendWhenControlDeviceHasHolders(t *testing.T) {
+func TestClientOptionsFromDeviceConfigKeepsExplicitDirectWhenControlDeviceHasHolders(t *testing.T) {
 	proxyExecutable := filepath.Join(t.TempDir(), "qmi-proxy")
 	writeExecutableForTest(t, proxyExecutable)
 	restore := stubQMIControlDeviceHolders(t, qmiControlDeviceHolders{
@@ -82,15 +82,15 @@ func TestClientOptionsFromDeviceConfigUsesProxyForQMIBackendWhenControlDeviceHas
 		QMIProxyExecutable: proxyExecutable,
 	})
 
-	if !opts.UseProxy {
-		t.Fatal("UseProxy=false, want true when qmi control device has holders")
+	if opts.UseProxy {
+		t.Fatal("UseProxy=true, want false because holder detection must not change explicit transport")
 	}
 	if opts.ProxyFallbackToRaw {
 		t.Fatal("ProxyFallbackToRaw=true, want no raw fallback when holders are present")
 	}
 }
 
-func TestClientOptionsFromDeviceConfigUsesProxyWhenHolderScanUnknown(t *testing.T) {
+func TestClientOptionsFromDeviceConfigKeepsExplicitDirectWhenHolderScanUnknown(t *testing.T) {
 	proxyExecutable := filepath.Join(t.TempDir(), "qmi-proxy")
 	writeExecutableForTest(t, proxyExecutable)
 	restore := stubQMIControlDeviceHolders(t, qmiControlDeviceHolders{Unknown: true})
@@ -102,8 +102,8 @@ func TestClientOptionsFromDeviceConfigUsesProxyWhenHolderScanUnknown(t *testing.
 		QMIProxyExecutable: proxyExecutable,
 	})
 
-	if !opts.UseProxy {
-		t.Fatal("UseProxy=false, want true when qmi holder scan is unknown")
+	if opts.UseProxy {
+		t.Fatal("UseProxy=true, want false because an unknown scan must not change explicit transport")
 	}
 	if opts.ProxyFallbackToRaw {
 		t.Fatal("ProxyFallbackToRaw=true, want no raw fallback when scan is unknown")
@@ -171,6 +171,7 @@ func TestClientOpenModeSummaryReportsProxy(t *testing.T) {
 		ID:                 "dev-qmi",
 		ControlDevice:      "/dev/cdc-wdm0",
 		DeviceBackend:      "qmi",
+		QMIUseProxy:        true,
 		QMIProxyPath:       "@qmi-proxy",
 		QMIProxyExecutable: proxyExecutable,
 	})

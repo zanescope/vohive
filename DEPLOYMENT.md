@@ -355,7 +355,7 @@ devices:
 | `module_vendor` | `quectel`；可选 `quectel`、`simcom` | AT 指令方言。 |
 | `proxy_port` | `0` | 兼容的设备代理端口；新代理实例优先配置在 `proxy.instances`。 |
 | `mbim_transport` | `auto`；可选 `auto`、`proxy`、`direct` | MBIM 控制通道打开方式。 |
-| `qmi_use_proxy` | `false` | 是否通过 libqmi `qmi-proxy` 打开 QMI 控制口；它不能替代下方的 ModemManager 所有权隔离。 |
+| `qmi_use_proxy` | `false` | 明确选择 QMI 控制口打开方式：`false` 为直连，`true` 为 libqmi `qmi-proxy`。运行时不会根据瞬时占用自动切换，两种方式都不能替代下方的 ModemManager 所有权隔离。 |
 | `qmi_proxy_path` | 空 | 自定义 qmi-proxy abstract socket 名称。 |
 | `qmi_proxy_executable` | 空 | 自定义 qmi-proxy 可执行文件路径。 |
 | `esim_transport` | `at`；可选 `at`、`qmi`、`mbim` | 兼容字段；设置 `device_backend` 时会优先从后端推导。 |
@@ -371,7 +371,9 @@ devices:
 
 同一个 QMI 控制口只能由一套设备管理栈负责。`qmi_use_proxy: true` 可以让多个 QMI 客户端共享 `qmi-proxy`，但不能让 VoHive 与 ModemManager 安全地共管同一台设备。如果 `qmi-proxy` 由 `ModemManager.service` 启动，ModemManager 崩溃、停止或重启时，systemd 可能同时清理该 proxy，导致共享它的全部 VoHive QMI 客户端收到 EOF。
 
-VoHive 会在打开实际控制口前检查占用进程的 cgroup 与父进程链。确认占用者属于 ModemManager 时会记录 `qmi_modemmanager_conflict=true` 和 `action=isolate_modemmanager_from_vohive_devices` 的非阻断告警；告警不会自动停止服务，也不会修改主机规则。
+VoHive 会在每次启动 QMI 控制面、紧邻实际打开控制口前重新检查占用进程的 cgroup 与父进程链。占用扫描失败或结果不完整时会拒绝打开；直连模式只允许无人占用的控制口，proxy 模式只允许无人占用或仅由 `qmi-proxy` 占用的控制口。运行时不会因为一次瞬时扫描结果在直连与 proxy 之间自动切换。
+
+确认占用者属于 ModemManager 时，VoHive 会记录 `qmi_modemmanager_conflict=true`、`action=isolate_modemmanager_from_vohive_devices` 以及启动预检错误，并拒绝本次 QMI 启动。它不会自动停止系统服务或修改主机规则；完成下述隔离后，后续启动重试会重新扫描。
 
 **专用 VoHive 主机**
 

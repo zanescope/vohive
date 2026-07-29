@@ -388,6 +388,11 @@ func (p *Pool) qmiRecoveryLiveCandidates(cfg config.DeviceConfig) ([]qmiRecovery
 }
 
 func qmiStartCoreFailureShouldAbortWorker(message string) bool {
+	if strings.Contains(strings.ToLower(message), "qmi_transport_ownership_preflight") {
+		// Ownership can converge after an operator isolates ModemManager or
+		// releases a stale holder, so keep the worker alive for bounded retry.
+		return false
+	}
 	return qmiErrorIndicatesTransportDown(message)
 }
 

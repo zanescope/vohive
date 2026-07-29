@@ -210,6 +210,10 @@ func TestQMIStartCoreFailureClassifiesTransientUSBErrors(t *testing.T) {
 		}
 	}
 
+	if qmiStartCoreFailureShouldAbortWorker("qmi_transport_ownership_preflight: holder scan failed: no such file or directory") {
+		t.Fatal("qmiStartCoreFailureShouldAbortWorker(ownership preflight) = true, want bounded retry")
+	}
+
 	if qmiStartCoreFailureShouldAbortWorker("UIM service not supported") {
 		t.Fatal("qmiStartCoreFailureShouldAbortWorker(non-transient) = true, want false")
 	}

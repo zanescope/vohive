@@ -108,10 +108,12 @@ type qmiTransportDecision struct {
 	HolderScanUnknown    bool
 	HolderScanError      string
 	ModemManagerHolders  []qmiControlDeviceHolder
+	Holders              []qmiControlDeviceHolder
+	OnlyQMIProxy         bool
 }
 
-func decideQMITransport(cfg config.DeviceConfig, backend string) qmiTransportDecision {
-	decision := qmiTransportDecision{}
+func decideQMITransport(cfg config.DeviceConfig, _ string) qmiTransportDecision {
+	decision := qmiTransportDecision{UseProxy: cfg.QMIUseProxy}
 	controlDevice := strings.TrimSpace(cfg.ControlDevice)
 	if controlDevice == "" {
 		controlDevice = strings.TrimSpace(cfg.QMIDevice)
@@ -123,6 +125,8 @@ func decideQMITransport(cfg config.DeviceConfig, backend string) qmiTransportDec
 			decision.HolderScanError = err.Error()
 		} else {
 			decision.HolderCount = len(holders.Holders)
+			decision.Holders = append(decision.Holders, holders.Holders...)
+			decision.OnlyQMIProxy = holders.onlyQMIProxy()
 			decision.HolderScanUnknown = holders.Unknown
 			for _, holder := range holders.Holders {
 				if holder.ModemManagerOwned {
@@ -132,15 +136,6 @@ func decideQMITransport(cfg config.DeviceConfig, backend string) qmiTransportDec
 		}
 	}
 
-	if cfg.QMIUseProxy {
-		decision.UseProxy = true
-		return decision
-	}
-	if backend == "qmi" &&
-		decision.ControlDeviceScanned &&
-		(decision.HolderScanError != "" || decision.HolderScanUnknown || decision.HolderCount > 0) {
-		decision.UseProxy = true
-	}
 	return decision
 }
 
