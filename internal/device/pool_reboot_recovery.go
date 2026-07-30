@@ -75,13 +75,14 @@ func (p *Pool) markQMIControlRecovered(worker *Worker, reason string) {
 }
 
 type modemRebootRecoveryOptions struct {
-	deviceID               string
-	reason                 string
-	delays                 []time.Duration
-	removeBeforeScan       bool
-	restoreVoWiFi          bool
-	transportEvent         *TransportRecoveryEvent
-	transportEventObserved bool
+	deviceID                  string
+	reason                    string
+	delays                    []time.Duration
+	removeBeforeScan          bool
+	restoreVoWiFi             bool
+	transportEvent            *TransportRecoveryEvent
+	transportRecoveryToken    TransportRecoveryToken
+	transportRecoveryBudgeted bool
 }
 
 func defaultModemRebootRecoveryOptions(deviceID string, reason string) modemRebootRecoveryOptions {
@@ -368,25 +369,36 @@ func (p *Pool) ScheduleModemRebootRecovery(deviceID string, reason string) {
 }
 
 func (p *Pool) scheduleWorkerRecoveryWithTransportEvent(deviceID string, reason string, event *TransportRecoveryEvent) bool {
+	return p.scheduleWorkerRecoveryWithTransportEventPolicy(deviceID, reason, event, false) == TransportRecoveryBeginAccepted
+}
+
+func (p *Pool) scheduleTransportRebuildWithEvent(deviceID string, reason string, event *TransportRecoveryEvent) TransportRecoveryBeginStatus {
+	return p.scheduleWorkerRecoveryWithTransportEventPolicy(deviceID, reason, event, true)
+}
+
+func (p *Pool) scheduleWorkerRecoveryWithTransportEventPolicy(deviceID string, reason string, event *TransportRecoveryEvent, budgeted bool) TransportRecoveryBeginStatus {
 	deviceID = strings.TrimSpace(deviceID)
 	reason = strings.TrimSpace(reason)
 	if p == nil || deviceID == "" {
-		return false
+		return TransportRecoveryBeginInvalid
 	}
 	if reason == "" {
 		reason = "worker_recovery"
 	}
 	opts := defaultModemRebootRecoveryOptions(deviceID, reason)
-	opts.transportEvent = event
-	if event != nil && p.transportRecovery != nil {
-		if event.DeviceID == "" {
-			event.DeviceID = deviceID
+	if event != nil {
+		normalizedEvent := *event
+		normalizedEvent.DeviceID = deviceID
+		opts.transportEvent = &normalizedEvent
+		opts.transportRecoveryBudgeted = budgeted
+		if p.transportRecovery != nil {
+			token, status := p.transportRecovery.Begin(normalizedEvent, budgeted)
+			if status != TransportRecoveryBeginAccepted {
+				logger.Debug("QMI 恢复调度被控制器拒绝", "device", deviceID, "reason", reason, "status", status)
+				return status
+			}
+			opts.transportRecoveryToken = token
 		}
-		if !p.transportRecovery.Observe(*event) {
-			logger.Debug("QMI 恢复已在运行，跳过重复调度", "device", deviceID, "reason", reason)
-			return false
-		}
-		opts.transportEventObserved = true
 	}
 	if worker := p.GetWorker(deviceID); worker != nil {
 		worker.RecordWatchdogEvent(WatchdogEvent{
@@ -397,7 +409,7 @@ func (p *Pool) scheduleWorkerRecoveryWithTransportEvent(deviceID string, reason 
 		})
 	}
 	go p.runModemRebootRecovery(opts)
-	return true
+	return TransportRecoveryBeginAccepted
 }
 
 func (p *Pool) scheduleWorkerRecovery(deviceID string, reason string) {
@@ -462,28 +474,35 @@ func (p *Pool) runModemRebootRecovery(opts modemRebootRecoveryOptions) {
 	if p == nil || opts.deviceID == "" {
 		return
 	}
+	controller := p.transportRecovery
+	token := opts.transportRecoveryToken
 	if !p.beginModemRebootRecovery(opts.deviceID) {
-		if opts.transportEventObserved && p.transportRecovery != nil {
-			p.transportRecovery.Finish(opts.deviceID)
+		if controller != nil && token.valid() {
+			controller.Finish(token)
 		}
 		logger.Debug("模组重启恢复已在运行，跳过重复调度", "device", opts.deviceID, "reason", opts.reason)
 		return
 	}
+	defer p.finishModemRebootRecovery(opts.deviceID)
 
-	if opts.transportEvent != nil && p.transportRecovery != nil && !opts.transportEventObserved {
-		if !p.transportRecovery.Observe(*opts.transportEvent) {
-			p.finishModemRebootRecovery(opts.deviceID)
-			logger.Debug("QMI 恢复已在运行，释放 modem reboot 锁并跳过", "device", opts.deviceID, "reason", opts.reason)
+	if opts.transportEvent != nil && controller != nil && !token.valid() {
+		var status TransportRecoveryBeginStatus
+		token, status = controller.Begin(*opts.transportEvent, opts.transportRecoveryBudgeted)
+		if status != TransportRecoveryBeginAccepted {
+			logger.Debug("QMI 恢复调度被控制器拒绝，释放 modem reboot 锁并跳过", "device", opts.deviceID, "reason", opts.reason, "status", status)
 			return
 		}
 	}
-
-	defer func() {
-		p.finishModemRebootRecovery(opts.deviceID)
-		if p.transportRecovery != nil {
-			p.transportRecovery.Finish(opts.deviceID)
+	if controller != nil && token.valid() {
+		defer controller.Finish(token)
+		if p.ctx != nil && p.ctx.Err() != nil {
+			return
 		}
-	}()
+		if !controller.Commit(token) {
+			logger.Debug("QMI 恢复预留在实际启动前失效，跳过重建", "device", opts.deviceID, "reason", opts.reason)
+			return
+		}
+	}
 	initialWorker := p.GetWorker(opts.deviceID)
 	initialControlReady := qmiWorkerControlReady(initialWorker)
 	if initialWorker != nil {
