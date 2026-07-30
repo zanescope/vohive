@@ -149,15 +149,13 @@ func seedPublicIPRuntime(worker *Worker, privateV4, privateV6, publicV4, publicV
 	state.publishedV4, state.publishedV6 = publicV4, publicV6
 	state.authoritativeV4, state.authoritativeV6 = publicV4, publicV6
 	state.mobikeBaseV4, state.mobikeBaseV6 = "", ""
-	state.retrying = false
+	resetPublicIPProbeCadenceLocked(state, publicIPProbePhaseHealthy)
 	state.cycleResolvedV4 = !state.expectedV4 || publicV4 != ""
 	state.cycleResolvedV6 = !state.expectedV6 || publicV6 != ""
 	state.cycleMOBIKEReserved = false
 	state.mobikeTransitionReserved = false
 	state.pendingMOBIKE = nil
 	state.mobikeInFlight = 0
-	state.retryAttemptV4, state.retryAttemptV6 = 0, 0
-	state.noAddressTries = 0
 	state.revision++
 	worker.cacheMu.Lock()
 	worker.cachedIP, worker.cachedPublicIPv6 = publicV4, publicV6
@@ -201,6 +199,100 @@ func waitPublicIPTest(t *testing.T, timeout time.Duration, condition func() bool
 	}
 	if !condition() {
 		t.Fatal("condition was not satisfied before timeout")
+	}
+}
+
+type fakePublicIPTimer struct {
+	mu      sync.Mutex
+	delay   time.Duration
+	fn      func()
+	stopped bool
+	fired   bool
+}
+
+func (timer *fakePublicIPTimer) Stop() bool {
+	timer.mu.Lock()
+	defer timer.mu.Unlock()
+	if timer.stopped || timer.fired {
+		return false
+	}
+	timer.stopped = true
+	return true
+}
+
+func (timer *fakePublicIPTimer) Fire() bool {
+	timer.mu.Lock()
+	if timer.stopped || timer.fired {
+		timer.mu.Unlock()
+		return false
+	}
+	timer.fired = true
+	fn := timer.fn
+	timer.mu.Unlock()
+	fn()
+	return true
+}
+
+func (timer *fakePublicIPTimer) active() bool {
+	timer.mu.Lock()
+	defer timer.mu.Unlock()
+	return !timer.stopped && !timer.fired
+}
+
+type fakePublicIPClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	timers []*fakePublicIPTimer
+}
+
+func installFakePublicIPClock(t *testing.T, worker *Worker) *fakePublicIPClock {
+	t.Helper()
+	if worker == nil {
+		t.Fatal("worker is required")
+	}
+	clock := &fakePublicIPClock{now: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)}
+	state := &worker.publicIP
+	state.mu.Lock()
+	state.now = clock.Now
+	state.scheduleTimer = clock.AfterFunc
+	state.mu.Unlock()
+	return clock
+}
+
+func (clock *fakePublicIPClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *fakePublicIPClock) AfterFunc(delay time.Duration, fn func()) publicIPTimer {
+	timer := &fakePublicIPTimer{delay: delay, fn: fn}
+	clock.mu.Lock()
+	clock.timers = append(clock.timers, timer)
+	clock.mu.Unlock()
+	return timer
+}
+
+func (clock *fakePublicIPClock) latestActive(t *testing.T) *fakePublicIPTimer {
+	t.Helper()
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	for index := len(clock.timers) - 1; index >= 0; index-- {
+		if clock.timers[index].active() {
+			return clock.timers[index]
+		}
+	}
+	t.Fatal("no active public IP timer")
+	return nil
+}
+
+func (clock *fakePublicIPClock) advanceAndFire(t *testing.T, timer *fakePublicIPTimer) {
+	t.Helper()
+	clock.mu.Lock()
+	clock.now = clock.now.Add(timer.delay)
+	clock.mu.Unlock()
+	if !timer.Fire() {
+		t.Fatal("public IP timer was already stopped or fired")
 	}
 }
 
@@ -467,7 +559,7 @@ func TestPublicIPRotationDisconnectConnectProbeTriggersMOBIKEOnce(t *testing.T) 
 		t.Fatalf("MOBIKE request=%+v", request)
 	}
 
-	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	waitPublicIPTest(t, time.Second, func() bool { return controller.probeCalls.Load() >= 2 })
 	if got := session.calls.Load(); got != 1 {
 		t.Fatalf("MOBIKE calls=%d, want exactly one", got)
@@ -613,7 +705,7 @@ func TestPublicIPPartialDualStackResultsMergeAcrossRetries(t *testing.T) {
 		v4, v6 := publicIPTestCached(worker)
 		return v4 == "8.8.8.8" && v6 == ""
 	})
-	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	waitPublicIPTest(t, time.Second, func() bool {
 		v4, v6 := publicIPTestCached(worker)
 		return v4 == "8.8.8.8" && v6 == "2606:4700:4700::1111"
@@ -670,7 +762,7 @@ func TestPublicIPLocalBearerFallbackIsDisplayOnly(t *testing.T) {
 	}
 
 	controller.setPublic("9.9.9.9", "")
-	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	waitPublicIPTest(t, time.Second, func() bool {
 		state.mu.Lock()
 		defer state.mu.Unlock()
@@ -704,7 +796,7 @@ func TestPublicIPLocalFallbackDoesNotConsumeOldAuthoritativeBaseline(t *testing.
 	state.mu.Unlock()
 
 	controller.setPublic("9.9.9.9", "")
-	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	waitPublicIPTest(t, time.Second, func() bool { return session.calls.Load() == 1 })
 	request := session.lastRequest()
 	if request.OldIP != "1.1.1.1" || request.NewIP != "9.9.9.9" {
@@ -735,7 +827,7 @@ func TestPublicIPDualStackSplitRetryReservesOneMOBIKEPerCycle(t *testing.T) {
 
 	p.refreshIPs(worker, true)
 	waitPublicIPTest(t, time.Second, func() bool { return session.calls.Load() == 1 })
-	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	waitPublicIPTest(t, time.Second, func() bool {
 		v4, v6 := publicIPTestCached(worker)
 		return v4 == "9.9.9.9" && v6 == newV6
@@ -778,7 +870,7 @@ func TestPublicIPDualStackUnchangedFirstFamilyDefersMOBIKEToChangedRetry(t *test
 	if got := session.calls.Load(); got != 0 {
 		t.Fatalf("unchanged first family triggered %d MOBIKE calls", got)
 	}
-	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	waitPublicIPTest(t, time.Second, func() bool { return session.calls.Load() == 1 })
 	request := session.lastRequest()
 	if request.OldIP != oldV6 || request.NewIP != newV6 {
@@ -1110,13 +1202,25 @@ func TestPublicIPNoAddressUsesBackoffWithoutLaunchingProbe(t *testing.T) {
 		t.Fatalf("first no-address state tries=%d timer=%v probes=%d", firstTries, firstTimer != nil, controller.probeCalls.Load())
 	}
 
+	// An unchanged event must not consume another attempt or move the timer.
 	worker.Pool.refreshIPs(worker, true)
 	state.mu.Lock()
 	secondTimer := state.retryTimer
 	secondTries := state.noAddressTries
 	state.mu.Unlock()
-	if secondTries != 2 || secondTimer == nil || secondTimer == firstTimer || controller.probeCalls.Load() != 0 {
-		t.Fatalf("second no-address state tries=%d replaced=%t probes=%d", secondTries, secondTimer != nil && secondTimer != firstTimer, controller.probeCalls.Load())
+	if secondTries != 1 || secondTimer != firstTimer || controller.probeCalls.Load() != 0 {
+		t.Fatalf("unchanged event moved no-address cadence: tries=%d same_timer=%t probes=%d",
+			secondTries, secondTimer == firstTimer, controller.probeCalls.Load())
+	}
+
+	worker.Pool.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
+	state.mu.Lock()
+	thirdTimer := state.retryTimer
+	thirdTries := state.noAddressTries
+	state.mu.Unlock()
+	if thirdTries != 2 || thirdTimer == nil || thirdTimer == firstTimer || controller.probeCalls.Load() != 0 {
+		t.Fatalf("timer no-address state tries=%d replaced=%t probes=%d",
+			thirdTries, thirdTimer != nil && thirdTimer != firstTimer, controller.probeCalls.Load())
 	}
 	if retryDelay(2) <= retryDelay(1) {
 		t.Fatalf("retry delay did not back off: first=%s second=%s", retryDelay(1), retryDelay(2))
@@ -1194,16 +1298,11 @@ func TestStopNetworkClearsMOBIKEBaseline(t *testing.T) {
 }
 
 func TestPublicIPProbeFallsBackToPeriodicChecksAfterRetryLimit(t *testing.T) {
-	previousLimit := publicIPRetryLimit
-	previousInterval := publicIPRecheckInterval
-	publicIPRetryLimit = 2
-	publicIPRecheckInterval = time.Hour
-	t.Cleanup(func() {
-		publicIPRetryLimit = previousLimit
-		publicIPRecheckInterval = previousInterval
-	})
-
 	p, worker, controller := newPublicIPStateHarness(t)
+	state := &worker.publicIP
+	state.mu.Lock()
+	state.retryLimit = 2
+	state.mu.Unlock()
 	controller.setPrivate("10.0.0.2", "")
 	controller.setPublic("", "")
 
@@ -1215,50 +1314,46 @@ func TestPublicIPProbeFallsBackToPeriodicChecksAfterRetryLimit(t *testing.T) {
 		return controller.probeCalls.Load() >= 1 && state.retryAttemptV4 == 1 && state.retryTimer != nil
 	})
 
-	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	waitPublicIPTest(t, time.Second, func() bool {
 		state := &worker.publicIP
 		state.mu.Lock()
 		defer state.mu.Unlock()
 		return controller.probeCalls.Load() >= 2 && state.retryAttemptV4 == 2 &&
-			!state.retrying && state.retryTimer == nil && state.periodicTimer != nil
+			state.phase == publicIPProbePhaseDegraded && !state.retrying &&
+			state.retryTimer == nil && state.periodicTimer != nil
 	})
 
 	controller.setPublic("8.8.8.8", "")
-	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	waitPublicIPTest(t, time.Second, func() bool {
 		v4, _ := publicIPTestCached(worker)
 		return v4 == "8.8.8.8"
 	})
-	state := &worker.publicIP
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.retryAttemptV4 != 0 || state.retrying || state.retryTimer != nil || state.periodicTimer == nil {
-		t.Fatalf("recovered state attempts=%d retrying=%t retry=%v periodic=%v",
-			state.retryAttemptV4, state.retrying, state.retryTimer != nil, state.periodicTimer != nil)
+	if state.phase != publicIPProbePhaseHealthy || state.retryAttemptV4 != 0 ||
+		state.retrying || state.retryTimer != nil || state.periodicTimer == nil {
+		t.Fatalf("recovered state phase=%s attempts=%d retrying=%t retry=%v periodic=%v",
+			state.phase, state.retryAttemptV4, state.retrying, state.retryTimer != nil, state.periodicTimer != nil)
 	}
 }
 
 func TestPublicIPMissingBearerAddressStopsRapidRetries(t *testing.T) {
-	previousLimit := publicIPRetryLimit
-	previousInterval := publicIPRecheckInterval
-	publicIPRetryLimit = 2
-	publicIPRecheckInterval = time.Hour
-	t.Cleanup(func() {
-		publicIPRetryLimit = previousLimit
-		publicIPRecheckInterval = previousInterval
-	})
-
 	p, worker, controller := newPublicIPStateHarness(t)
-	controller.setPrivate("", "")
-	p.refreshIPs(worker, true)
-	p.refreshIPs(worker, true)
-
 	state := &worker.publicIP
 	state.mu.Lock()
+	state.retryLimit = 2
+	state.mu.Unlock()
+	controller.setPrivate("", "")
+	p.refreshIPs(worker, true)
+	p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
+
+	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.noAddressTries != 2 || state.retrying || state.retryTimer != nil || state.periodicTimer == nil {
-		t.Fatalf("missing-address state attempts=%d retrying=%t retry=%v periodic=%v",
-			state.noAddressTries, state.retrying, state.retryTimer != nil, state.periodicTimer != nil)
+	if state.phase != publicIPProbePhaseDegraded || state.noAddressTries != 2 ||
+		state.retrying || state.retryTimer != nil || state.periodicTimer == nil {
+		t.Fatalf("missing-address state phase=%s attempts=%d retrying=%t retry=%v periodic=%v",
+			state.phase, state.noAddressTries, state.retrying, state.retryTimer != nil, state.periodicTimer != nil)
 	}
 }

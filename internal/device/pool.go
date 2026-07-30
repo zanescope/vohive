@@ -793,12 +793,11 @@ func (p *Pool) bindMBIMStateIndications(worker *Worker) {
 		p.handleSIMStatusEvent(worker.ID, "mbim_sim_status", nil, "")
 		p.wakeDesiredVoWiFiRecoverFromDeviceEvent(worker.ID, "post_switch_mbim_sim_status")
 	})
-	worker.MBIMCore.OnDataConnected(func() {
+	worker.MBIMCore.OnDataConnected(func(sessionToken uint64) {
 		if !p.isCurrentPublicIPWorker(worker) {
 			return
 		}
-		p.refreshIPs(worker, false)
-		p.notifyDataConnected(worker.ID)
+		p.handlePublicIPDataSessionConnected(worker, publicIPDataSessionMBIM, sessionToken)
 	})
 	worker.MBIMCore.OnDataDisconnected(func() {
 		if !p.isCurrentPublicIPWorker(worker) {
@@ -1748,13 +1747,12 @@ func (p *Pool) startAllSynchronousLegacy() error {
 		}
 
 		if qmiCore != nil {
-			qmiCore.SetOnConnect(func() {
+			qmiCore.SetOnConnect(func(sessionToken uint64) {
 				if !p.acceptsWorkerCallback(w, w.generation) {
 					return
 				}
 				p.markQMIControlRecovered(w, "qmi_connected")
-				p.refreshIPs(w, false)
-				p.notifyDataConnected(w.ID)
+				p.handlePublicIPDataSessionConnected(w, publicIPDataSessionQMI, sessionToken)
 			})
 			p.bindQMIHealthIndications(w)
 		}

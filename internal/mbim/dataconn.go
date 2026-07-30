@@ -183,9 +183,10 @@ func (m *Manager) endDataStop() {
 func (m *Manager) queueDataConnectedCallbackLocked() {
 	m.mu.Lock()
 	cb := m.dataConnectedCB
+	sessionToken := m.dataEpoch
 	m.mu.Unlock()
 	if cb != nil {
-		m.pendingDataCallbacks = append(m.pendingDataCallbacks, cb)
+		m.pendingDataCallbacks = append(m.pendingDataCallbacks, func() { cb(sessionToken) })
 	}
 }
 
