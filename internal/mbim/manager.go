@@ -56,7 +56,7 @@ type Manager struct {
 	publicIPv6URLs      []string
 	publicIPLookupCache *netprobe.LookupCache
 	publicIPLookupEpoch uint64
-	dataConnectedCB     func()
+	dataConnectedCB     func(uint64)
 	dataDisconnectedCB  func()
 	ipConfigChangedCB   func()
 	dataEpoch           uint64
@@ -164,8 +164,9 @@ func (m *Manager) OnSlotStatus(cb func(slotIndex, state uint32)) {
 }
 
 // OnDataConnected registers a callback fired after a data session has been
-// activated and its complete IP configuration has been applied.
-func (m *Manager) OnDataConnected(cb func()) {
+// activated and its complete IP configuration has been applied. The token is
+// stable for duplicate delivery of one session and advances for a new session.
+func (m *Manager) OnDataConnected(cb func(sessionToken uint64)) {
 	m.mu.Lock()
 	m.dataConnectedCB = cb
 	m.mu.Unlock()

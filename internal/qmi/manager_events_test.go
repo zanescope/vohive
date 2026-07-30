@@ -417,7 +417,7 @@ func TestOnNewSMSCompatibilityIgnoresStorage(t *testing.T) {
 func TestManagerDispatchesNetworkEventsSeparatelyFromHealth(t *testing.T) {
 	m := &Manager{}
 	connectCalls, ipChangedCalls, disconnectedCalls, healthCalls := 0, 0, 0, 0
-	m.SetOnConnect(func() { connectCalls++ })
+	m.SetOnConnect(func(uint64) { connectCalls++ })
 	m.OnIPChanged(func() { ipChangedCalls++ })
 	m.OnDataDisconnected(func() { disconnectedCalls++ })
 	m.OnHealthEvent(func(HealthEvent) { healthCalls++ })

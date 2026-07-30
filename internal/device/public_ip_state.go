@@ -64,6 +64,14 @@ const (
 	publicIPRefreshRotation
 )
 
+type publicIPDataSessionSource uint8
+
+const (
+	publicIPDataSessionNone publicIPDataSessionSource = iota
+	publicIPDataSessionQMI
+	publicIPDataSessionMBIM
+)
+
 type publicIPTimerKind uint8
 
 const (
@@ -111,9 +119,13 @@ type publicIPRuntime struct {
 	lastFailureClass    string
 	nextProbeAt         time.Time
 	timerKind           publicIPTimerKind
+	timerDispatching    bool
+	qmiSessionToken     uint64
+	mbimSessionToken    uint64
 	retryLimit          int
 	now                 func() time.Time
 	scheduleTimer       publicIPTimerFactory
+	timerDispatchHook   func()
 
 	mobikeSeq                uint64
 	mobikeInFlight           uint64
@@ -330,6 +342,7 @@ func stopPublicIPTimersLocked(state *publicIPRuntime) {
 	state.pending = false
 	state.nextProbeAt = time.Time{}
 	state.timerKind = publicIPTimerNone
+	state.timerDispatching = false
 }
 
 func (p *Pool) schedulePublicIPTimerLocked(worker *Worker, state *publicIPRuntime, delay time.Duration, kind publicIPTimerKind) {
@@ -361,8 +374,13 @@ func (p *Pool) schedulePublicIPTimerLocked(worker *Worker, state *publicIPRuntim
 		}
 		state.nextProbeAt = time.Time{}
 		state.timerKind = publicIPTimerNone
+		state.timerDispatching = true
+		dispatchHook := state.timerDispatchHook
 		state.mu.Unlock()
-		p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
+		if dispatchHook != nil {
+			dispatchHook()
+		}
+		p.refreshIPsFromTimer(worker, epoch)
 	}
 	if periodic {
 		if state.periodicTimer != nil {
@@ -857,20 +875,39 @@ func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
 	if checkPublic {
 		trigger = publicIPRefreshEvent
 	}
-	p.refreshIPsWithTrigger(worker, trigger)
+	_ = p.refreshIPsWithSession(worker, trigger, publicIPDataSessionNone, 0, 0)
 }
 
 func (p *Pool) refreshIPsWithTrigger(worker *Worker, trigger publicIPRefreshTrigger) {
+	_ = p.refreshIPsWithSession(worker, trigger, publicIPDataSessionNone, 0, 0)
+}
+
+func (p *Pool) refreshIPsFromTimer(worker *Worker, epoch uint64) {
+	_ = p.refreshIPsWithSession(worker, publicIPRefreshTimer, publicIPDataSessionNone, 0, epoch)
+}
+
+func (p *Pool) refreshIPsForDataSession(worker *Worker, source publicIPDataSessionSource, token uint64) bool {
+	if source == publicIPDataSessionNone || token == 0 {
+		return false
+	}
+	return p.refreshIPsWithSession(worker, publicIPRefreshReconnect, source, token, 0)
+}
+func (p *Pool) handlePublicIPDataSessionConnected(worker *Worker, source publicIPDataSessionSource, token uint64) {
+	_ = p.refreshIPsForDataSession(worker, source, token)
+	p.notifyDataConnected(worker.ID)
+}
+
+func (p *Pool) refreshIPsWithSession(worker *Worker, trigger publicIPRefreshTrigger, sessionSource publicIPDataSessionSource, sessionToken, timerDispatchEpoch uint64) bool {
 	if p == nil || worker == nil || !p.isCurrentPublicIPWorker(worker) {
-		return
+		return false
 	}
 	if p.ctx != nil && p.ctx.Err() != nil {
-		return
+		return false
 	}
 	nc := worker.NetworkController()
 	if nc == nil || !nc.IsConnected() {
 		p.invalidatePublicIPState(worker, true)
-		return
+		return false
 	}
 	privateV4 := normalizeBearerIP(nc.GetPrivateIP())
 	privateV6 := normalizeBearerIP(nc.GetPrivateIPv6())
@@ -878,6 +915,35 @@ func (p *Pool) refreshIPsWithTrigger(worker *Worker, trigger publicIPRefreshTrig
 
 	state := &worker.publicIP
 	state.mu.Lock()
+	if sessionSource != publicIPDataSessionNone {
+		var lastToken *uint64
+		switch sessionSource {
+		case publicIPDataSessionQMI:
+			lastToken = &state.qmiSessionToken
+		case publicIPDataSessionMBIM:
+			lastToken = &state.mbimSessionToken
+		default:
+			state.mu.Unlock()
+			return false
+		}
+		if sessionToken <= *lastToken {
+			state.mu.Unlock()
+			return false
+		}
+		*lastToken = sessionToken
+	}
+	if trigger == publicIPRefreshTimer {
+		if timerDispatchEpoch != 0 {
+			if !state.timerDispatching || state.epoch != timerDispatchEpoch {
+				state.mu.Unlock()
+				return false
+			}
+			state.timerDispatching = false
+		} else if state.timerDispatching {
+			state.mu.Unlock()
+			return false
+		}
+	}
 	forceEpoch := trigger == publicIPRefreshReconnect || trigger == publicIPRefreshRotation
 	newEpoch := forceEpoch || !state.initialized || !state.connected ||
 		state.privateV4 != privateV4 || state.privateV6 != privateV6
@@ -912,15 +978,16 @@ func (p *Pool) refreshIPsWithTrigger(worker *Worker, trigger publicIPRefreshTrig
 		switch trigger {
 		case publicIPRefreshObservation:
 			state.mu.Unlock()
-			return
+			return false
 		case publicIPRefreshEvent:
 			// An unchanged indication is not a new connectivity epoch. In
 			// particular, it must not bypass an active fast/degraded cadence
 			// or move the already scheduled deadline.
-			if state.inFlight || state.retryTimer != nil || state.periodicTimer != nil ||
+			if state.inFlight || state.timerDispatching ||
+				state.retryTimer != nil || state.periodicTimer != nil ||
 				state.phase == publicIPProbePhaseFastRetry || state.phase == publicIPProbePhaseDegraded {
 				state.mu.Unlock()
-				return
+				return false
 			}
 		}
 	}
@@ -1038,11 +1105,12 @@ func (p *Pool) refreshIPsWithTrigger(worker *Worker, trigger publicIPRefreshTrig
 			}
 			state.mu.Unlock()
 		}
-		return
+		return false
 	}
 	if launchProbe {
 		go p.runPublicIPProbe(probeCtx, worker, nc, snapshot)
 	}
+	return true
 }
 
 func (p *Pool) runPublicIPProbe(ctx context.Context, worker *Worker, nc NetworkController, snapshot publicIPSnapshot) {

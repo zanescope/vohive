@@ -604,13 +604,12 @@ func (p *Pool) addWorkerFromConfig(devCfg config.DeviceConfig, discoveryCache *q
 			}()
 		})
 
-		qmiCore.SetOnConnect(func() {
+		qmiCore.SetOnConnect(func(sessionToken uint64) {
 			if !p.acceptsWorkerCallback(w, w.generation) {
 				return
 			}
 			p.markQMIControlRecovered(w, "qmi_connected")
-			p.refreshIPs(w, false)
-			p.notifyDataConnected(w.ID)
+			p.handlePublicIPDataSessionConnected(w, publicIPDataSessionQMI, sessionToken)
 		})
 	}
 

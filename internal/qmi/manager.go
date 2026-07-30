@@ -741,7 +741,8 @@ type Manager struct {
 	apduLeaseMu         sync.Mutex
 	apduArbiter         *apduarbiter.Arbiter
 	apduSessions        map[byte]apduSessionInfo
-	onConnect           func()
+	onConnect           func(uint64)
+	dataSessionSeq      uint64
 	smsHandlersMu       sync.Mutex
 	onNewSMS            []func(index uint32)
 	onNewSMSStored      []func(storage uint8, index uint32)
@@ -846,11 +847,7 @@ func New(cfg config.DeviceConfig, modemDev *qmimanager.ModemDevice) *Manager {
 	})
 
 	// 设置连接回调
-	m.qmiMgr.OnConnect(func(s *qmi.RuntimeSettings) {
-		if m.onConnect != nil {
-			go m.onConnect()
-		}
-	})
+	m.qmiMgr.OnConnect(func(*qmi.RuntimeSettings) { m.dispatchDataConnected() })
 
 	return m
 }
@@ -902,8 +899,27 @@ func buildQMIManagerConfig(cfg config.DeviceConfig, device qmimanager.ModemDevic
 	}
 }
 
-func (m *Manager) SetOnConnect(handler func()) {
+func (m *Manager) SetOnConnect(handler func(sessionToken uint64)) {
+	if m == nil {
+		return
+	}
+	m.networkHandlersMu.Lock()
 	m.onConnect = handler
+	m.networkHandlersMu.Unlock()
+}
+
+func (m *Manager) dispatchDataConnected() {
+	if m == nil {
+		return
+	}
+	m.networkHandlersMu.Lock()
+	m.dataSessionSeq++
+	sessionToken := m.dataSessionSeq
+	handler := m.onConnect
+	m.networkHandlersMu.Unlock()
+	if handler != nil {
+		go handler(sessionToken)
+	}
 }
 
 func (m *Manager) OnIPChanged(handler func()) {
