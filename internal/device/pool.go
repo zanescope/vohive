@@ -160,6 +160,7 @@ type Worker struct {
 	healthSnapshot            HealthSnapshot
 	healthSyncInFlight        atomic.Bool
 	qmiControlReady           atomic.Bool
+	qmiCoreStartupRetrying    atomic.Bool
 
 	streamSubs          atomic.Int32 // 单设备的流订阅计数器
 	uimIndicationsReady atomic.Bool  // worker 完成启动注册后才处理 UIM 事件触发的重扫/重载

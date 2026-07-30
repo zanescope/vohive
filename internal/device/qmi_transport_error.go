@@ -107,26 +107,20 @@ func (p *Pool) handleTransportRecoveryExhausted(worker *Worker, generation uint6
 	if err == nil {
 		err = fmt.Errorf("qmi recovery exhausted: %s", reason)
 	}
-	logger.Warn("传输核心恢复已彻底失败，调度 worker 重建",
-		"device", worker.ID, "layer", layer, "reason", reason, "err", err)
-	p.clearDesiredVoWiFiRecoverState(worker.ID)
-	return p.scheduleWorkerRecoveryWithTransportEvent(worker.ID, qmiTransportFailureRecoveryReason, &TransportRecoveryEvent{
+	status := p.scheduleTransportRebuildWithEvent(worker.ID, qmiTransportFailureRecoveryReason, &TransportRecoveryEvent{
 		DeviceID:         worker.ID,
 		WorkerGeneration: worker.generation,
 		Kind:             TransportRecoveryEventRecoveryExhausted,
 		Source:           string(layer) + ":recovery_exhausted:" + reason,
 		Err:              err,
 	})
-}
-
-// maybeScheduleTransportRebuild applies the sliding-window guard before
-// scheduling a worker rebuild. Over-cap devices are marked Failed instead of
-// looping rebuilds.
-func (p *Pool) maybeScheduleTransportRebuild(worker *Worker, layer HealthLayer, reason string, err error) bool {
-	if p == nil || worker == nil || !p.acceptsWorkerCallback(worker, worker.generation) {
-		return false
-	}
-	if p.transportRecovery != nil && !p.transportRecovery.AllowRebuild(worker.ID) {
+	switch status {
+	case TransportRecoveryBeginAccepted:
+		logger.Warn("传输核心恢复已彻底失败，调度 worker 重建",
+			"device", worker.ID, "layer", layer, "reason", reason, "err", err)
+		p.clearDesiredVoWiFiRecoverState(worker.ID)
+		return true
+	case TransportRecoveryBeginRateLimited:
 		logger.Warn("传输恢复重建超过滑窗上限，置 Failed 等待人工/重枚举",
 			"device", worker.ID, "layer", layer, "reason", reason, "err", err)
 		worker.RecordWatchdogEvent(WatchdogEvent{
@@ -136,6 +130,15 @@ func (p *Pool) maybeScheduleTransportRebuild(worker *Worker, layer HealthLayer, 
 			Reason:    reason,
 			Err:       err,
 		})
+	}
+	return false
+}
+
+// maybeScheduleTransportRebuild applies the sliding-window guard before
+// scheduling a worker rebuild. Over-cap devices are marked Failed instead of
+// looping rebuilds.
+func (p *Pool) maybeScheduleTransportRebuild(worker *Worker, layer HealthLayer, reason string, err error) bool {
+	if p == nil || worker == nil || !p.acceptsWorkerCallback(worker, worker.generation) {
 		return false
 	}
 	return p.handleTransportRecoveryExhausted(worker, worker.generation, layer, reason, err)

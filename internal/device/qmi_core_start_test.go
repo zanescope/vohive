@@ -61,6 +61,124 @@ func TestRunQMIStartCoreRetryAttemptIsBounded(t *testing.T) {
 	}
 }
 
+func TestQMICoreRetryPolicyDelayIsCapped(t *testing.T) {
+	policy := qmiCoreRetryPolicy{initialDelay: 2 * time.Millisecond, maximumDelay: 5 * time.Millisecond}
+	want := []time.Duration{2 * time.Millisecond, 4 * time.Millisecond, 5 * time.Millisecond, 5 * time.Millisecond}
+	for i, expected := range want {
+		if got := policy.delayBeforeAttempt(i + 1); got != expected {
+			t.Fatalf("delayBeforeAttempt(%d) = %v, want %v", i+1, got, expected)
+		}
+	}
+}
+
+func TestRunQMIStartCoreRetryStateMachineExhaustsAtPolicyLimit(t *testing.T) {
+	wantErr := errors.New("still unavailable")
+	calls := 0
+	failures := 0
+	outcome := runQMIStartCoreRetryStateMachine(
+		context.Background(),
+		func(context.Context) error {
+			calls++
+			return wantErr
+		},
+		qmiCoreRetryPolicy{maxAttempts: 3, attemptBudget: time.Second},
+		func(attempt int, total int, err error, nextDelay time.Duration) {
+			failures++
+			if attempt > total {
+				t.Fatalf("attempt %d exceeds total %d", attempt, total)
+			}
+			if !errors.Is(err, wantErr) {
+				t.Errorf("failure err = %v, want %v", err, wantErr)
+			}
+			if attempt == total && nextDelay != 0 {
+				t.Errorf("final nextDelay = %v, want 0", nextDelay)
+			}
+		},
+	)
+
+	if outcome.state != qmiCoreRetryExhausted {
+		t.Fatalf("state = %v, want exhausted", outcome.state)
+	}
+	if outcome.attempts != 3 || calls != 3 || failures != 3 {
+		t.Fatalf("attempts=%d calls=%d failures=%d, want all 3", outcome.attempts, calls, failures)
+	}
+	if !errors.Is(outcome.err, wantErr) {
+		t.Fatalf("err = %v, want %v", outcome.err, wantErr)
+	}
+}
+
+func TestRunQMIStartCoreRetryStateMachineStopsAfterRecovery(t *testing.T) {
+	calls := 0
+	outcome := runQMIStartCoreRetryStateMachine(
+		context.Background(),
+		func(context.Context) error {
+			calls++
+			if calls == 2 {
+				return nil
+			}
+			return errors.New("not ready")
+		},
+		qmiCoreRetryPolicy{maxAttempts: 5, attemptBudget: time.Second},
+		nil,
+	)
+
+	if outcome.state != qmiCoreRetryRecovered {
+		t.Fatalf("state = %v, want recovered", outcome.state)
+	}
+	if outcome.attempts != 2 || calls != 2 {
+		t.Fatalf("attempts=%d calls=%d, want both 2", outcome.attempts, calls)
+	}
+}
+
+func TestQMIStartCoreRetryStopsWithWorkerAndJoinsCancelBridge(t *testing.T) {
+	workerStop := make(chan struct{})
+	retryCtx, cleanup := newQMIStartCoreRetryContext(context.Background(), workerStop)
+	started := make(chan struct{})
+	done := make(chan qmiCoreRetryOutcome, 1)
+	go func() {
+		done <- runQMIStartCoreRetryStateMachine(
+			retryCtx,
+			func(ctx context.Context) error {
+				close(started)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			qmiCoreRetryPolicy{maxAttempts: 5, attemptBudget: time.Second},
+			nil,
+		)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("retry attempt did not start")
+	}
+	close(workerStop)
+
+	select {
+	case outcome := <-done:
+		if outcome.state != qmiCoreRetryStopped {
+			t.Fatalf("state = %v, want stopped", outcome.state)
+		}
+		if !errors.Is(outcome.err, context.Canceled) {
+			t.Fatalf("err = %v, want context canceled", outcome.err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("retry state machine did not stop with Worker")
+	}
+
+	cleanupDone := make(chan struct{})
+	go func() {
+		cleanup()
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("retry cancellation bridge did not exit")
+	}
+}
+
 func TestStartAllReturnsBeforeQMIDiscoveryCompletes(t *testing.T) {
 	origDiscover := discoverQMIDevicesFn
 	releaseDiscover := make(chan struct{})
