@@ -16,12 +16,61 @@ import (
 	"github.com/zanescope/vohive/pkg/logger"
 )
 
-var (
-	publicIPRetryBase         = 2 * time.Second
-	publicIPRetryMax          = 5 * time.Minute
-	publicIPRetryLimit        = 6
-	publicIPRecheckInterval   = 10 * time.Minute
-	publicIPProbeCycleTimeout = 15 * time.Second
+const (
+	publicIPRetryBase               = 2 * time.Second
+	publicIPRetryMax                = 5 * time.Minute
+	publicIPRetryLimit              = 6
+	publicIPHealthyRecheckInterval  = 10 * time.Minute
+	publicIPDegradedRecheckInterval = 2 * time.Hour
+)
+
+var publicIPProbeCycleTimeout = 15 * time.Second
+
+type publicIPTimer interface {
+	Stop() bool
+}
+
+type publicIPTimerFactory func(time.Duration, func()) publicIPTimer
+
+type publicIPProbePhase uint8
+
+const (
+	publicIPProbePhaseIdle publicIPProbePhase = iota
+	publicIPProbePhaseHealthy
+	publicIPProbePhaseFastRetry
+	publicIPProbePhaseDegraded
+)
+
+func (phase publicIPProbePhase) String() string {
+	switch phase {
+	case publicIPProbePhaseHealthy:
+		return "healthy"
+	case publicIPProbePhaseFastRetry:
+		return "fast_retry"
+	case publicIPProbePhaseDegraded:
+		return "degraded"
+	default:
+		return "idle"
+	}
+}
+
+type publicIPRefreshTrigger uint8
+
+const (
+	publicIPRefreshObservation publicIPRefreshTrigger = iota
+	publicIPRefreshEvent
+	publicIPRefreshTimer
+	publicIPRefreshReconnect
+	publicIPRefreshRotation
+)
+
+type publicIPTimerKind uint8
+
+const (
+	publicIPTimerNone publicIPTimerKind = iota
+	publicIPTimerFastRetry
+	publicIPTimerHealthy
+	publicIPTimerDegraded
 )
 
 type publicIPRuntime struct {
@@ -55,6 +104,16 @@ type publicIPRuntime struct {
 	cycleResolvedV4     bool
 	cycleResolvedV6     bool
 	cycleMOBIKEReserved bool
+	phase               publicIPProbePhase
+	degradedSince       time.Time
+	degradedSlowChecks  int
+	degradedWarned      bool
+	lastFailureClass    string
+	nextProbeAt         time.Time
+	timerKind           publicIPTimerKind
+	retryLimit          int
+	now                 func() time.Time
+	scheduleTimer       publicIPTimerFactory
 
 	mobikeSeq                uint64
 	mobikeInFlight           uint64
@@ -64,8 +123,8 @@ type publicIPRuntime struct {
 	retryAttemptV4 int
 	retryAttemptV6 int
 	noAddressTries int
-	retryTimer     *time.Timer
-	periodicTimer  *time.Timer
+	retryTimer     publicIPTimer
+	periodicTimer  publicIPTimer
 }
 type publicIPProbeWithContext interface {
 	GetPublicIPv4AndV6Context(context.Context) (publicV4 string, publicV6 string)
@@ -188,6 +247,72 @@ func retryDelay(attempt int) time.Duration {
 	return delay
 }
 
+func publicIPRetryLimitFor(state *publicIPRuntime) int {
+	if state != nil && state.retryLimit > 0 {
+		return state.retryLimit
+	}
+	return publicIPRetryLimit
+}
+
+func publicIPNowFor(state *publicIPRuntime) time.Time {
+	if state != nil && state.now != nil {
+		return state.now()
+	}
+	return time.Now()
+}
+
+func publicIPTimerFactoryFor(state *publicIPRuntime) publicIPTimerFactory {
+	if state != nil && state.scheduleTimer != nil {
+		return state.scheduleTimer
+	}
+	return func(delay time.Duration, fn func()) publicIPTimer {
+		return time.AfterFunc(delay, fn)
+	}
+}
+
+func saturatingPublicIPIncrement(value, limit int) int {
+	if value < 0 {
+		value = 0
+	}
+	if limit > 0 && value >= limit {
+		return limit
+	}
+	maxInt := int(^uint(0) >> 1)
+	if value >= maxInt {
+		return maxInt
+	}
+	return value + 1
+}
+
+func resetPublicIPProbeCadenceLocked(state *publicIPRuntime, phase publicIPProbePhase) {
+	state.phase = phase
+	state.retrying = false
+	state.retryAttemptV4 = 0
+	state.retryAttemptV6 = 0
+	state.noAddressTries = 0
+	state.degradedSince = time.Time{}
+	state.degradedSlowChecks = 0
+	state.degradedWarned = false
+	state.lastFailureClass = ""
+}
+
+func enterPublicIPDegradedLocked(state *publicIPRuntime, failureClass string) bool {
+	if state.phase != publicIPProbePhaseDegraded {
+		state.phase = publicIPProbePhaseDegraded
+		state.degradedSince = publicIPNowFor(state)
+		state.degradedSlowChecks = 0
+	} else {
+		state.degradedSlowChecks = saturatingPublicIPIncrement(state.degradedSlowChecks, 0)
+	}
+	state.retrying = false
+	state.lastFailureClass = failureClass
+	if state.degradedWarned {
+		return false
+	}
+	state.degradedWarned = true
+	return true
+}
+
 func stopPublicIPTimersLocked(state *publicIPRuntime) {
 	if state.cancel != nil {
 		state.cancel()
@@ -203,15 +328,21 @@ func stopPublicIPTimersLocked(state *publicIPRuntime) {
 	}
 	state.inFlight = false
 	state.pending = false
+	state.nextProbeAt = time.Time{}
+	state.timerKind = publicIPTimerNone
 }
 
-func (p *Pool) schedulePublicIPTimerLocked(worker *Worker, state *publicIPRuntime, delay time.Duration, periodic bool) {
+func (p *Pool) schedulePublicIPTimerLocked(worker *Worker, state *publicIPRuntime, delay time.Duration, kind publicIPTimerKind) {
 	epoch := state.epoch
+	phase := state.phase
+	now := publicIPNowFor(state)
+	scheduleTimer := publicIPTimerFactoryFor(state)
 	delay = stablePublicIPDelay(worker.ID, epoch, delay)
-	var timer *time.Timer
+	periodic := kind != publicIPTimerFastRetry
+	var timer publicIPTimer
 	fire := func() {
 		state.mu.Lock()
-		if state.epoch != epoch || !state.connected {
+		if state.epoch != epoch || !state.connected || state.phase != phase || state.timerKind != kind {
 			state.mu.Unlock()
 			return
 		}
@@ -228,22 +359,26 @@ func (p *Pool) schedulePublicIPTimerLocked(worker *Worker, state *publicIPRuntim
 			}
 			state.retryTimer = nil
 		}
+		state.nextProbeAt = time.Time{}
+		state.timerKind = publicIPTimerNone
 		state.mu.Unlock()
-		p.refreshIPs(worker, true)
+		p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	}
 	if periodic {
 		if state.periodicTimer != nil {
 			state.periodicTimer.Stop()
 		}
-		timer = time.AfterFunc(delay, fire)
+		timer = scheduleTimer(delay, fire)
 		state.periodicTimer = timer
-		return
+	} else {
+		if state.retryTimer != nil {
+			state.retryTimer.Stop()
+		}
+		timer = scheduleTimer(delay, fire)
+		state.retryTimer = timer
 	}
-	if state.retryTimer != nil {
-		state.retryTimer.Stop()
-	}
-	timer = time.AfterFunc(delay, fire)
-	state.retryTimer = timer
+	state.nextProbeAt = now.Add(delay)
+	state.timerKind = kind
 }
 
 func publicIPStateMatchesLocked(worker *Worker, state *publicIPRuntime, snapshot publicIPSnapshot) bool {
@@ -453,16 +588,13 @@ func (p *Pool) invalidatePublicIPStateWithMode(worker *Worker, persist, allowUnr
 	state.expectedV6 = false
 	state.authoritativeV4 = ""
 	state.authoritativeV6 = ""
-	state.retrying = false
+	resetPublicIPProbeCadenceLocked(state, publicIPProbePhaseIdle)
 	state.cycleResolvedV4 = false
 	state.cycleResolvedV6 = false
 	state.cycleMOBIKEReserved = false
 	state.mobikeTransitionReserved = false
 	state.pendingMOBIKE = nil
 	state.mobikeInFlight = 0
-	state.retryAttemptV4 = 0
-	state.retryAttemptV6 = 0
-	state.noAddressTries = 0
 	snapshot := publicIPSnapshot{epoch: state.epoch, generation: worker.generation}
 	state.mu.Unlock()
 
@@ -505,6 +637,7 @@ func (p *Pool) stopPublicIPState(worker *Worker) {
 	state.pendingMOBIKE = nil
 	state.mobikeInFlight = 0
 	state.epoch++
+	resetPublicIPProbeCadenceLocked(state, publicIPProbePhaseIdle)
 	state.mu.Unlock()
 }
 func cachedWorkerIMEI(worker *Worker) string {
@@ -621,14 +754,12 @@ func (p *Pool) beginPublicIPRotation(worker *Worker, nc NetworkController) (publ
 	state.expectedV4, state.expectedV6 = false, false
 	state.publishedV4, state.publishedV6 = "", ""
 	state.authoritativeV4, state.authoritativeV6 = "", ""
-	state.retrying = false
+	resetPublicIPProbeCadenceLocked(state, publicIPProbePhaseIdle)
 	state.cycleResolvedV4, state.cycleResolvedV6 = false, false
 	state.cycleMOBIKEReserved = false
 	state.mobikeTransitionReserved = false
 	state.pendingMOBIKE = nil
 	state.mobikeInFlight = 0
-	state.retryAttemptV4, state.retryAttemptV6 = 0, 0
-	state.noAddressTries = 0
 	state.revision++
 	revision := state.revision
 	snapshot := publicIPSnapshot{epoch: state.epoch, generation: worker.generation}
@@ -722,6 +853,14 @@ func (p *Pool) waitForPublicIPRotation(
 }
 
 func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
+	trigger := publicIPRefreshObservation
+	if checkPublic {
+		trigger = publicIPRefreshEvent
+	}
+	p.refreshIPsWithTrigger(worker, trigger)
+}
+
+func (p *Pool) refreshIPsWithTrigger(worker *Worker, trigger publicIPRefreshTrigger) {
 	if p == nil || worker == nil || !p.isCurrentPublicIPWorker(worker) {
 		return
 	}
@@ -739,7 +878,9 @@ func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
 
 	state := &worker.publicIP
 	state.mu.Lock()
-	newEpoch := !state.initialized || !state.connected || state.privateV4 != privateV4 || state.privateV6 != privateV6
+	forceEpoch := trigger == publicIPRefreshReconnect || trigger == publicIPRefreshRotation
+	newEpoch := forceEpoch || !state.initialized || !state.connected ||
+		state.privateV4 != privateV4 || state.privateV6 != privateV6
 	if newEpoch {
 		if state.connected {
 			if state.mobikeBaseV4 == "" && state.authoritativeV4 != "" {
@@ -760,16 +901,28 @@ func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
 		state.expectedV6 = expectedV6
 		state.authoritativeV4 = ""
 		state.authoritativeV6 = ""
-		state.retrying = false
+		resetPublicIPProbeCadenceLocked(state, publicIPProbePhaseHealthy)
 		state.cycleResolvedV4 = false
 		state.cycleResolvedV6 = false
 		state.cycleMOBIKEReserved = false
 		state.mobikeTransitionReserved = false
 		state.pendingMOBIKE = nil
 		state.mobikeInFlight = 0
-		state.retryAttemptV4 = 0
-		state.retryAttemptV6 = 0
-		state.noAddressTries = 0
+	} else {
+		switch trigger {
+		case publicIPRefreshObservation:
+			state.mu.Unlock()
+			return
+		case publicIPRefreshEvent:
+			// An unchanged indication is not a new connectivity epoch. In
+			// particular, it must not bypass an active fast/degraded cadence
+			// or move the already scheduled deadline.
+			if state.inFlight || state.retryTimer != nil || state.periodicTimer != nil ||
+				state.phase == publicIPProbePhaseFastRetry || state.phase == publicIPProbePhaseDegraded {
+				state.mu.Unlock()
+				return
+			}
+		}
 	}
 	snapshot := publicIPSnapshot{
 		epoch:      state.epoch,
@@ -780,22 +933,40 @@ func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
 	}
 
 	launchProbe := false
+	var (
+		failureLog       string
+		failureClass     string
+		failureNextProbe time.Time
+		failureAttempt   int
+		failurePhase     publicIPProbePhase
+	)
+	retryLimit := publicIPRetryLimitFor(state)
 	if !expectedV4 && !expectedV6 {
-		state.noAddressTries++
-		if state.noAddressTries < publicIPRetryLimit {
+		state.noAddressTries = saturatingPublicIPIncrement(state.noAddressTries, retryLimit)
+		failureClass = "no_bearer_address"
+		failureAttempt = state.noAddressTries
+		if state.noAddressTries < retryLimit {
+			state.phase = publicIPProbePhaseFastRetry
 			state.retrying = true
-			p.schedulePublicIPTimerLocked(worker, state, retryDelay(state.noAddressTries), false)
+			p.schedulePublicIPTimerLocked(worker, state, retryDelay(state.noAddressTries), publicIPTimerFastRetry)
+			failureLog = "fast"
 		} else {
-			state.retrying = false
 			if state.retryTimer != nil {
 				state.retryTimer.Stop()
 				state.retryTimer = nil
 			}
-			p.schedulePublicIPTimerLocked(worker, state, publicIPRecheckInterval, true)
+			if enterPublicIPDegradedLocked(state, failureClass) {
+				failureLog = "entered_degraded"
+			} else {
+				failureLog = "degraded"
+			}
+			p.schedulePublicIPTimerLocked(worker, state, publicIPDegradedRecheckInterval, publicIPTimerDegraded)
 		}
-	} else if checkPublic || newEpoch {
+		failureNextProbe = state.nextProbeAt
+		failurePhase = state.phase
+	} else if newEpoch || trigger != publicIPRefreshObservation {
 		if state.inFlight {
-			if checkPublic {
+			if trigger == publicIPRefreshTimer {
 				state.pending = true
 			}
 		} else {
@@ -807,7 +978,9 @@ func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
 				state.periodicTimer.Stop()
 				state.periodicTimer = nil
 			}
-			if !state.retrying {
+			state.nextProbeAt = time.Time{}
+			state.timerKind = publicIPTimerNone
+			if state.phase == publicIPProbePhaseHealthy {
 				state.cycleResolvedV4 = false
 				state.cycleResolvedV6 = false
 				state.cycleMOBIKEReserved = false
@@ -829,6 +1002,28 @@ func (p *Pool) refreshIPs(worker *Worker, checkPublic bool) {
 		state.cancel = cancel
 	}
 	state.mu.Unlock()
+
+	switch failureLog {
+	case "entered_degraded":
+		logger.Warn("public IP probing entered degraded cadence",
+			"device", worker.ID,
+			"failure_class", failureClass,
+			"attempt", failureAttempt,
+			"retry_limit", retryLimit,
+			"next_probe_at", failureNextProbe)
+	case "fast":
+		logger.Debug("public IP probe deferred while bearer address is unavailable",
+			"device", worker.ID,
+			"phase", failurePhase.String(),
+			"attempt", failureAttempt,
+			"next_probe_at", failureNextProbe)
+	case "degraded":
+		logger.Debug("public IP degraded check still has no bearer address",
+			"device", worker.ID,
+			"phase", failurePhase.String(),
+			"attempt", failureAttempt,
+			"next_probe_at", failureNextProbe)
+	}
 
 	published := p.publishPublicIPState(worker, snapshot, "", "", publicIPPublishOptions{
 		replace:        newEpoch,
@@ -892,7 +1087,7 @@ func (p *Pool) runPublicIPProbe(ctx context.Context, worker *Worker, nc NetworkC
 			state.cancel = nil
 		}
 		state.mu.Unlock()
-		p.refreshIPs(worker, true)
+		p.refreshIPsWithTrigger(worker, publicIPRefreshEvent)
 		return
 	}
 	state.inFlight = false
@@ -924,39 +1119,65 @@ func (p *Pool) runPublicIPProbe(ctx context.Context, worker *Worker, nc NetworkC
 		state.cycleResolvedV6 = true
 	}
 
+	wasDegraded := state.phase == publicIPProbePhaseDegraded
+	retryLimit := publicIPRetryLimitFor(state)
 	v4Resolved := !expectedV4 || state.cycleResolvedV4
 	v6Resolved := !expectedV6 || state.cycleResolvedV6
 	if v4Resolved {
 		state.retryAttemptV4 = 0
 	} else {
-		state.retryAttemptV4++
+		state.retryAttemptV4 = saturatingPublicIPIncrement(state.retryAttemptV4, retryLimit)
 	}
 	if v6Resolved {
 		state.retryAttemptV6 = 0
 	} else {
-		state.retryAttemptV6++
+		state.retryAttemptV6 = saturatingPublicIPIncrement(state.retryAttemptV6, retryLimit)
 	}
-	retryScheduled := false
+	var (
+		failureLog            string
+		failureNextProbe      time.Time
+		failureAttempt        int
+		recoveredFromDegraded bool
+		recoveredDegradedFor  time.Duration
+		recoveredSlowChecks   int
+		recoveredFailureClass string
+	)
 	if v4Resolved && v6Resolved {
-		state.retrying = false
-		p.schedulePublicIPTimerLocked(worker, state, publicIPRecheckInterval, true)
+		if wasDegraded {
+			recoveredFromDegraded = true
+			recoveredDegradedFor = publicIPNowFor(state).Sub(state.degradedSince)
+			if recoveredDegradedFor < 0 {
+				recoveredDegradedFor = 0
+			}
+			recoveredSlowChecks = state.degradedSlowChecks
+			recoveredFailureClass = state.lastFailureClass
+		}
+		resetPublicIPProbeCadenceLocked(state, publicIPProbePhaseHealthy)
+		p.schedulePublicIPTimerLocked(worker, state, publicIPHealthyRecheckInterval, publicIPTimerHealthy)
 	} else {
 		attempt := state.retryAttemptV4
 		if attempt == 0 || (state.retryAttemptV6 > 0 && state.retryAttemptV6 < attempt) {
 			attempt = state.retryAttemptV6
 		}
-		if attempt < publicIPRetryLimit {
+		failureAttempt = attempt
+		if attempt < retryLimit {
+			state.phase = publicIPProbePhaseFastRetry
 			state.retrying = true
-			retryScheduled = true
-			p.schedulePublicIPTimerLocked(worker, state, retryDelay(attempt), false)
+			failureLog = "fast"
+			p.schedulePublicIPTimerLocked(worker, state, retryDelay(attempt), publicIPTimerFastRetry)
 		} else {
-			state.retrying = false
 			if state.retryTimer != nil {
 				state.retryTimer.Stop()
 				state.retryTimer = nil
 			}
-			p.schedulePublicIPTimerLocked(worker, state, publicIPRecheckInterval, true)
+			if enterPublicIPDegradedLocked(state, "public_ip_probe") {
+				failureLog = "entered_degraded"
+			} else {
+				failureLog = "degraded"
+			}
+			p.schedulePublicIPTimerLocked(worker, state, publicIPDegradedRecheckInterval, publicIPTimerDegraded)
 		}
+		failureNextProbe = state.nextProbeAt
 	}
 
 	displayV4, displayV6 := publicV4, publicV6
@@ -984,20 +1205,42 @@ func (p *Pool) runPublicIPProbe(ctx context.Context, worker *Worker, nc NetworkC
 				"old_ip", published.oldV4, "new_ip", published.newV4,
 				"old_ipv6", published.oldV6, "new_ipv6", published.newV6)
 		}
+		if recoveredFromDegraded {
+			logger.Info("public IP probing recovered from degraded cadence",
+				"device", worker.ID,
+				"failure_class", recoveredFailureClass,
+				"degraded_for", recoveredDegradedFor,
+				"slow_checks", recoveredSlowChecks)
+		}
 		p.triggerPublicIPMOBIKE(worker)
 	}
-	if !v4Resolved || !v6Resolved {
-		if retryScheduled {
-			logger.Warn(fmt.Sprintf("[%s] 公网 IP 未完整获取，已安排重试", worker.ID),
-				"ipv4_resolved", v4Resolved, "ipv6_resolved", v6Resolved)
-		} else {
-			logger.Warn(fmt.Sprintf("[%s] 公网 IP 连续获取失败，已暂停快速重试", worker.ID),
-				"ipv4_resolved", v4Resolved, "ipv6_resolved", v6Resolved,
-				"retry_limit", publicIPRetryLimit, "next_check", publicIPRecheckInterval.String())
-		}
+	switch failureLog {
+	case "entered_degraded":
+		logger.Warn("public IP probing entered degraded cadence",
+			"device", worker.ID,
+			"failure_class", "public_ip_probe",
+			"ipv4_resolved", v4Resolved,
+			"ipv6_resolved", v6Resolved,
+			"attempt", failureAttempt,
+			"retry_limit", retryLimit,
+			"next_probe_at", failureNextProbe)
+	case "fast":
+		logger.Debug("public IP probe incomplete; fast retry scheduled",
+			"device", worker.ID,
+			"ipv4_resolved", v4Resolved,
+			"ipv6_resolved", v6Resolved,
+			"attempt", failureAttempt,
+			"next_probe_at", failureNextProbe)
+	case "degraded":
+		logger.Debug("public IP degraded probe remains incomplete",
+			"device", worker.ID,
+			"ipv4_resolved", v4Resolved,
+			"ipv6_resolved", v6Resolved,
+			"attempt", failureAttempt,
+			"next_probe_at", failureNextProbe)
 	}
 	if pending {
-		p.refreshIPs(worker, true)
+		p.refreshIPsWithTrigger(worker, publicIPRefreshTimer)
 	}
 }
 

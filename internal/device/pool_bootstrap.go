@@ -598,7 +598,7 @@ func (p *Pool) addWorkerFromConfig(devCfg config.DeviceConfig, discoveryCache *q
 						continue
 					}
 					logger.Info("模组重置恢复：数据面已重建", "device", w.ID, "attempt", attempt)
-					p.refreshIPs(w, true)
+					p.refreshIPsWithTrigger(w, publicIPRefreshReconnect)
 					return
 				}
 			}()

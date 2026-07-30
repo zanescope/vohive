@@ -916,7 +916,7 @@ func (p *Pool) restoreRadioDataForSwitchSnapshot(deviceID string, worker *Worker
 		logger.Warn("切卡后按快照恢复网络失败", "device", deviceID, "reason", reason, "err", err)
 	}
 	if nc := worker.NetworkController(); nc != nil && nc.IsConnected() {
-		p.refreshIPs(worker, true)
+		p.refreshIPsWithTrigger(worker, publicIPRefreshRotation)
 	}
 }
 
