@@ -69,7 +69,7 @@ func TestWorkerRecordWatchdogEventTransitions(t *testing.T) {
 		State:               HealthStateSuspect,
 		Reason:              "qmi_health_probe_failed",
 		ConsecutiveFailures: 1,
-		Threshold:           qmiHealthFailureThreshold,
+		Threshold:           controlHealthFailureThreshold,
 	})
 	if snapshot.State != HealthStateSuspect {
 		t.Fatalf("state=%s want %s", snapshot.State, HealthStateSuspect)
@@ -85,8 +85,8 @@ func TestWorkerRecordWatchdogEventTransitions(t *testing.T) {
 		Layer:               HealthLayerQMI,
 		State:               HealthStateInvalid,
 		Reason:              "qmi_health_threshold",
-		ConsecutiveFailures: qmiHealthFailureThreshold,
-		Threshold:           qmiHealthFailureThreshold,
+		ConsecutiveFailures: controlHealthFailureThreshold,
+		Threshold:           controlHealthFailureThreshold,
 	})
 	if snapshot.State != HealthStateInvalid {
 		t.Fatalf("state=%s want %s", snapshot.State, HealthStateInvalid)

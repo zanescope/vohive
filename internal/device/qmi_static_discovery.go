@@ -1,6 +1,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,20 @@ import (
 	"time"
 
 	qmimanager "github.com/zanescope/quectel-qmi-go/pkg/manager"
+)
+
+// ErrNoQMIDevices means the QMI scan completed but found no QMI-capable modem.
+var (
+	ErrNoQMIDevices                   = errors.New("no QMI devices discovered")
+	ErrQMIDiscoveryIncomplete         = errors.New("QMI device discovery incomplete")
+	errQMIDeviceEnumerationIncomplete = errors.New("QMI device enumeration incomplete")
+)
+
+var (
+	qmiUSBDevicesRoot            = "/sys/bus/usb/devices"
+	qmiDiscoveryEntryTimeout     = 5 * time.Second
+	discoverQMIDeviceFromSysFSFn = discoverQMIDeviceFromSysFS
+	discoverWWANQMIDevicesFn     = discoverWWANQMIDevices
 )
 
 // QMIDevice 表示通过 sysfs 静态枚举到的 QMI 设备拓扑信息。
@@ -67,16 +82,31 @@ func DiscoverAllQMIDevices() ([]QMIDevice, error) {
 func discoverQMIDevices(requireControlPath bool) ([]QMIDevice, error) {
 	var devices []QMIDevice
 
-	usbDevices, err := os.ReadDir("/sys/bus/usb/devices")
+	root := qmiUSBDevicesRoot
+	entryTimeout := qmiDiscoveryEntryTimeout
+	if entryTimeout <= 0 {
+		entryTimeout = 5 * time.Second
+	}
+	discoverEntry := discoverQMIDeviceFromSysFSFn
+	discoverWWAN := discoverWWANQMIDevicesFn
+
+	usbDevices, err := os.ReadDir(root)
 	if err != nil {
-		if wwanDevices, wwanErr := discoverWWANQMIDevices(); wwanErr == nil && len(wwanDevices) > 0 {
-			return wwanDevices, nil
+		wwanDevices, wwanErr := discoverWWAN()
+		discoveryErr := errors.Join(
+			ErrQMIDiscoveryIncomplete,
+			fmt.Errorf("读取 USB 设备失败: %w", err),
+			wwanErr,
+		)
+		if len(wwanDevices) > 0 {
+			return wwanDevices, discoveryErr
 		}
-		return nil, fmt.Errorf("读取 USB 设备失败: %w", err)
+		return nil, discoveryErr
 	}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	scanIncomplete := false
 
 	for _, entry := range usbDevices {
 		if strings.HasPrefix(entry.Name(), "usb") {
@@ -87,7 +117,7 @@ func discoverQMIDevices(requireControlPath bool) ([]QMIDevice, error) {
 		go func(e os.DirEntry) {
 			defer wg.Done()
 
-			path := filepath.Join("/sys/bus/usb/devices", e.Name())
+			path := filepath.Join(root, e.Name())
 			type result struct {
 				val *QMIDevice
 				err error
@@ -95,12 +125,18 @@ func discoverQMIDevices(requireControlPath bool) ([]QMIDevice, error) {
 			done := make(chan result, 1)
 
 			go func() {
-				md, err := discoverQMIDeviceFromSysFS(path)
+				md, err := discoverEntry(path)
 				done <- result{md, err}
 			}()
 
 			select {
 			case res := <-done:
+				if errors.Is(res.err, errQMIDeviceEnumerationIncomplete) {
+					mu.Lock()
+					scanIncomplete = true
+					mu.Unlock()
+					return
+				}
 				if res.err == nil && res.val != nil {
 					// 默认发现流程要求设备具备 QMI 控制口；必要时调用方也可以放宽这个约束。
 					if requireControlPath && strings.TrimSpace(res.val.ControlPath) == "" {
@@ -110,19 +146,33 @@ func discoverQMIDevices(requireControlPath bool) ([]QMIDevice, error) {
 					devices = append(devices, *res.val)
 					mu.Unlock()
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(entryTimeout):
+				mu.Lock()
+				scanIncomplete = true
+				mu.Unlock()
 			}
 		}(entry)
 	}
 
 	wg.Wait()
 
-	if wwanDevices, err := discoverWWANQMIDevices(); err == nil && len(wwanDevices) > 0 {
+	wwanDevices, wwanErr := discoverWWAN()
+	if len(wwanDevices) > 0 {
 		devices = mergeQMIDeviceLists(devices, wwanDevices)
+	}
+	if scanIncomplete || wwanErr != nil {
+		incompleteErrs := []error{ErrQMIDiscoveryIncomplete}
+		if scanIncomplete {
+			incompleteErrs = append(incompleteErrs, errors.New("one or more USB topology probes were incomplete"))
+		}
+		if wwanErr != nil {
+			incompleteErrs = append(incompleteErrs, fmt.Errorf("WWAN QMI discovery failed: %w", wwanErr))
+		}
+		return devices, errors.Join(incompleteErrs...)
 	}
 
 	if len(devices) == 0 {
-		return nil, fmt.Errorf("未发现调制解调器")
+		return nil, fmt.Errorf("%w: 未发现调制解调器", ErrNoQMIDevices)
 	}
 
 	return devices, nil
@@ -135,8 +185,11 @@ func discoverQMIDeviceFromSysFS(usbPath string) (*QMIDevice, error) {
 
 	vid := readHexFile(filepath.Join(scanUSBPath, "idVendor"))
 	pid := readHexFile(filepath.Join(scanUSBPath, "idProduct"))
-	capability, ok := detectQMIUSBCapability(scanUSBPath)
+	capability, ok, incomplete := detectQMIUSBCapabilityWithStatus(scanUSBPath)
 	if !ok {
+		if incomplete {
+			return nil, fmt.Errorf("%w: %s", errQMIDeviceEnumerationIncomplete, scanUSBPath)
+		}
 		return nil, fmt.Errorf("不是 QMI capable 设备")
 	}
 
@@ -208,18 +261,22 @@ func discoverWWANQMIDevices() ([]QMIDevice, error) {
 	classDevices, classErr := discoverWWANQMIDevicesFromClass("/sys/class/wwan")
 	devDevices, devErr := discoverWWANQMIDevicesFromDev("/dev")
 	merged := mergeQMIDeviceLists(classDevices, devDevices)
-	if len(merged) > 0 {
-		return merged, nil
-	}
+	var discoveryErrs []error
 	if classErr != nil {
-		return nil, classErr
+		discoveryErrs = append(discoveryErrs, fmt.Errorf("WWAN class discovery: %w", classErr))
 	}
-	return nil, devErr
+	if devErr != nil {
+		discoveryErrs = append(discoveryErrs, fmt.Errorf("WWAN device discovery: %w", devErr))
+	}
+	return merged, errors.Join(discoveryErrs...)
 }
 
 func discoverWWANQMIDevicesFromClass(wwanClassPath string) ([]QMIDevice, error) {
 	entries, err := os.ReadDir(wwanClassPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("读取 WWAN 设备失败: %w", err)
 	}
 
@@ -273,7 +330,7 @@ func discoverWWANQMIDevicesFromClass(wwanClassPath string) ([]QMIDevice, error) 
 	})
 
 	if len(devices) == 0 {
-		return nil, fmt.Errorf("未发现 WWAN QMI 设备")
+		return nil, nil
 	}
 	return devices, nil
 }
@@ -281,6 +338,9 @@ func discoverWWANQMIDevicesFromClass(wwanClassPath string) ([]QMIDevice, error) 
 func discoverWWANQMIDevicesFromDev(devDir string) ([]QMIDevice, error) {
 	entries, err := os.ReadDir(devDir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("读取 WWAN 设备节点失败: %w", err)
 	}
 
@@ -334,7 +394,7 @@ func discoverWWANQMIDevicesFromDev(devDir string) ([]QMIDevice, error) {
 	})
 
 	if len(devices) == 0 {
-		return nil, fmt.Errorf("未发现 WWAN QMI 设备节点")
+		return nil, nil
 	}
 	return devices, nil
 }
@@ -425,19 +485,26 @@ type qmiUSBCapability struct {
 }
 
 func detectQMIUSBCapability(scanUSBPath string) (qmiUSBCapability, bool) {
+	capability, ok, _ := detectQMIUSBCapabilityWithStatus(scanUSBPath)
+	return capability, ok
+}
+
+func detectQMIUSBCapabilityWithStatus(scanUSBPath string) (qmiUSBCapability, bool, bool) {
 	usbName := filepath.Base(scanUSBPath)
 	pattern := filepath.Join(scanUSBPath, usbName+":1.*")
 	ifaces, err := filepath.Glob(pattern)
 	if err != nil {
-		return qmiUSBCapability{}, false
+		return qmiUSBCapability{}, false, true
 	}
 	sortUSBInterfacePaths(ifaces)
 
+	sawQMICandidate := false
 	for _, ifPath := range ifaces {
 		driver := determineDriver(ifPath)
 		if driver != "qmi_wwan" {
 			continue
 		}
+		sawQMICandidate = true
 
 		netInterface := firstNetInterfaceInUSBInterface(ifPath)
 		if netInterface == "" {
@@ -457,10 +524,10 @@ func detectQMIUSBCapability(scanUSBPath string) (qmiUSBCapability, bool) {
 			NetInterface:  netInterface,
 			DriverName:    driver,
 			ControlPath:   controlPath,
-		}, true
+		}, true, false
 	}
 
-	return qmiUSBCapability{}, false
+	return qmiUSBCapability{}, false, sawQMICandidate
 }
 
 func detectMBIMUSBCapability(scanUSBPath string) (qmiUSBCapability, bool) {

@@ -66,8 +66,8 @@ func TestModemRebootRecoveryWakeSignalsActiveRecovery(t *testing.T) {
 		close(done)
 	}()
 
-	if woke := p.WakeModemRebootRecoveries("udev_add"); woke != 1 {
-		t.Fatalf("WakeModemRebootRecoveries() = %d, want 1", woke)
+	if woke := p.WakeModemRebootRecovery("dev-1", "udev_add"); !woke {
+		t.Fatal("WakeModemRebootRecovery() = false, want true")
 	}
 
 	select {

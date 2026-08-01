@@ -61,7 +61,7 @@ func TestHealthCheckAllowsFastPullWhenNotRecovering(t *testing.T) {
 
 // TestRunHealthCheckTickSkipsObservationWindowOnTransportDownError 测试当探活失败的错误
 // 明确表示传输已断开（broken pipe/EOF/connection closed 等）时，应跳过 3 次观察窗口，
-// 第一次失败就直接触发恢复，而不是像普通超时那样等满 qmiHealthFailureThreshold 次。
+// 第一次失败就直接触发恢复，而不是像普通超时那样等满 controlHealthFailureThreshold 次。
 func TestRunHealthCheckTickSkipsObservationWindowOnTransportDownError(t *testing.T) {
 	p := NewPool(&config.Config{})
 	defer p.cancel()
