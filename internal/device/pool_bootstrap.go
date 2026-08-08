@@ -528,6 +528,7 @@ func (p *Pool) addWorkerFromConfig(devCfg config.DeviceConfig, discoveryCache *q
 	}
 	p.bindESIMUIMIndications(w)
 	p.bindQMIStateIndications(w)
+	p.bindQMICoreStatus(w)
 	p.bindQMIHealthIndications(w)
 	if mbimCore != nil {
 		p.bindMBIMStateIndications(w)
@@ -548,11 +549,6 @@ func (p *Pool) addWorkerFromConfig(devCfg config.DeviceConfig, discoveryCache *q
 			if !p.acceptsWorkerCallback(w, w.generation) {
 				return
 			}
-			w.markQMIControlUnavailable()
-			if p.lifecycle != nil {
-				p.lifecycle.BeginRecovery(w.ID, LifecyclePhaseRecovering, "qmi_modem_reset", qmiLifecycleRecoveryTTL)
-			}
-			w.markHealthRecoveryWindow(qmiHealthGraceAfterReset)
 			logger.Warn("QMI 检测到模组重置，启用健康检查恢复窗口",
 				"device", w.ID,
 				"window", qmiHealthGraceAfterReset.String())
@@ -608,7 +604,6 @@ func (p *Pool) addWorkerFromConfig(devCfg config.DeviceConfig, discoveryCache *q
 			if !p.acceptsWorkerCallback(w, w.generation) {
 				return
 			}
-			p.markQMIControlRecovered(w, "qmi_connected")
 			p.handlePublicIPDataSessionConnected(w, publicIPDataSessionQMI, sessionToken)
 		})
 	}
