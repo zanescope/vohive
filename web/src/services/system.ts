@@ -70,6 +70,55 @@ export type SystemInfo = {
   docs: DocsLinks
 }
 
+export type ModemManagerIsolationState =
+  | 'absent'
+  | 'current'
+  | 'stale'
+  | 'partial'
+  | 'pending_replug'
+  | 'foreign'
+  | 'modified'
+  | 'unsupported'
+
+export type ModemManagerIsolationSelectorKind = 'usb_serial' | 'usb_path' | 'none'
+
+export type ModemManagerIsolationDevice = {
+  device_id: string
+  name?: string
+  control_device?: string
+  selector_kind?: ModemManagerIsolationSelectorKind
+  selector_value?: string
+  covered?: boolean
+  reason?: string
+}
+
+export type ModemManagerIsolationStatus = {
+  status: ModemManagerIsolationState
+  reason?: string
+  rule_path?: string
+  revision?: string
+  plan_revision?: string
+  managed_by_vohive?: boolean
+  can_install?: boolean
+  can_uninstall?: boolean
+  total_devices?: number
+  covered_devices?: number
+  requires_replug?: boolean
+  warning?: string
+  manual_attention?: boolean
+  devices?: ModemManagerIsolationDevice[]
+}
+
+export type ModemManagerIsolationActionRequest = {
+  current_password: string
+  expected_revision: string
+  expected_plan_revision: string
+}
+
+export type ModemManagerIsolationActionResponse = ModemManagerIsolationStatus & {
+  message?: string
+}
+
 export type TelegramSettings = {
   enabled: boolean
   bot_token: string
@@ -252,6 +301,30 @@ export const systemService = {
     return callService(async () => {
       const res = await api.get('/system/info')
       return res.data as SystemInfo
+    })
+  },
+  getModemManagerIsolation() {
+    return callService(async () => {
+      const res = await api.get<ModemManagerIsolationStatus>('/system/modemmanager/isolation')
+      return res.data
+    })
+  },
+  installModemManagerIsolation(payload: ModemManagerIsolationActionRequest) {
+    return callService(async () => {
+      const res = await api.post<ModemManagerIsolationActionResponse>(
+        '/system/modemmanager/isolation/actions/install',
+        payload
+      )
+      return res.data || {}
+    })
+  },
+  uninstallModemManagerIsolation(payload: ModemManagerIsolationActionRequest) {
+    return callService(async () => {
+      const res = await api.post<ModemManagerIsolationActionResponse>(
+        '/system/modemmanager/isolation/actions/uninstall',
+        payload
+      )
+      return res.data || {}
     })
   },
   changePassword(payload: { old_password: string; new_password: string; confirm_password: string }) {

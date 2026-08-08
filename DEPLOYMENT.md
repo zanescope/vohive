@@ -398,6 +398,29 @@ sudo systemctl enable --now ModemManager.service
 
 如果主机还需要 ModemManager 管理其他蜂窝设备，不要全局停用它。应只让 ModemManager 忽略交给 VoHive 的设备：
 
+原生 systemd 安装可以在“系统设置 → ModemManager 混合使用”中预览并安装隔离配置。网页会检查所有由 VoHive 配置为 QMI 后端的设备；只有这些设备当前全部在线，并且都能解析出唯一 USB 序列号或稳定物理端口后，才会启用安装按钮。安装和卸载都需要再次输入当前管理员密码。
+
+从 v1.6.5 等旧版本原地升级后，如果页面提示缺少宿主机配置 helper，请重新下载当前版本的签名安装器并执行 `sudo sh vohive-install.sh --repair`，补装并刷新受控 systemd 单元，然后返回页面重新检查。
+
+网页管理的规则固定写入 `/etc/udev/rules.d/78-mm-vohive-managed.rules`。VoHive 不会接管、覆盖或删除下面手工方式使用的 `78-mm-vohive.rules`，也不会接受浏览器传入的规则文本或文件路径。容器、OpenWrt、portable 部署，以及无法解析稳定 USB 身份的设备，仍需在宿主机按下面步骤手工处理。
+
+网页操作只会 reload udev 规则。为了避免影响主机上由 ModemManager 管理的其他设备，VoHive 不会自动执行全局 `udevadm trigger`，也不会自动重启 ModemManager；请在维护窗口逐台重新插拔目标设备。
+
+如果页面进入“需要人工确认”状态，表示规则文件可能已经变更，但系统没有确认 udev 规则已成功 reload。此时网页会锁定后续安装和卸载，避免在未知状态上继续覆盖。最稳妥的恢复方式是重启宿主机，重启后页面会自动重新检查并解除这项临时锁。
+
+无法立即重启时，必须由 root 先 reload 并核对规则，再清除同一开机周期的恢复证据：
+
+```bash
+sudo udevadm control --reload-rules
+# 核对 /etc/udev/rules.d/78-mm-vohive-managed.rules 与目标设备后再继续
+sudo rm -f /var/lib/vohive/host-config/request.json /var/lib/vohive/host-config/result.json /var/lib/vohive/host-config/manual-attention.json
+sudo systemctl restart vohive.service
+```
+
+不要在未 reload、未核对规则时单独删除这些恢复证据。
+
+手工配置步骤如下：
+
 1. 查询目标设备的唯一 USB 序列号和物理路径：
 
    ```bash
@@ -413,7 +436,7 @@ sudo systemctl enable --now ModemManager.service
    SUBSYSTEMS=="usb", ATTRS{idVendor}=="2c7c", ATTRS{serial}=="REPLACE_WITH_UNIQUE_SERIAL", ENV{ID_MM_DEVICE_IGNORE}="1"
 
    # 备选：固定 USB 物理端口；启用时删除上面的 serial 规则
-   # SUBSYSTEMS=="usb", KERNELS=="1-2.3", ENV{ID_MM_DEVICE_IGNORE}="1"
+   # SUBSYSTEMS=="usb", ATTRS{idVendor}=="2c7c", KERNELS=="1-2.3", ENV{ID_MM_DEVICE_IGNORE}="1"
 
    LABEL="mm_vohive_end"
    ```
@@ -424,9 +447,8 @@ sudo systemctl enable --now ModemManager.service
 
    ```bash
    sudo systemctl stop vohive.service
-   sudo udevadm control --reload
+   sudo udevadm control --reload-rules
    # 逐台重新插拔交给 VoHive 的设备
-   sudo systemctl restart ModemManager.service
    sudo systemctl start vohive.service
    ```
 
