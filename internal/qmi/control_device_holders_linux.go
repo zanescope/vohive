@@ -10,8 +10,11 @@ import (
 )
 
 type qmiControlDeviceHolder struct {
-	PID     int
-	Command string
+	PID                     int
+	Command                 string
+	Cgroup                  string
+	ModemManagerOwned       bool
+	ModemManagerOwnerReason string
 }
 
 type qmiControlDeviceHolders struct {
@@ -68,9 +71,13 @@ func detectQMIControlDeviceHoldersLinux(controlDevice string) (qmiControlDeviceH
 			out.Unknown = true
 		}
 		if matched {
+			ownership := detectModemManagerOwnershipAt("/proc", pid)
 			out.Holders = append(out.Holders, qmiControlDeviceHolder{
-				PID:     pid,
-				Command: readProcessCommand(pid),
+				PID:                     pid,
+				Command:                 readProcessCommand(pid),
+				Cgroup:                  ownership.Cgroup,
+				ModemManagerOwned:       ownership.Owned,
+				ModemManagerOwnerReason: ownership.Reason,
 			})
 		}
 	}

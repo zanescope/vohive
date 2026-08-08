@@ -48,6 +48,11 @@ func DiscoveryClientOptionsForControlDevice(controlDevice string) (qmiq.ClientOp
 }
 
 func clientOpenModeSummary(cfg config.DeviceConfig) []any {
+	fields, _ := clientOpenModeSummaryAndDecision(cfg)
+	return fields
+}
+
+func clientOpenModeSummaryAndDecision(cfg config.DeviceConfig) ([]any, qmiTransportDecision) {
 	opts, decision := clientOptionsFromDeviceConfig(cfg)
 	controlDevice := strings.TrimSpace(cfg.ControlDevice)
 	if controlDevice == "" {
@@ -76,7 +81,17 @@ func clientOpenModeSummary(cfg config.DeviceConfig) []any {
 			"qmi_proxy_executable", opts.ProxyExecutable,
 		)
 	}
-	return fields
+	if len(decision.ModemManagerHolders) > 0 {
+		holderPIDs := make([]int, 0, len(decision.ModemManagerHolders))
+		for _, holder := range decision.ModemManagerHolders {
+			holderPIDs = append(holderPIDs, holder.PID)
+		}
+		fields = append(fields,
+			"qmi_modemmanager_conflict", true,
+			"qmi_modemmanager_holder_pids", holderPIDs,
+		)
+	}
+	return fields, decision
 }
 
 func qmiTransportName(useProxy bool) string {
@@ -92,10 +107,13 @@ type qmiTransportDecision struct {
 	HolderCount          int
 	HolderScanUnknown    bool
 	HolderScanError      string
+	ModemManagerHolders  []qmiControlDeviceHolder
+	Holders              []qmiControlDeviceHolder
+	OnlyQMIProxy         bool
 }
 
-func decideQMITransport(cfg config.DeviceConfig, backend string) qmiTransportDecision {
-	decision := qmiTransportDecision{}
+func decideQMITransport(cfg config.DeviceConfig, _ string) qmiTransportDecision {
+	decision := qmiTransportDecision{UseProxy: cfg.QMIUseProxy}
 	controlDevice := strings.TrimSpace(cfg.ControlDevice)
 	if controlDevice == "" {
 		controlDevice = strings.TrimSpace(cfg.QMIDevice)
@@ -107,19 +125,17 @@ func decideQMITransport(cfg config.DeviceConfig, backend string) qmiTransportDec
 			decision.HolderScanError = err.Error()
 		} else {
 			decision.HolderCount = len(holders.Holders)
+			decision.Holders = append(decision.Holders, holders.Holders...)
+			decision.OnlyQMIProxy = holders.onlyQMIProxy()
 			decision.HolderScanUnknown = holders.Unknown
+			for _, holder := range holders.Holders {
+				if holder.ModemManagerOwned {
+					decision.ModemManagerHolders = append(decision.ModemManagerHolders, holder)
+				}
+			}
 		}
 	}
 
-	if cfg.QMIUseProxy {
-		decision.UseProxy = true
-		return decision
-	}
-	if backend == "qmi" &&
-		decision.ControlDeviceScanned &&
-		(decision.HolderScanError != "" || decision.HolderScanUnknown || decision.HolderCount > 0) {
-		decision.UseProxy = true
-	}
 	return decision
 }
 

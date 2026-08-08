@@ -853,7 +853,8 @@ func New(cfg config.DeviceConfig, modemDev *qmimanager.ModemDevice) *Manager {
 	qmiCfg := buildQMIManagerConfig(cfg, device)
 
 	// 创建 QMI 管理器
-	openFields := clientOpenModeSummary(cfg)
+	openFields, transportDecision := clientOpenModeSummaryAndDecision(cfg)
+	warnModemManagerQMIConflict(cfg, transportDecision)
 	if qmiCfg.ClientOptions.UseProxy {
 		logger.Info("QMI client 将优先通过 qmi-proxy 打开控制口", openFields...)
 	} else {
@@ -1837,20 +1838,45 @@ func (m *Manager) GetSMSC(ctx context.Context) (string, error) {
 	return m.qmiMgr.GetSMSC(ctx)
 }
 
+func (m *Manager) validateStartOwnership() error {
+	if m == nil {
+		return fmt.Errorf("qmi_transport_ownership_preflight: manager is nil")
+	}
+	if err := validateQMITransportOwnership(m.cfg); err != nil {
+		logger.Error(
+			"QMI transport ownership preflight rejected start",
+			"device", strings.TrimSpace(m.cfg.ID),
+			"qmi_use_proxy", m.cfg.QMIUseProxy,
+			"err", err,
+		)
+		return err
+	}
+	return nil
+}
+
 // Start 启动 QMI 管理器
 func (m *Manager) Start() error {
+	if err := m.validateStartOwnership(); err != nil {
+		return err
+	}
 	logger.Info(fmt.Sprintf("[%s] 启动 QMI 管理器", m.cfg.ID))
 	return m.qmiMgr.Start()
 }
 
 // StartCore 仅启动 QMI 核心控制面，不建立数据连接。
 func (m *Manager) StartCore() error {
+	if err := m.validateStartOwnership(); err != nil {
+		return err
+	}
 	logger.Info(fmt.Sprintf("[%s] 启动 QMI Core", m.cfg.ID))
 	return m.qmiMgr.StartCore()
 }
 
 // StartCoreContext 仅启动 QMI 核心控制面，不建立数据连接，并受调用方 context 约束。
 func (m *Manager) StartCoreContext(ctx context.Context) error {
+	if err := m.validateStartOwnership(); err != nil {
+		return err
+	}
 	logger.Info(fmt.Sprintf("[%s] 启动 QMI Core", m.cfg.ID))
 	return m.qmiMgr.StartCoreContext(ctx)
 }
