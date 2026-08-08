@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useSettingsStore } from '../stores/settings'
 import PageHeader from '../components/PageHeader.vue'
 import FieldRow from '../components/FieldRow.vue'
+import ModemManagerIsolationCard from '../components/ModemManagerIsolationCard.vue'
 import { 
   Key24Regular, 
   Save24Regular,
@@ -877,6 +878,8 @@ onBeforeUnmount(() => {
             </div>
          </div>
       </div>
+
+      <ModemManagerIsolationCard />
 
       <div class="notify-card ui-card p-8 relative overflow-hidden group lg:col-span-2">
          <div class="absolute top-0 right-0 w-40 h-40 bg-purple-500/5 rounded-bl-full -mr-10 -mt-10 transition-transform group-hover:scale-110"></div>

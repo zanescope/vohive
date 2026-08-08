@@ -7,9 +7,11 @@ PURGE=0
 ASSUME_YES=0
 KEEP_CONFIG=0
 LOCK_FILE='/var/lib/vohive/update/update.lock'
+MANAGED_MODEMMANAGER_RULE='/etc/udev/rules.d/78-mm-vohive-managed.rules'
 LOCK_HELD=0
 LOCK_BOOT_ID=''
 LOCK_PROCESS_START_TICKS=''
+MAIN_SERVICE_RESTART=''
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -52,19 +54,57 @@ safe_remove_tree() {
 	rm -rf -- "$1"
 }
 
-refuse_active_transaction_services() {
+find_active_transaction_service() {
 	if command -v systemctl >/dev/null 2>&1; then
-		for service in vohive-update.service vohive-recover.service; do
+		for service in vohive-update.service vohive-recover.service vohive-host-config.service; do
 			if systemctl is-active --quiet "$service" 2>/dev/null; then
-				die "$service is active; wait for it to finish before uninstalling"
+				printf '%s\n' "$service"
+				return 0
 			fi
 		done
 	fi
 	for service in vohive-update vohive-recover; do
 		if [ -x "/etc/init.d/$service" ] && "/etc/init.d/$service" running >/dev/null 2>&1; then
-			die "OpenWrt $service is active; wait for it to finish before uninstalling"
+			printf 'OpenWrt %s\n' "$service"
+			return 0
 		fi
 	done
+	return 1
+}
+
+refuse_active_transaction_services() {
+	if active_service=$(find_active_transaction_service); then
+		die "$active_service is active; wait for it to finish before uninstalling"
+	fi
+}
+
+restart_main_service_after_cleanup_failure() {
+	case "$MAIN_SERVICE_RESTART" in
+		'') return 0 ;;
+		systemd|openwrt) ;;
+		*) return 1 ;;
+	esac
+	# guard-start rejects a service start while the uninstall/update lock is
+	# still held. Release only after deciding the previous service was active.
+	release_uninstall_lock || return 1
+	case "$MAIN_SERVICE_RESTART" in
+		systemd) systemctl start vohive.service >/dev/null 2>&1 ;;
+		openwrt) /etc/init.d/vohive start >/dev/null 2>&1 ;;
+	esac
+}
+
+abort_host_config_cleanup() {
+	message=$1
+	if ! restart_main_service_after_cleanup_failure; then
+		warn 'could not restart the previously active VoHive service after the cleanup failure'
+	fi
+	die "$message"
+}
+
+refuse_active_transaction_services_after_stop() {
+	if active_service=$(find_active_transaction_service); then
+		abort_host_config_cleanup "$active_service became active after VoHive stopped; service definitions and programs were retained"
+	fi
 }
 
 release_uninstall_lock() {
@@ -122,12 +162,18 @@ acquire_uninstall_lock() {
 
 stop_services() {
 	if command -v systemctl >/dev/null 2>&1; then
+		if systemctl is-active --quiet vohive.service 2>/dev/null; then
+			MAIN_SERVICE_RESTART='systemd'
+		fi
 		systemctl stop vohive.service 2>/dev/null || true
 		if systemctl is-active --quiet vohive.service 2>/dev/null; then
 			die 'vohive.service is still active; refusing to remove files'
 		fi
 	fi
 	if [ -x /etc/init.d/vohive ]; then
+		if [ -z "$MAIN_SERVICE_RESTART" ] && /etc/init.d/vohive running >/dev/null 2>&1; then
+			MAIN_SERVICE_RESTART='openwrt'
+		fi
 		/etc/init.d/vohive stop 2>/dev/null || true
 		if /etc/init.d/vohive running >/dev/null 2>&1; then
 			die 'OpenWrt VoHive service is still active; refusing to remove files'
@@ -139,12 +185,31 @@ remove_services() {
 	if command -v systemctl >/dev/null 2>&1; then
 		systemctl disable vohive.service vohive-recover.service 2>/dev/null || true
 	fi
-	rm -f -- /etc/systemd/system/vohive.service /etc/systemd/system/vohive-update.service /etc/systemd/system/vohive-recover.service
+	rm -f -- /etc/systemd/system/vohive.service /etc/systemd/system/vohive-update.service /etc/systemd/system/vohive-recover.service /etc/systemd/system/vohive-host-config.service
 	if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload 2>/dev/null || true; fi
 	for service in vohive vohive-update vohive-recover; do
 		if [ -x "/etc/init.d/$service" ]; then "/etc/init.d/$service" disable 2>/dev/null || true; fi
 		rm -f -- "/etc/init.d/$service"
 	done
+}
+
+cleanup_managed_host_config() {
+	control='/opt/vohive/control/vohivectl'
+	if [ ! -e "$MANAGED_MODEMMANAGER_RULE" ] && [ ! -L "$MANAGED_MODEMMANAGER_RULE" ]; then
+		return 0
+	fi
+	if [ -f "$control" ] && [ ! -L "$control" ] && [ -x "$control" ]; then
+		if ! "$control" host-config --cleanup-managed-for-uninstall; then
+			abort_host_config_cleanup 'could not safely remove the VoHive-managed ModemManager isolation rule; service definitions and programs were retained'
+		fi
+		say 'VoHive-managed ModemManager isolation is absent or removed.'
+		say 'Reconnect affected modems or reboot before expecting existing udev device state to change.'
+		return
+	fi
+	if [ -e "$control" ] || [ -L "$control" ]; then
+		abort_host_config_cleanup 'the host-configuration cleanup command is unsafe; service definitions and programs were retained'
+	fi
+	abort_host_config_cleanup 'the managed ModemManager rule exists but the trusted cleanup command is unavailable; service definitions and programs were retained'
 }
 
 make_purge_backup() {
@@ -171,8 +236,6 @@ make_purge_backup() {
 
 refuse_active_transaction_services
 acquire_uninstall_lock
-# A worker that appeared during lock acquisition is still detected before the
-# main service or any files are touched. New workers cannot pass this lock.
 refuse_active_transaction_services
 stop_services
 
@@ -186,6 +249,10 @@ if [ "$PURGE" -eq 1 ]; then
 	make_purge_backup
 fi
 
+# The main service can no longer launch a new host-config helper. Recheck after
+# any interactive purge confirmation before changing the managed rule.
+refuse_active_transaction_services_after_stop
+cleanup_managed_host_config
 remove_services
 
 if [ -L /usr/local/sbin/vohivectl ]; then

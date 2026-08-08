@@ -23,6 +23,7 @@ import (
 	"github.com/zanescope/vohive/internal/db"
 	"github.com/zanescope/vohive/internal/device"
 	"github.com/zanescope/vohive/internal/global"
+	"github.com/zanescope/vohive/internal/hostconfig"
 	"github.com/zanescope/vohive/internal/notify"
 	"github.com/zanescope/vohive/internal/proxy/server"
 	proxytraffic "github.com/zanescope/vohive/internal/proxy/traffic"
@@ -67,21 +68,23 @@ type loginAttempt struct {
 
 // Server 是 API 服务器的核心结构
 type Server struct {
-	cfg         config.ServerConfig // HTTP 服务器配置
-	fullCfg     *config.Config      // 完整配置引用
-	pool        *device.Pool        // 设备工作器池
-	auth        config.WebConfig    // Web 认证配置
-	fs          http.FileSystem     // 静态文件系统
-	configPath  string              // 配置文件路径
-	proxyMgr    *server.Manager     // 代理实例管理器
-	trafficRT   realtimeTrafficSubscriber
-	proxyRepo   repo.ProxyInstanceRepository
-	proxySyncMu sync.Mutex
-	voiceGW     *voicehost.Gateway
-	notifyMgr   *notify.Manager
-	websheets   *vwebsheet.Broker
-	updates     updater.Coordinator
-	configApply deviceConfigApplyRuntime
+	cfg                      config.ServerConfig // HTTP 服务器配置
+	fullCfg                  *config.Config      // 完整配置引用
+	pool                     *device.Pool        // 设备工作器池
+	auth                     config.WebConfig    // Web 认证配置
+	fs                       http.FileSystem     // 静态文件系统
+	configPath               string              // 配置文件路径
+	proxyMgr                 *server.Manager     // 代理实例管理器
+	trafficRT                realtimeTrafficSubscriber
+	proxyRepo                repo.ProxyInstanceRepository
+	proxySyncMu              sync.Mutex
+	voiceGW                  *voicehost.Gateway
+	notifyMgr                *notify.Manager
+	websheets                *vwebsheet.Broker
+	updates                  updater.Coordinator
+	configApply              deviceConfigApplyRuntime
+	hostConfig               hostconfig.Coordinator
+	hostConfigTargetProvider func() []hostconfig.Target
 
 	httpSrvMu sync.Mutex
 	httpSrv   *http.Server
@@ -91,6 +94,9 @@ type Server struct {
 
 	updateAuthMu       sync.Mutex
 	updateAuthAttempts map[string]loginAttempt
+
+	hostConfigAuthMu       sync.Mutex
+	hostConfigAuthAttempts map[string]loginAttempt
 
 	shutdownCh chan struct{}
 }
@@ -162,6 +168,7 @@ func New(cfg *config.Config, pool *device.Pool, fs http.FileSystem, proxyMgr *se
 		proxyRepo:          repo.NewDBRepo(),
 		websheets:          vwebsheet.New(vwebsheet.Config{BasePath: "/api/websheets"}),
 		updates:            newDefaultUpdateCoordinator(),
+		hostConfig:         hostconfig.NewLocalCoordinator(),
 		loginAttempts:      make(map[string]loginAttempt),
 		updateAuthAttempts: make(map[string]loginAttempt),
 		shutdownCh:         make(chan struct{}),
@@ -311,6 +318,9 @@ func (s *Server) newRouter() *gin.Engine {
 		api.GET("/system/update/check", s.handleUpdateCheck)
 		api.POST("/system/update/jobs", s.handleStartUpdateJob)
 		api.GET("/system/update/jobs/:job_id", s.handleUpdateJobState)
+		api.GET("/system/modemmanager/isolation", s.handleModemManagerIsolationStatus)
+		api.POST("/system/modemmanager/isolation/actions/install", s.handleInstallModemManagerIsolation)
+		api.POST("/system/modemmanager/isolation/actions/uninstall", s.handleUninstallModemManagerIsolation)
 
 		api.GET("/devices", s.handleDeviceMgmtList)                                            // 获取设备列表（管理页用）
 		api.POST("/devices", s.handleDeviceMgmtAddDevice)                                      // 添加新设备

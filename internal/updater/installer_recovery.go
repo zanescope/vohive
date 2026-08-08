@@ -52,6 +52,7 @@ func restoreInstallerManagedFiles(ctx context.Context, paths RuntimePaths, backu
 			installerBackupMarker{name: "unit_main", destination: "/etc/systemd/system/vohive.service", mode: 0o644},
 			installerBackupMarker{name: "unit_update", destination: "/etc/systemd/system/vohive-update.service", mode: 0o644},
 			installerBackupMarker{name: "unit_recover", destination: "/etc/systemd/system/vohive-recover.service", mode: 0o644},
+			installerBackupMarker{name: "unit_host_config", destination: "/etc/systemd/system/vohive-host-config.service", mode: 0o644},
 			installerBackupMarker{name: "enable_main", destination: "/etc/systemd/system/multi-user.target.wants/vohive.service", mode: 0o644},
 			installerBackupMarker{name: "enable_recover", destination: "/etc/systemd/system/multi-user.target.wants/vohive-recover.service", mode: 0o644},
 		)

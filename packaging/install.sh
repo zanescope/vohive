@@ -337,6 +337,7 @@ rollback_transaction() {
 				restore_path /etc/systemd/system/vohive.service unit_main || restore_failed=1
 				restore_path /etc/systemd/system/vohive-update.service unit_update || restore_failed=1
 				restore_path /etc/systemd/system/vohive-recover.service unit_recover || restore_failed=1
+				restore_path /etc/systemd/system/vohive-host-config.service unit_host_config || restore_failed=1
 				restore_path /etc/systemd/system/multi-user.target.wants/vohive.service enable_main || restore_failed=1
 				restore_path /etc/systemd/system/multi-user.target.wants/vohive-recover.service enable_recover || restore_failed=1
 				systemctl daemon-reload >/dev/null 2>&1 || restore_failed=1
@@ -717,6 +718,7 @@ backup_transaction() {
 			save_path /etc/systemd/system/vohive.service unit_main
 			save_path /etc/systemd/system/vohive-update.service unit_update
 			save_path /etc/systemd/system/vohive-recover.service unit_recover
+			save_path /etc/systemd/system/vohive-host-config.service unit_host_config
 			save_path /etc/systemd/system/multi-user.target.wants/vohive.service enable_main
 			save_path /etc/systemd/system/multi-user.target.wants/vohive-recover.service enable_recover
 			;;
@@ -762,7 +764,7 @@ EOF
 install_systemd_units() {
 	config_parent=$(dirname "$CONFIG_FILE")
 	data_parent=$(dirname "$DATA_ROOT")
-	rm -f -- /etc/systemd/system/vohive.service /etc/systemd/system/vohive-update.service /etc/systemd/system/vohive-recover.service
+	rm -f -- /etc/systemd/system/vohive.service /etc/systemd/system/vohive-update.service /etc/systemd/system/vohive-recover.service /etc/systemd/system/vohive-host-config.service
 	cat >/etc/systemd/system/vohive.service <<EOF
 [Unit]
 Description=VoHive cellular modem manager
@@ -838,7 +840,40 @@ ReadWritePaths=/opt/vohive /etc/vohive /var/lib/vohive
 [Install]
 WantedBy=multi-user.target
 EOF
-	chmod 0644 /etc/systemd/system/vohive.service /etc/systemd/system/vohive-update.service /etc/systemd/system/vohive-recover.service
+	cat >/etc/systemd/system/vohive-host-config.service <<'EOF'
+[Unit]
+Description=Apply VoHive managed host configuration
+Documentation=https://github.com/zanescope/vohive
+After=local-fs.target
+ConditionPathExists=/var/lib/vohive/host-config/request.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/var/lib/vohive
+ExecStart=/opt/vohive/control/vohivectl host-config --request /var/lib/vohive/host-config/request.json
+TimeoutStartSec=30s
+UMask=0077
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/sys
+ReadWritePaths=/etc/udev/rules.d /var/lib/vohive/host-config /var/lib/vohive/update
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX
+EOF
+	chmod 0644 /etc/systemd/system/vohive.service /etc/systemd/system/vohive-update.service /etc/systemd/system/vohive-recover.service /etc/systemd/system/vohive-host-config.service
 	systemctl daemon-reload
 	systemctl enable vohive.service vohive-recover.service >/dev/null
 }

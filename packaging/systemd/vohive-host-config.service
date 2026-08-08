@@ -1,0 +1,31 @@
+[Unit]
+Description=Apply VoHive managed host configuration
+Documentation=https://github.com/zanescope/vohive
+After=local-fs.target
+ConditionPathExists=/var/lib/vohive/host-config/request.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/var/lib/vohive
+ExecStart=/opt/vohive/control/vohivectl host-config --request /var/lib/vohive/host-config/request.json
+TimeoutStartSec=30s
+UMask=0077
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/sys
+ReadWritePaths=/etc/udev/rules.d /var/lib/vohive/host-config /var/lib/vohive/update
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX

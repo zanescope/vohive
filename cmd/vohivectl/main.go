@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zanescope/vohive/internal/hostconfig"
 	"github.com/zanescope/vohive/internal/updater"
 )
 
@@ -48,6 +49,8 @@ func main() {
 		err = recover(ctx, *deploymentFile, args[1:])
 	case "guard-start":
 		err = guardStart(*deploymentFile, args[1:])
+	case "host-config":
+		err = applyHostConfig(ctx, args[1:])
 	case "probe":
 		err = probe(ctx, *deploymentFile, args[1:])
 	default:
@@ -61,7 +64,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: vohivectl [--deployment PATH] <status|check|update|rollback|backup|doctor|recover|guard-start|probe> [options]")
+	fmt.Fprintln(os.Stderr, "usage: vohivectl [--deployment PATH] <status|check|update|rollback|backup|doctor|recover|guard-start|host-config|probe> [options]")
 }
 
 func status(deploymentFile string) error {
@@ -234,6 +237,38 @@ func guardStart(deploymentFile string, args []string) error {
 		return errors.New("guard-start takes no arguments")
 	}
 	return updater.GuardStart(deploymentFile)
+}
+
+func applyHostConfig(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("host-config", flag.ContinueOnError)
+	requestFile := flags.String("request", "", "read a persisted, server-generated host configuration request")
+	cleanupForUninstall := flags.Bool(
+		"cleanup-managed-for-uninstall",
+		false,
+		"remove only the canonical VoHive-managed ModemManager rule during product uninstall",
+	)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("host-config takes no positional arguments")
+	}
+	if (*requestFile != "") == *cleanupForUninstall {
+		return errors.New(
+			"host-config requires exactly one of --request or --cleanup-managed-for-uninstall",
+		)
+	}
+	if *cleanupForUninstall {
+		result, cleanupErr := hostconfig.CleanupManagedForUninstall(ctx, nil)
+		if jsonErr := writeJSON(result); cleanupErr == nil && jsonErr != nil {
+			cleanupErr = jsonErr
+		}
+		return cleanupErr
+	}
+	if *requestFile != hostconfig.DefaultRequestPath {
+		return fmt.Errorf("host-config --request must be %s", hostconfig.DefaultRequestPath)
+	}
+	return hostconfig.RunWorker(ctx, *requestFile, nil)
 }
 
 func probe(ctx context.Context, deploymentFile string, args []string) error {

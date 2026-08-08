@@ -638,6 +638,86 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /system/modemmanager/isolation:
+    get:
+      tags: [settings]
+      summary: 查看 ModemManager 设备级隔离状态
+      responses:
+        '200':
+          description: 当前规则所有权、设备匹配预览与可执行操作
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModemManagerIsolationStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /system/modemmanager/isolation/actions/install:
+    post:
+      tags: [settings]
+      summary: 安装或更新 VoHive 管理的 ModemManager 隔离规则
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModemManagerIsolationActionRequest'
+      responses:
+        '200':
+          description: 操作完成；requires_replug 表示需要逐台重新插拔目标设备
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModemManagerIsolationActionResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '422':
+          $ref: '#/components/responses/ErrorMessage'
+        '429':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
+  /system/modemmanager/isolation/actions/uninstall:
+    post:
+      tags: [settings]
+      summary: 卸载 VoHive 管理的 ModemManager 隔离规则
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModemManagerIsolationActionRequest'
+      responses:
+        '200':
+          description: 操作完成；VoHive 不会自动触发 udev 或重启 ModemManager
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModemManagerIsolationActionResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ErrorMessage'
+        '409':
+          $ref: '#/components/responses/ErrorMessage'
+        '422':
+          $ref: '#/components/responses/ErrorMessage'
+        '429':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
   /devices:
     get:
       tags: [devices]
@@ -1803,6 +1883,99 @@ components:
           type: string
         docs:
           $ref: '#/components/schemas/DocsLinks'
+
+    ModemManagerIsolationDevice:
+      type: object
+      required: [device_id, covered]
+      properties:
+        device_id:
+          type: string
+        name:
+          type: string
+        control_device:
+          type: string
+        selector_kind:
+          type: string
+          enum: [usb_serial, usb_path, none]
+        selector_value:
+          type: string
+        covered:
+          type: boolean
+        reason:
+          type: string
+
+    ModemManagerIsolationStatus:
+      type: object
+      required:
+        - status
+        - managed_by_vohive
+        - can_install
+        - can_uninstall
+        - total_devices
+        - covered_devices
+        - devices
+      properties:
+        status:
+          type: string
+          enum: [absent, current, stale, partial, pending_replug, foreign, modified, unsupported]
+        reason:
+          type: string
+        rule_path:
+          type: string
+        revision:
+          type: string
+          description: 用于安装或卸载时防止覆盖并发修改的不透明版本
+        plan_revision:
+          type: string
+          description: Opaque digest binding the displayed rule state and resolved target matchers
+          pattern: '^sha256:[0-9a-f]{64}$'
+        managed_by_vohive:
+          type: boolean
+        can_install:
+          type: boolean
+        can_uninstall:
+          type: boolean
+        total_devices:
+          type: integer
+          minimum: 0
+        covered_devices:
+          type: integer
+          minimum: 0
+        requires_replug:
+          type: boolean
+        warning:
+          type: string
+          description: Non-sensitive warning when a committed change needs privileged cleanup repair
+        manual_attention:
+          type: boolean
+          description: True when a host configuration change needs explicit recovery before more actions
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModemManagerIsolationDevice'
+
+    ModemManagerIsolationActionRequest:
+      type: object
+      additionalProperties: false
+      required: [current_password, expected_revision, expected_plan_revision]
+      properties:
+        current_password:
+          type: string
+          format: password
+        expected_revision:
+          type: string
+        expected_plan_revision:
+          type: string
+          description: Opaque plan revision returned by the latest status preview
+          pattern: '^sha256:[0-9a-f]{64}$'
+
+    ModemManagerIsolationActionResponse:
+      allOf:
+        - $ref: '#/components/schemas/ModemManagerIsolationStatus'
+        - type: object
+          properties:
+            message:
+              type: string
 
     LoginRequest:
       type: object
