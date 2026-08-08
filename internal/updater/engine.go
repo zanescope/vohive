@@ -51,7 +51,7 @@ func NewEngine(deploymentFile string, resolver ReleaseResolver) (*Engine, error)
 	}
 	return &Engine{
 		DeploymentFile: deploymentFile, Resolver: resolver,
-		HTTPClient: &http.Client{Timeout: 30 * time.Minute},
+		HTTPClient: &http.Client{Timeout: artifactSourceTimeout + time.Minute},
 		Service:    NewServiceController(deployment.InstallType, nil), Ready: HTTPReadyChecker{},
 		Now: time.Now, ReadyTimeout: 90 * time.Second, ReadyInterval: 2 * time.Second, StableFor: 30 * time.Second,
 	}, nil
@@ -127,12 +127,37 @@ func (e *Engine) Update(ctx context.Context, request UpdateRequest) (state Trans
 
 	artifactPath := filepath.Join(paths.DownloadsDir(), candidate.Artifact.Name)
 	state.ArtifactPath = artifactPath
+	state.DownloadTotalBytes = candidate.Artifact.Size
 	if err := e.saveState(paths, &state, PhaseDownloading, nil); err != nil {
 		return state, err
 	}
-	if err := DownloadArtifact(ctx, e.HTTPClient, candidate, artifactPath); err != nil {
+	var lastProgressSave time.Time
+	var lastProgressSource string
+	source, err := downloadArtifactWithProgress(
+		ctx,
+		e.HTTPClient,
+		candidate,
+		artifactPath,
+		func(progress DownloadProgress) error {
+			state.DownloadSource = progress.Source
+			state.DownloadedBytes = progress.DownloadedBytes
+			state.DownloadTotalBytes = progress.TotalBytes
+			now := time.Now()
+			sourceChanged := progress.Source != lastProgressSource
+			complete := progress.DownloadedBytes == progress.TotalBytes
+			if sourceChanged || complete || lastProgressSave.IsZero() || now.Sub(lastProgressSave) >= 2*time.Second {
+				lastProgressSave = now
+				lastProgressSource = progress.Source
+				return e.saveState(paths, &state, PhaseDownloading, nil)
+			}
+			return nil
+		},
+	)
+	if err != nil {
 		return e.fail(paths, state, err)
 	}
+	state.DownloadSource = source
+	state.DownloadedBytes = candidate.Artifact.Size
 	if err := e.saveState(paths, &state, PhaseVerifying, nil); err != nil {
 		return state, err
 	}

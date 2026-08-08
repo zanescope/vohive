@@ -349,6 +349,9 @@ type TransactionState struct {
 	ControlTouched         bool      `json:"control_touched,omitempty"`
 	BackupPath             string    `json:"backup_path,omitempty"`
 	ArtifactPath           string    `json:"artifact_path,omitempty"`
+	DownloadSource         string    `json:"download_source,omitempty"`
+	DownloadedBytes        int64     `json:"downloaded_bytes,omitempty"`
+	DownloadTotalBytes     int64     `json:"download_total_bytes,omitempty"`
 	StagingPath            string    `json:"staging_path,omitempty"`
 	InstalledReleasePath   string    `json:"installed_release_path,omitempty"`
 	Error                  string    `json:"error,omitempty"`
