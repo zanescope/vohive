@@ -210,7 +210,7 @@ func (p *Pool) startQMICoreWithStartupBudgetContext(parent context.Context, work
 		if _, resetErr := p.resetExistingQMIDataConnectionBeforePreference(worker, reason); resetErr != nil {
 			logger.Warn(fmt.Sprintf("[%s] QMI Core 启动后清理已有数据连接失败，继续启动", worker.ID), "err", resetErr)
 		}
-		p.markQMIControlRecovered(worker, reason)
+		p.applyQMICoreStatus(worker, worker.QMICore.CurrentCoreStatus())
 		logger.Debug(fmt.Sprintf("[%s] QMI Core 已启动，网络偏好将异步应用", worker.ID))
 		return nil
 	}
@@ -265,7 +265,7 @@ func (p *Pool) startQMICoreRetryLoop(worker *Worker) {
 					logger.Warn(fmt.Sprintf("[%s] QMI Core 恢复后自动应用网络偏好失败", worker.ID), "err", applyErr)
 				}
 			}
-			p.markQMIControlRecovered(worker, "qmi_core_recovered")
+			p.applyQMICoreStatus(worker, worker.QMICore.CurrentCoreStatus())
 		case qmiCoreRetryExhausted:
 			worker.markQMIControlUnavailable()
 			lastErr := outcome.err

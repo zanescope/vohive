@@ -64,6 +64,24 @@ type qmiEventSummary struct {
 	Fields  []any
 }
 
+// CorePhase and CoreStatus expose the durable lifecycle contract from the
+// underlying QMI manager without making device consumers depend on its event
+// callbacks. Event callbacks describe individual observations; CoreStatus is
+// the authoritative latest control-plane state.
+type CorePhase = qmimanager.CorePhase
+type CoreStatus = qmimanager.CoreStatus
+
+const (
+	CorePhaseIdle       = qmimanager.CorePhaseIdle
+	CorePhaseStarting   = qmimanager.CorePhaseStarting
+	CorePhaseReady      = qmimanager.CorePhaseReady
+	CorePhaseRecovering = qmimanager.CorePhaseRecovering
+	CorePhaseDegraded   = qmimanager.CorePhaseDegraded
+	CorePhaseStopping   = qmimanager.CorePhaseStopping
+	CorePhaseStopped    = qmimanager.CorePhaseStopped
+	CorePhaseTerminal   = qmimanager.CorePhaseTerminal
+)
+
 type qmiManagerLoggerAdapter struct {
 	fields []any
 }
@@ -1736,6 +1754,26 @@ func (m *Manager) RequestCoreRecovery(reason string) bool {
 		return false
 	}
 	return m.qmiMgr.RequestCoreRecovery(reason)
+}
+
+// CurrentCoreStatus returns the durable latest QMI control-plane snapshot.
+func (m *Manager) CurrentCoreStatus() CoreStatus {
+	if m == nil || m.qmiMgr == nil {
+		return CoreStatus{Phase: CorePhaseIdle, State: qmimanager.StateDisconnected}
+	}
+	return m.qmiMgr.CurrentCoreStatus()
+}
+
+// SubscribeCoreStatus follows the latest-value QMI control-plane stream. The
+// subscription remains valid across in-place core recovery generations and is
+// closed only when ctx ends.
+func (m *Manager) SubscribeCoreStatus(ctx context.Context) <-chan CoreStatus {
+	if m == nil || m.qmiMgr == nil {
+		ch := make(chan CoreStatus)
+		close(ch)
+		return ch
+	}
+	return m.qmiMgr.SubscribeCoreStatus(ctx)
 }
 
 func (m *Manager) GetUSIMAID(ctx context.Context) ([]byte, error) {

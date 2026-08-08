@@ -162,6 +162,9 @@ type Worker struct {
 	healthSyncInFlight        atomic.Bool
 	qmiControlReady           atomic.Bool
 	qmiCoreStartupRetrying    atomic.Bool
+	qmiCoreStatusMu           sync.Mutex
+	qmiCoreStatusSeen         bool
+	qmiCoreStatus             qmicore.CoreStatus
 
 	streamSubs          atomic.Int32 // 单设备的流订阅计数器
 	uimIndicationsReady atomic.Bool  // worker 完成启动注册后才处理 UIM 事件触发的重扫/重载
@@ -889,7 +892,6 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		if !p.acceptsWorkerCallback(worker, generation) {
 			return
 		}
-		worker.markQMIControlUnavailable()
 		p.maybeScheduleTransportRebuild(worker, HealthLayerQMI, reason, err)
 	})
 	worker.QMICore.OnIPChanged(func() {
@@ -910,7 +912,6 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 		}
 		switch event.State {
 		case qmicore.HealthEventHealthy:
-			worker.qmiControlReady.Store(true)
 			worker.RecordWatchdogEvent(WatchdogEvent{
 				Layer:     HealthLayerQMI,
 				State:     HealthStateHealthy,
@@ -918,7 +919,6 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 				Reason:    event.Reason,
 				At:        event.At,
 			})
-			worker.resetHealthFailureStreak()
 		case qmicore.HealthEventSuspect:
 			worker.RecordWatchdogEvent(WatchdogEvent{
 				Layer:     HealthLayerQMI,
@@ -928,7 +928,6 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 				At:        event.At,
 			})
 		case qmicore.HealthEventRecovering:
-			worker.markQMIControlUnavailable()
 			recoveryUntil := time.Now().Add(qmiHealthGraceAfterReset)
 			worker.RecordWatchdogEvent(WatchdogEvent{
 				Layer:         HealthLayerQMI,
@@ -938,9 +937,6 @@ func (p *Pool) bindQMIHealthIndications(worker *Worker) {
 				RecoveryUntil: recoveryUntil,
 				At:            event.At,
 			})
-			if p != nil && p.lifecycle != nil {
-				p.lifecycle.BeginRecovery(worker.ID, LifecyclePhaseRecovering, event.Reason, qmiLifecycleRecoveryTTL)
-			}
 		}
 	})
 }
@@ -1754,9 +1750,9 @@ func (p *Pool) startAllSynchronousLegacy() error {
 				if !p.acceptsWorkerCallback(w, w.generation) {
 					return
 				}
-				p.markQMIControlRecovered(w, "qmi_connected")
 				p.handlePublicIPDataSessionConnected(w, publicIPDataSessionQMI, sessionToken)
 			})
+			p.bindQMICoreStatus(w)
 			p.bindQMIHealthIndications(w)
 		}
 		if mbimCore != nil {
