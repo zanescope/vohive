@@ -48,6 +48,31 @@ func DiscoverCompatibleModems() ([]CompatibleModem, error) {
 // DiscoverCompatibleModemsFromQMI 基于已发现的 QMI 设备结果聚合兼容发现。
 // 该入口用于复用本地静态扫描结果，避免重复遍历 sysfs。
 func DiscoverCompatibleModemsFromQMI(qmiList []QMIDevice) ([]CompatibleModem, error) {
+	out, fallbackErr := discoverCompatibleModemsFromQMI(qmiList)
+	if fallbackErr != nil && len(out) == 0 {
+		return nil, fallbackErr
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("未发现调制解调器")
+	}
+	// Preserve the public helper's historical best-effort behavior: callers
+	// that already have QMI results may still use those results if the
+	// optional compatible scan fails.
+	return out, nil
+}
+
+// discoverCompatibleModemsFromQMIComplete requires the compatible/fallback
+// scan to complete. Destructive rescan decisions use this path so a failed
+// AT/MBIM scan cannot be mistaken for proof that a device disappeared.
+func discoverCompatibleModemsFromQMIComplete(qmiList []QMIDevice) ([]CompatibleModem, error) {
+	out, fallbackErr := discoverCompatibleModemsFromQMI(qmiList)
+	if fallbackErr != nil {
+		return out, fallbackErr
+	}
+	return out, nil
+}
+
+func discoverCompatibleModemsFromQMI(qmiList []QMIDevice) ([]CompatibleModem, error) {
 	out := make([]CompatibleModem, 0)
 	seen := make(map[string]struct{})
 	qmiUSBPaths := make(map[string]struct{})
@@ -70,8 +95,8 @@ func DiscoverCompatibleModemsFromQMI(qmiList []QMIDevice) ([]CompatibleModem, er
 	}
 
 	fallback, err := discoverFallbackModemsFn()
-	if err != nil && len(out) == 0 {
-		return nil, err
+	if err != nil {
+		return out, err
 	}
 	for _, m := range fallback {
 		// 如果该 USB 设备已经通过 QMI 主路径识别到，则忽略 fallback，避免切模后出现“残留重复项”。
@@ -88,9 +113,6 @@ func DiscoverCompatibleModemsFromQMI(qmiList []QMIDevice) ([]CompatibleModem, er
 		out = append(out, m)
 	}
 
-	if len(out) == 0 {
-		return nil, fmt.Errorf("未发现调制解调器")
-	}
 	return out, nil
 }
 

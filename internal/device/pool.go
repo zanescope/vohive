@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -81,7 +82,7 @@ var publicIPLookupWait = 6 * time.Second
 
 const (
 	defaultESIMPostSwitchMinDelay = time.Second
-	qmiHealthFailureThreshold     = 3
+	controlHealthFailureThreshold = 3
 	qmiHealthGraceAfterSwitch     = 2 * time.Minute
 	qmiHealthGraceAfterReset      = 90 * time.Second
 )
@@ -183,6 +184,7 @@ type Pool struct {
 	// 否则恢复扫描内的 AddWorkerFromConfig 会被自己的标记挡住。
 	modemRebootRecovering     map[string]bool
 	modemRebootWakeups        map[string]chan struct{}
+	modemRebootIdentities     map[string]modemRebootRecoveryIdentity
 	cfg                       *config.Config
 	notifier                  Notifier
 	mu                        sync.RWMutex
@@ -241,6 +243,7 @@ func NewPool(cfg *config.Config) *Pool {
 		workerGenerations:     make(map[string]uint64),
 		modemRebootRecovering: make(map[string]bool),
 		modemRebootWakeups:    make(map[string]chan struct{}),
+		modemRebootIdentities: make(map[string]modemRebootRecoveryIdentity),
 		cfg:                   cfg,
 		ctx:                   ctx,
 		cancel:                cancel,
@@ -2140,10 +2143,21 @@ func (p *Pool) runScheduledRescans() {
 }
 
 func (p *Pool) collectRescanHardware(discovered []QMIDevice, liveWorkerIndex WorkerDiscoveryIndex) []CompatibleModem {
-	return p.collectRescanHardwareForDevices(discovered, liveWorkerIndex, config.ListDevices(), nil)
+	hardware, _ := p.collectRescanHardwareForDevicesComplete(discovered, liveWorkerIndex, config.ListDevices(), nil)
+	return hardware
 }
 
 func (p *Pool) collectRescanHardwareForDevices(discovered []QMIDevice, liveWorkerIndex WorkerDiscoveryIndex, managed []config.DeviceConfig, discoveryCache *qmiBootstrapDiscoveryCache) []CompatibleModem {
+	hardware, _ := p.collectRescanHardwareForDevicesComplete(discovered, liveWorkerIndex, managed, discoveryCache)
+	return hardware
+}
+
+func (p *Pool) collectRescanHardwareForDevicesComplete(
+	discovered []QMIDevice,
+	liveWorkerIndex WorkerDiscoveryIndex,
+	managed []config.DeviceConfig,
+	discoveryCache *qmiBootstrapDiscoveryCache,
+) ([]CompatibleModem, error) {
 	var hardware []CompatibleModem
 	for i := range discovered {
 		raw := discovered[i]
@@ -2195,27 +2209,29 @@ func (p *Pool) collectRescanHardwareForDevices(discovered []QMIDevice, liveWorke
 	}
 
 	if configuredDevicesNeedCompatibleATDiscovery(managed) {
-		if compatList, err := DiscoverCompatibleModemsFromQMI(discovered); err == nil {
-			seen := map[string]bool{}
-			for _, hw := range hardware {
-				if k := config.NormalizeIMEI(hw.IMEI); k != "" {
-					seen[k] = true
-				}
-			}
-			for _, raw := range compatList {
-				m, imei := resolveDiscoveredCompatibleModemFn(raw, 1200*time.Millisecond)
-				if config.NormalizeIMEI(imei) == "" {
-					continue
-				}
-				if seen[config.NormalizeIMEI(imei)] {
-					continue
-				}
-				m.IMEI = imei
-				hardware = append(hardware, m)
+		compatList, err := discoverCompatibleModemsFromQMIComplete(discovered)
+		if err != nil {
+			return hardware, fmt.Errorf("compatible modem discovery failed: %w", err)
+		}
+		seen := map[string]bool{}
+		for _, hw := range hardware {
+			if k := config.NormalizeIMEI(hw.IMEI); k != "" {
+				seen[k] = true
 			}
 		}
+		for _, raw := range compatList {
+			m, imei := resolveDiscoveredCompatibleModemFn(raw, 1200*time.Millisecond)
+			if config.NormalizeIMEI(imei) == "" {
+				continue
+			}
+			if seen[config.NormalizeIMEI(imei)] {
+				continue
+			}
+			m.IMEI = imei
+			hardware = append(hardware, m)
+		}
 	}
-	return hardware
+	return hardware, nil
 }
 
 func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
@@ -2226,13 +2242,24 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	defer p.rescanMu.Unlock()
 
 	discovered, err := discoverQMIDevicesFn()
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrNoQMIDevices) {
 		return fmt.Errorf("QMI 硬件扫描失败: %w", err)
+	}
+	if errors.Is(err, ErrNoQMIDevices) {
+		discovered = nil
 	}
 
 	liveWorkerIndex := BuildWorkerDiscoveryIndex(p.GetAllWorkers(), false)
-	hardware := p.collectRescanHardware(discovered, liveWorkerIndex)
 	managed := config.ListDevices()
+	hardware, err := p.collectRescanHardwareForDevicesComplete(
+		discovered,
+		liveWorkerIndex,
+		managed,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
 	resolved := ResolveDeviceIdentities(hardware, managed)
 	limit := p.FreeDeviceLimit()
 

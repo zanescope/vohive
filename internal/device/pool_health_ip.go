@@ -238,9 +238,12 @@ func (w *Worker) resetHealthFailureStreak() {
 	w.healthMu.Unlock()
 }
 
-func (w *Worker) recordHealthFailure() int {
+func (w *Worker) recordControlHealthFailure(layer HealthLayer, cause error) int {
 	if w == nil {
 		return 0
+	}
+	if layer == "" {
+		layer = HealthLayerPool
 	}
 	w.healthMu.Lock()
 	w.healthConsecutiveFailures++
@@ -248,18 +251,23 @@ func (w *Worker) recordHealthFailure() int {
 	w.healthMu.Unlock()
 
 	state := HealthStateSuspect
-	if failures >= qmiHealthFailureThreshold {
+	if failures >= controlHealthFailureThreshold {
 		state = HealthStateInvalid
 	}
 	w.RecordWatchdogEvent(WatchdogEvent{
-		Layer:               HealthLayerQMI,
+		Layer:               layer,
 		State:               state,
 		EventType:           "control_health_check_failed",
 		Reason:              "control_health_check_failed",
+		Err:                 cause,
 		ConsecutiveFailures: failures,
-		Threshold:           qmiHealthFailureThreshold,
+		Threshold:           controlHealthFailureThreshold,
 	})
 	return failures
+}
+
+func (w *Worker) recordHealthFailure() int {
+	return w.recordControlHealthFailure(HealthLayerQMI, nil)
 }
 
 func (w *Worker) InvalidateDynamicCache() {

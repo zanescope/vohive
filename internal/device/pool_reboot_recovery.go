@@ -74,6 +74,31 @@ func (p *Pool) markQMIControlRecovered(worker *Worker, reason string) {
 	}
 }
 
+type modemRebootRecoveryIdentity struct {
+	USBPath       string
+	ControlDevice string
+	QMIDevice     string
+	Interface     string
+	ATPort        string
+	ManagePort    string
+}
+
+func modemRebootRecoveryIdentityFromConfig(cfg config.DeviceConfig) modemRebootRecoveryIdentity {
+	return modemRebootRecoveryIdentity{
+		USBPath:       strings.TrimSpace(cfg.USBPath),
+		ControlDevice: strings.TrimSpace(cfg.ControlDevice),
+		QMIDevice:     strings.TrimSpace(cfg.QMIDevice),
+		Interface:     strings.TrimSpace(cfg.Interface),
+		ATPort:        strings.TrimSpace(cfg.ATPort),
+		ManagePort:    strings.TrimSpace(cfg.ManagePort),
+	}
+}
+
+type modemRebootRecoveryWakeTarget struct {
+	deviceID string
+	wakeCh   chan struct{}
+}
+
 type modemRebootRecoveryOptions struct {
 	deviceID                  string
 	reason                    string
@@ -83,6 +108,7 @@ type modemRebootRecoveryOptions struct {
 	transportEvent            *TransportRecoveryEvent
 	transportRecoveryToken    TransportRecoveryToken
 	transportRecoveryBudgeted bool
+	recoveryIdentity          *modemRebootRecoveryIdentity
 }
 
 func defaultModemRebootRecoveryOptions(deviceID string, reason string) modemRebootRecoveryOptions {
@@ -101,7 +127,22 @@ func manualRebootRecoveryDelays() []time.Duration {
 	return []time.Duration{2 * time.Second, 3 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second}
 }
 
-func (p *Pool) beginModemRebootRecovery(deviceID string) bool {
+func (p *Pool) captureModemRebootRecoveryIdentity(deviceID string) *modemRebootRecoveryIdentity {
+	if p == nil || strings.TrimSpace(deviceID) == "" {
+		return nil
+	}
+	p.mu.RLock()
+	worker := p.workers[deviceID]
+	if worker == nil {
+		p.mu.RUnlock()
+		return nil
+	}
+	identity := modemRebootRecoveryIdentityFromConfig(worker.Config)
+	p.mu.RUnlock()
+	return &identity
+}
+
+func (p *Pool) beginModemRebootRecovery(deviceID string, captured ...modemRebootRecoveryIdentity) bool {
 	if p == nil || deviceID == "" {
 		return false
 	}
@@ -118,6 +159,16 @@ func (p *Pool) beginModemRebootRecovery(deviceID string) bool {
 		p.modemRebootWakeups = make(map[string]chan struct{})
 	}
 	p.modemRebootWakeups[deviceID] = make(chan struct{}, 1)
+	if p.modemRebootIdentities == nil {
+		p.modemRebootIdentities = make(map[string]modemRebootRecoveryIdentity)
+	}
+	if len(captured) > 0 {
+		p.modemRebootIdentities[deviceID] = captured[0]
+	} else if worker := p.workers[deviceID]; worker != nil {
+		p.modemRebootIdentities[deviceID] = modemRebootRecoveryIdentityFromConfig(worker.Config)
+	} else {
+		p.modemRebootIdentities[deviceID] = modemRebootRecoveryIdentity{}
+	}
 	return true
 }
 
@@ -128,6 +179,7 @@ func (p *Pool) finishModemRebootRecovery(deviceID string) {
 	p.mu.Lock()
 	delete(p.modemRebootRecovering, deviceID)
 	delete(p.modemRebootWakeups, deviceID)
+	delete(p.modemRebootIdentities, deviceID)
 	p.mu.Unlock()
 }
 
@@ -159,24 +211,65 @@ func (p *Pool) waitModemRebootRecoveryTrigger(deviceID string, delay time.Durati
 	}
 }
 
-func (p *Pool) WakeModemRebootRecoveries(reason string) int {
+func (p *Pool) modemRebootRecoveryTargetForUevent(event modemUevent) (modemRebootRecoveryWakeTarget, bool) {
 	if p == nil {
-		return 0
+		return modemRebootRecoveryWakeTarget{}, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var matched modemRebootRecoveryWakeTarget
+	for deviceID, identity := range p.modemRebootIdentities {
+		if !p.modemRebootRecovering[deviceID] || !modemUeventMatchesRecoveryIdentity(event, identity) {
+			continue
+		}
+		wakeCh := p.modemRebootWakeups[deviceID]
+		if wakeCh == nil {
+			continue
+		}
+		if matched.deviceID != "" {
+			return modemRebootRecoveryWakeTarget{}, false
+		}
+		matched = modemRebootRecoveryWakeTarget{deviceID: deviceID, wakeCh: wakeCh}
+	}
+	return matched, matched.deviceID != ""
+}
+
+func (p *Pool) wakeModemRebootRecoveryTarget(target modemRebootRecoveryWakeTarget, reason string) bool {
+	if p == nil || strings.TrimSpace(target.deviceID) == "" || target.wakeCh == nil {
+		return false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	woken := 0
-	for deviceID, ch := range p.modemRebootWakeups {
-		if !p.modemRebootRecovering[deviceID] || ch == nil {
-			continue
-		}
-		select {
-		case ch <- struct{}{}:
-			woken++
-		default:
-		}
+	if !p.modemRebootRecovering[target.deviceID] ||
+		p.modemRebootWakeups[target.deviceID] != target.wakeCh {
+		return false
 	}
-	return woken
+	select {
+	case target.wakeCh <- struct{}{}:
+		logger.Debug("模组事件已唤醒对应恢复流程",
+			"device", target.deviceID,
+			"reason", strings.TrimSpace(reason))
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Pool) WakeModemRebootRecovery(deviceID string, reason string) bool {
+	if p == nil || strings.TrimSpace(deviceID) == "" {
+		return false
+	}
+	p.mu.RLock()
+	target := modemRebootRecoveryWakeTarget{
+		deviceID: deviceID,
+		wakeCh:   p.modemRebootWakeups[deviceID],
+	}
+	active := p.modemRebootRecovering[deviceID]
+	p.mu.RUnlock()
+	if !active {
+		return false
+	}
+	return p.wakeModemRebootRecoveryTarget(target, reason)
 }
 
 func modemRebootRecoveryConfig(deviceID string) (config.DeviceConfig, bool) {
@@ -365,6 +458,7 @@ func (p *Pool) ScheduleModemRebootRecovery(deviceID string, reason string) {
 	if strings.TrimSpace(reason) == "manual_reboot" {
 		opts.delays = manualRebootRecoveryDelays()
 	}
+	opts.recoveryIdentity = p.captureModemRebootRecoveryIdentity(deviceID)
 	go p.runModemRebootRecovery(opts)
 }
 
@@ -386,6 +480,7 @@ func (p *Pool) scheduleWorkerRecoveryWithTransportEventPolicy(deviceID string, r
 		reason = "worker_recovery"
 	}
 	opts := defaultModemRebootRecoveryOptions(deviceID, reason)
+	opts.recoveryIdentity = p.captureModemRebootRecoveryIdentity(deviceID)
 	if event != nil {
 		normalizedEvent := *event
 		normalizedEvent.DeviceID = deviceID
@@ -467,6 +562,7 @@ func (p *Pool) scheduleATDisconnectRecovery(deviceID string, reason string) {
 	}
 	opts := defaultModemRebootRecoveryOptions(deviceID, reason)
 	opts.removeBeforeScan = false
+	opts.recoveryIdentity = p.captureModemRebootRecoveryIdentity(deviceID)
 	go p.runModemRebootRecovery(opts)
 }
 
@@ -476,7 +572,13 @@ func (p *Pool) runModemRebootRecovery(opts modemRebootRecoveryOptions) {
 	}
 	controller := p.transportRecovery
 	token := opts.transportRecoveryToken
-	if !p.beginModemRebootRecovery(opts.deviceID) {
+	started := false
+	if opts.recoveryIdentity != nil {
+		started = p.beginModemRebootRecovery(opts.deviceID, *opts.recoveryIdentity)
+	} else {
+		started = p.beginModemRebootRecovery(opts.deviceID)
+	}
+	if !started {
 		if controller != nil && token.valid() {
 			controller.Finish(token)
 		}

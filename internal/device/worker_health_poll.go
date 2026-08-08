@@ -86,10 +86,7 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 		}
 	}
 
-	failures := 1
-	if isQMI {
-		failures = worker.recordHealthFailure()
-	}
+	failures := worker.recordControlHealthFailure(layer, healthErr)
 	// 传输确认已断开（broken pipe/EOF/connection closed 等）时，重连前不可能探活成功，
 	// 没有必要再等满 3 次观察窗口——跳过等待，第一次失败就直接触发恢复。
 	// Recovery is staged: reconnect QMI Core in place first; rebuild the Worker
@@ -99,15 +96,15 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 		return false
 	}
 	if isQMI && strings.TrimSpace(worker.Config.ControlDevice) != "" {
-		if failures < qmiHealthFailureThreshold && !transportDown {
+		if failures < controlHealthFailureThreshold && !transportDown {
 			logger.Warn("QMI 节点探活失败，进入连续失败观察窗口",
 				"device", worker.ID,
 				"failures", failures,
-				"threshold", qmiHealthFailureThreshold)
+				"threshold", controlHealthFailureThreshold)
 			return false
 		}
 		reason := "qmi_health_threshold"
-		if transportDown && failures < qmiHealthFailureThreshold {
+		if transportDown && failures < controlHealthFailureThreshold {
 			reason = "qmi_transport_down"
 		}
 		worker.RecordWatchdogEvent(WatchdogEvent{
@@ -116,7 +113,7 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 			EventType:           reason,
 			Reason:              reason,
 			ConsecutiveFailures: failures,
-			Threshold:           qmiHealthFailureThreshold,
+			Threshold:           controlHealthFailureThreshold,
 		})
 		if p.lifecycle != nil {
 			p.lifecycle.BeginRecovery(worker.ID, LifecyclePhaseRecovering, reason, qmiLifecycleRecoveryTTL)
@@ -132,13 +129,15 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 		return false
 	}
 
-	worker.RecordWatchdogEvent(WatchdogEvent{
-		Layer:     layer,
-		State:     HealthStateSuspect,
-		EventType: "control_health_check_failed",
-		Reason:    "control_health_check_failed",
-		Err:       healthErr,
-	})
+	if failures < controlHealthFailureThreshold {
+		logger.Warn("设备控制面探活失败，进入连续失败观察窗口",
+			"device", worker.ID,
+			"backend", layer,
+			"failures", failures,
+			"threshold", controlHealthFailureThreshold,
+			"err", healthErr)
+		return true
+	}
 	logger.Info("定时检查发现设备不健康，将触发重连扫描",
 		"device", worker.ID,
 		"backend", func() string {

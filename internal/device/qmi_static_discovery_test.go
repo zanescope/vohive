@@ -1,11 +1,257 @@
 package device
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
+
+func TestDiscoverQMIDevicesEntryTimeoutIsIncompleteNotEmpty(t *testing.T) {
+	originalRoot := qmiUSBDevicesRoot
+	originalTimeout := qmiDiscoveryEntryTimeout
+	originalDiscoverEntry := discoverQMIDeviceFromSysFSFn
+	originalDiscoverWWAN := discoverWWANQMIDevicesFn
+	t.Cleanup(func() {
+		qmiUSBDevicesRoot = originalRoot
+		qmiDiscoveryEntryTimeout = originalTimeout
+		discoverQMIDeviceFromSysFSFn = originalDiscoverEntry
+		discoverWWANQMIDevicesFn = originalDiscoverWWAN
+	})
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "1-1"), 0o755); err != nil {
+		t.Fatalf("mkdir USB entry: %v", err)
+	}
+	release := make(chan struct{})
+	probeDone := make(chan struct{})
+	qmiUSBDevicesRoot = root
+	qmiDiscoveryEntryTimeout = 5 * time.Millisecond
+	discoverQMIDeviceFromSysFSFn = func(string) (*QMIDevice, error) {
+		<-release
+		close(probeDone)
+		return nil, nil
+	}
+	discoverWWANQMIDevicesFn = func() ([]QMIDevice, error) {
+		return nil, nil
+	}
+
+	_, err := discoverQMIDevices(true)
+	close(release)
+	select {
+	case <-probeDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out discovery probe did not exit")
+	}
+	if !errors.Is(err, ErrQMIDiscoveryIncomplete) {
+		t.Fatalf("discoverQMIDevices() error = %v, want incomplete", err)
+	}
+	if errors.Is(err, ErrNoQMIDevices) {
+		t.Fatalf("timed-out discovery was classified as an empty completed scan: %v", err)
+	}
+}
+
+func TestDiscoverQMIDevicesPartialSuccessAndTimeoutIsIncomplete(t *testing.T) {
+	originalRoot := qmiUSBDevicesRoot
+	originalTimeout := qmiDiscoveryEntryTimeout
+	originalDiscoverEntry := discoverQMIDeviceFromSysFSFn
+	originalDiscoverWWAN := discoverWWANQMIDevicesFn
+	t.Cleanup(func() {
+		qmiUSBDevicesRoot = originalRoot
+		qmiDiscoveryEntryTimeout = originalTimeout
+		discoverQMIDeviceFromSysFSFn = originalDiscoverEntry
+		discoverWWANQMIDevicesFn = originalDiscoverWWAN
+	})
+
+	root := t.TempDir()
+	for _, name := range []string{"1-1", "1-2"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatalf("mkdir USB entry %s: %v", name, err)
+		}
+	}
+	release := make(chan struct{})
+	probeDone := make(chan struct{})
+	qmiUSBDevicesRoot = root
+	qmiDiscoveryEntryTimeout = 5 * time.Millisecond
+	discoverQMIDeviceFromSysFSFn = func(path string) (*QMIDevice, error) {
+		if filepath.Base(path) == "1-1" {
+			return &QMIDevice{
+				ControlPath:  "/dev/cdc-wdm0",
+				NetInterface: "wwan0",
+				USBPath:      path,
+			}, nil
+		}
+		<-release
+		close(probeDone)
+		return nil, nil
+	}
+	discoverWWANQMIDevicesFn = func() ([]QMIDevice, error) {
+		return nil, nil
+	}
+
+	devices, err := discoverQMIDevices(true)
+	close(release)
+	select {
+	case <-probeDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out discovery probe did not exit")
+	}
+	if !errors.Is(err, ErrQMIDiscoveryIncomplete) {
+		t.Fatalf("discoverQMIDevices() error = %v, want incomplete", err)
+	}
+	if len(devices) != 1 || devices[0].ControlPath != "/dev/cdc-wdm0" {
+		t.Fatalf("partial devices = %#v, want the one completed result", devices)
+	}
+}
+
+func TestDiscoverQMIDevicesCompletedNonQMIEntriesReturnNoDevices(t *testing.T) {
+	originalRoot := qmiUSBDevicesRoot
+	originalTimeout := qmiDiscoveryEntryTimeout
+	originalDiscoverEntry := discoverQMIDeviceFromSysFSFn
+	originalDiscoverWWAN := discoverWWANQMIDevicesFn
+	t.Cleanup(func() {
+		qmiUSBDevicesRoot = originalRoot
+		qmiDiscoveryEntryTimeout = originalTimeout
+		discoverQMIDeviceFromSysFSFn = originalDiscoverEntry
+		discoverWWANQMIDevicesFn = originalDiscoverWWAN
+	})
+
+	root := t.TempDir()
+	for _, name := range []string{"1-1", "2-3"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatalf("mkdir USB entry %s: %v", name, err)
+		}
+	}
+	qmiUSBDevicesRoot = root
+	qmiDiscoveryEntryTimeout = time.Second
+	discoverQMIDeviceFromSysFSFn = func(string) (*QMIDevice, error) {
+		return nil, errors.New("not QMI capable")
+	}
+	discoverWWANQMIDevicesFn = func() ([]QMIDevice, error) {
+		return nil, nil
+	}
+
+	devices, err := discoverQMIDevices(true)
+	if len(devices) != 0 {
+		t.Fatalf("devices = %#v, want none", devices)
+	}
+	if !errors.Is(err, ErrNoQMIDevices) {
+		t.Fatalf("discoverQMIDevices() error = %v, want no-devices sentinel", err)
+	}
+	if errors.Is(err, ErrQMIDiscoveryIncomplete) {
+		t.Fatalf("completed non-QMI scan was classified incomplete: %v", err)
+	}
+}
+
+func TestDiscoverQMIDevicesPartialEnumerationIsIncomplete(t *testing.T) {
+	originalRoot := qmiUSBDevicesRoot
+	originalTimeout := qmiDiscoveryEntryTimeout
+	originalDiscoverEntry := discoverQMIDeviceFromSysFSFn
+	originalDiscoverWWAN := discoverWWANQMIDevicesFn
+	t.Cleanup(func() {
+		qmiUSBDevicesRoot = originalRoot
+		qmiDiscoveryEntryTimeout = originalTimeout
+		discoverQMIDeviceFromSysFSFn = originalDiscoverEntry
+		discoverWWANQMIDevicesFn = originalDiscoverWWAN
+	})
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "1-1"), 0o755); err != nil {
+		t.Fatalf("mkdir USB entry: %v", err)
+	}
+	qmiUSBDevicesRoot = root
+	qmiDiscoveryEntryTimeout = time.Second
+	discoverQMIDeviceFromSysFSFn = func(string) (*QMIDevice, error) {
+		return nil, errQMIDeviceEnumerationIncomplete
+	}
+	discoverWWANQMIDevicesFn = func() ([]QMIDevice, error) {
+		return nil, nil
+	}
+
+	devices, err := discoverQMIDevices(true)
+	if len(devices) != 0 {
+		t.Fatalf("devices = %#v, want none", devices)
+	}
+	if !errors.Is(err, ErrQMIDiscoveryIncomplete) {
+		t.Fatalf("discoverQMIDevices() error = %v, want incomplete", err)
+	}
+	if errors.Is(err, ErrNoQMIDevices) {
+		t.Fatalf("partial enumeration was classified as a completed empty scan: %v", err)
+	}
+}
+
+func TestDiscoverQMIDevicesWWANFailureIsIncomplete(t *testing.T) {
+	originalRoot := qmiUSBDevicesRoot
+	originalTimeout := qmiDiscoveryEntryTimeout
+	originalDiscoverEntry := discoverQMIDeviceFromSysFSFn
+	originalDiscoverWWAN := discoverWWANQMIDevicesFn
+	t.Cleanup(func() {
+		qmiUSBDevicesRoot = originalRoot
+		qmiDiscoveryEntryTimeout = originalTimeout
+		discoverQMIDeviceFromSysFSFn = originalDiscoverEntry
+		discoverWWANQMIDevicesFn = originalDiscoverWWAN
+	})
+
+	root := t.TempDir()
+	wwanErr := errors.New("WWAN class permission denied")
+	qmiUSBDevicesRoot = root
+	qmiDiscoveryEntryTimeout = time.Second
+	discoverQMIDeviceFromSysFSFn = func(string) (*QMIDevice, error) {
+		t.Fatal("empty USB root unexpectedly invoked an entry probe")
+		return nil, nil
+	}
+	discoverWWANQMIDevicesFn = func() ([]QMIDevice, error) {
+		return nil, wwanErr
+	}
+
+	devices, err := discoverQMIDevices(true)
+	if len(devices) != 0 {
+		t.Fatalf("devices = %#v, want none", devices)
+	}
+	if !errors.Is(err, ErrQMIDiscoveryIncomplete) || !errors.Is(err, wwanErr) {
+		t.Fatalf("discoverQMIDevices() error = %v, want incomplete preserving WWAN cause", err)
+	}
+	if errors.Is(err, ErrNoQMIDevices) {
+		t.Fatalf("failed WWAN scan was classified as a completed empty scan: %v", err)
+	}
+}
+
+func TestDiscoverQMIDeviceFromSysFSMarksQMICandidateWithoutControlIncomplete(t *testing.T) {
+	usbPath := t.TempDir()
+	usbName := filepath.Base(usbPath)
+	ifacePath := filepath.Join(usbPath, usbName+":1.4")
+	if err := os.MkdirAll(filepath.Join(ifacePath, "net", "wwan0"), 0o755); err != nil {
+		t.Fatalf("mkdir net interface: %v", err)
+	}
+	driverTarget := filepath.Join(t.TempDir(), "qmi_wwan")
+	if err := os.MkdirAll(driverTarget, 0o755); err != nil {
+		t.Fatalf("mkdir driver target: %v", err)
+	}
+	if err := os.Symlink(driverTarget, filepath.Join(ifacePath, "driver")); err != nil {
+		t.Fatalf("symlink qmi_wwan driver: %v", err)
+	}
+
+	device, err := discoverQMIDeviceFromSysFS(usbPath)
+	if device != nil {
+		t.Fatalf("device = %#v, want nil while cdc-wdm is absent", device)
+	}
+	if !errors.Is(err, errQMIDeviceEnumerationIncomplete) {
+		t.Fatalf("discoverQMIDeviceFromSysFS() error = %v, want enumeration incomplete", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(ifacePath, "usbmisc", "cdc-wdm0"), 0o755); err != nil {
+		t.Fatalf("mkdir cdc-wdm node: %v", err)
+	}
+	device, err = discoverQMIDeviceFromSysFS(usbPath)
+	if err != nil {
+		t.Fatalf("discoverQMIDeviceFromSysFS() after completion error = %v", err)
+	}
+	if device == nil || device.ControlPath != "/dev/cdc-wdm0" || device.NetInterface != "wwan0" {
+		t.Fatalf("completed device = %#v", device)
+	}
+}
 
 func TestNormalizeATPorts(t *testing.T) {
 	got := normalizeATPorts([]string{

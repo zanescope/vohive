@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 
@@ -17,6 +18,10 @@ type configuredDeviceBootstrapPlan struct {
 func (p *Pool) prepareConfiguredDeviceBootstraps(devices []config.DeviceConfig) configuredDeviceBootstrapPlan {
 	planned := append([]config.DeviceConfig(nil), devices...)
 	discovered, err := discoverQMIDevicesFn()
+	if errors.Is(err, ErrNoQMIDevices) {
+		discovered = nil
+		err = nil
+	}
 	cache := &qmiBootstrapDiscoveryCache{
 		loaded: true,
 		list:   append([]QMIDevice(nil), discovered...),
@@ -28,7 +33,11 @@ func (p *Pool) prepareConfiguredDeviceBootstraps(devices []config.DeviceConfig) 
 	}
 
 	liveWorkerIndex := BuildWorkerDiscoveryIndex(p.GetAllWorkers(), false)
-	hardware := p.collectRescanHardwareForDevices(discovered, liveWorkerIndex, devices, cache)
+	hardware, err := p.collectRescanHardwareForDevicesComplete(discovered, liveWorkerIndex, devices, cache)
+	if err != nil {
+		logger.Warn("startup compatible modem discovery failed; trying existing runtime attachments", "err", err)
+		return configuredDeviceBootstrapPlan{devices: planned, discovery: cache}
+	}
 	resolved := ResolveDeviceIdentities(hardware, devices)
 	matchedByID := make(map[string]MatchedPair, len(resolved.Matched))
 	for _, pair := range resolved.Matched {
