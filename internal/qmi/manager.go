@@ -786,6 +786,9 @@ type Manager struct {
 	hasIPv4Bearer       func() bool
 	hasIPv6Bearer       func() bool // 测试替身：是否存在已建立的 IPv6 数据承载，默认见 ipv6BearerUp
 
+	dialRecoveryMu         sync.Mutex
+	invalidSIMDialFailures invalidSIMDialFailureState
+
 	resetExistingDataConnection            func(context.Context) (bool, error)
 	resetExistingDataConnectionViaCoreHook func(context.Context) (bool, error)
 }
@@ -1130,6 +1133,7 @@ func (m *Manager) handleQMIEvent(event qmimanager.Event) {
 			}
 		}
 	}
+	m.handleInvalidSIMDialRecovery(event)
 }
 
 func (m *Manager) lookupPublicIPHost(ctx context.Context, host string) ([]string, error) {
