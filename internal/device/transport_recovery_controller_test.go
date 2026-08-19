@@ -353,3 +353,20 @@ func TestTransportRecoverySchedulingConflictDoesNotConsumeBudget(t *testing.T) {
 		t.Fatalf("failed scheduling recorded %d rebuild attempts, want 0", got)
 	}
 }
+
+func TestTerminalWorkerReprobeIsImmediateThenCooledDown(t *testing.T) {
+	c := NewTransportRecoveryController(nil)
+	now := time.Now()
+	dev := "dev-terminal"
+
+	if allowed, retryAfter := c.allowTerminalWorkerReprobeAt(dev, now); !allowed || retryAfter != 0 {
+		t.Fatalf("first terminal reprobe = (%v, %s), want (true, 0)", allowed, retryAfter)
+	}
+	c.SetWorkerGeneration(dev, 2)
+	if allowed, retryAfter := c.allowTerminalWorkerReprobeAt(dev, now.Add(time.Minute)); allowed || retryAfter != 4*time.Minute {
+		t.Fatalf("cooled terminal reprobe after generation change = (%v, %s), want (false, 4m)", allowed, retryAfter)
+	}
+	if allowed, retryAfter := c.allowTerminalWorkerReprobeAt(dev, now.Add(terminalWorkerReprobeCooldown)); !allowed || retryAfter != 0 {
+		t.Fatalf("terminal reprobe at cooldown boundary = (%v, %s), want (true, 0)", allowed, retryAfter)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"github.com/zanescope/vohive/internal/backend"
 	"github.com/zanescope/vohive/internal/config"
 	mbimcore "github.com/zanescope/vohive/internal/mbim"
+	qmicore "github.com/zanescope/vohive/internal/qmi"
 )
 
 func TestHealthLayerForWorkerDistinguishesMBIM(t *testing.T) {
@@ -65,6 +66,28 @@ func TestPoolHealthCheckDelegatesMBIMProbeToCore(t *testing.T) {
 	snapshot := worker.HealthSnapshot()
 	if snapshot.Layer != HealthLayerPool || snapshot.EventType != "" {
 		t.Fatalf("pool-level probe overwrote MBIM core health state: %+v", snapshot)
+	}
+}
+
+func TestPoolHealthCheckRescansTerminalQMIWorkerWithUnreadyControl(t *testing.T) {
+	p := NewPool(&config.Config{})
+	defer p.cancel()
+	worker := &Worker{
+		ID:      "qmi-terminal",
+		Config:  config.DeviceConfig{ID: "qmi-terminal", DeviceBackend: backend.BackendQMI},
+		QMICore: &qmicore.Manager{},
+	}
+	worker.RecordWatchdogEvent(WatchdogEvent{
+		Layer:     HealthLayerQMI,
+		State:     HealthStateFailed,
+		EventType: "transport_recovery_giveup",
+	})
+	p.mu.Lock()
+	p.workers[worker.ID] = worker
+	p.mu.Unlock()
+
+	if needRescan := p.runWorkerHealthCheck(worker); !needRescan {
+		t.Fatal("terminal QMI worker with unready control did not request a rescan")
 	}
 }
 

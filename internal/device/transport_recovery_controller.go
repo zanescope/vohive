@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	rebuildWindow      = 30 * time.Minute
-	rebuildMaxInWindow = 5
+	rebuildWindow                 = 30 * time.Minute
+	rebuildMaxInWindow            = 5
+	terminalWorkerReprobeCooldown = 5 * time.Minute
 )
 
 type TransportRecoveryEventKind string
@@ -67,6 +68,7 @@ type TransportRecoveryController struct {
 	workerGenerations map[string]uint64
 	rebuildTimes      map[string][]time.Time
 	nextToken         uint64
+	terminalReprobes  map[string]time.Time
 }
 
 func NewTransportRecoveryController(pool *Pool) *TransportRecoveryController {
@@ -75,7 +77,36 @@ func NewTransportRecoveryController(pool *Pool) *TransportRecoveryController {
 		active:            make(map[string]transportRecoveryActive),
 		workerGenerations: make(map[string]uint64),
 		rebuildTimes:      make(map[string][]time.Time),
+		terminalReprobes:  make(map[string]time.Time),
 	}
+}
+
+// AllowTerminalWorkerReprobe permits the first live-hardware reprobe
+// immediately, then rate-limits further terminal-worker rebuilds. This path is
+// deliberately independent from the transport rebuild budget: a USB add event
+// proves that the hardware state changed, but a flapping modem must still not
+// drive an unbounded rebuild loop.
+func (c *TransportRecoveryController) AllowTerminalWorkerReprobe(deviceID string) (bool, time.Duration) {
+	return c.allowTerminalWorkerReprobeAt(strings.TrimSpace(deviceID), time.Now())
+}
+
+func (c *TransportRecoveryController) allowTerminalWorkerReprobeAt(deviceID string, now time.Time) (bool, time.Duration) {
+	if c == nil || deviceID == "" {
+		return false, 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if last := c.terminalReprobes[deviceID]; !last.IsZero() {
+		next := last.Add(terminalWorkerReprobeCooldown)
+		if now.Before(next) {
+			return false, next.Sub(now)
+		}
+	}
+	c.terminalReprobes[deviceID] = now
+	return true, 0
 }
 
 // Begin reserves a per-device recovery operation. For budgeted recoveries the
