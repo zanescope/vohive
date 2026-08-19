@@ -205,6 +205,32 @@ func TestQMIHealthyWorkerDoesNotNeedRebuildForSameAttachment(t *testing.T) {
 	}
 }
 
+func TestQMITerminalWorkerNeedsLiveReprobeWithSameAttachment(t *testing.T) {
+	worker := &Worker{
+		ID: "wwan0",
+		Config: config.DeviceConfig{
+			ID:            "wwan0",
+			ControlDevice: "/dev/cdc-wdm1",
+			Interface:     "wwan0",
+			USBPath:       "/sys/bus/usb/devices/1-9",
+			DeviceBackend: "qmi",
+		},
+	}
+
+	if needed, reason := qmiTerminalWorkerNeedsLiveReprobe(worker); needed || reason != "" {
+		t.Fatalf("healthy worker reprobe = (%v, %q), want (false, empty)", needed, reason)
+	}
+	worker.RecordWatchdogEvent(WatchdogEvent{
+		Layer:     HealthLayerQMI,
+		State:     HealthStateFailed,
+		EventType: "transport_recovery_giveup",
+		Reason:    "device_removed",
+	})
+	if needed, reason := qmiTerminalWorkerNeedsLiveReprobe(worker); !needed || reason != "transport_recovery_giveup" {
+		t.Fatalf("failed worker reprobe = (%v, %q), want (true, transport_recovery_giveup)", needed, reason)
+	}
+}
+
 func TestQMIHealthyWorkerAttachmentUpdateSkipsInvalidWorkers(t *testing.T) {
 	live := QMIDevice{
 		ControlPath:  "/dev/cdc-wdm0",

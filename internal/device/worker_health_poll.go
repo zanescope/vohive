@@ -52,6 +52,13 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 	}
 	layer := healthLayerForWorker(worker)
 	if layer == HealthLayerQMI && worker.QMICore != nil && !worker.qmiControlTasksReady() {
+		if terminal, reason := qmiTerminalWorkerNeedsLiveReprobe(worker); terminal {
+			logger.InfoRate("qmi_terminal_worker_rescan:"+worker.ID, time.Minute,
+				"QMI control is terminal while hardware may have returned; requesting rescan",
+				"device", worker.ID,
+				"reason", reason)
+			return true
+		}
 		logger.Debug("QMI control is not ready; skipping pool health probe", "device", worker.ID)
 		return false
 	}

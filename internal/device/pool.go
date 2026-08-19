@@ -2327,9 +2327,12 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 				ATPort:       hw.ATPort,
 			}
 			if useQMI {
-				if changed, _ := qmiHealthyWorkerAttachmentUpdate(worker, hwQMI); changed {
+				attachmentChanged, _ := qmiHealthyWorkerAttachmentUpdate(worker, hwQMI)
+				terminalReprobe, terminalReason := qmiTerminalWorkerNeedsLiveReprobe(worker)
+				terminalReprobe = terminalReprobe && !attachmentChanged
+				if attachmentChanged || terminalReprobe {
 					if !opts.allowWorkerMutation(md.ID) {
-						logger.Debug("跳过非目标设备 QMI 路径变化重建：当前处于手动重启恢复重扫窗口",
+						logger.Debug("跳过非目标设备 QMI Worker 重建：当前处于手动重启恢复重扫窗口",
 							"device", md.ID,
 							"target_device", opts.targetDeviceID,
 							"old_control", worker.Config.ControlDevice,
@@ -2338,38 +2341,64 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 							"new_interface", hw.NetInterface)
 						continue
 					}
-					if canEvict, reason := p.canEvictRescanWorker(md.ID, worker); !canEvict {
-						logger.Debug("跳过 QMI 路径变化重建",
-							"device", md.ID,
-							"reason", reason)
-						continue
+					if terminalReprobe && p.transportRecovery != nil {
+						allowed, retryAfter := p.transportRecovery.AllowTerminalWorkerReprobe(md.ID)
+						if !allowed {
+							logger.WarnRate("qmi_terminal_worker_reprobe_limited:"+md.ID, time.Minute,
+								"QMI 终态 Worker 重探处于冷却期，等待后续健康检查重试",
+								"device", md.ID,
+								"reason", terminalReason,
+								"retry_after", retryAfter.Round(time.Second).String())
+							continue
+						}
+					}
+					if !terminalReprobe {
+						if canEvict, reason := p.canEvictRescanWorker(md.ID, worker); !canEvict {
+							logger.Debug("跳过 QMI 路径变化重建",
+								"device", md.ID,
+								"reason", reason)
+							continue
+						}
 					}
 
 					nextCfg := applyQMIManagedAttachment(md, hwQMI)
-					logger.Info("检测到 QMI 设备路径变化，重建 Worker",
-						"device", md.ID,
-						"old_control", worker.Config.ControlDevice,
-						"new_control", nextCfg.ControlDevice,
-						"old_interface", worker.Config.Interface,
-						"new_interface", nextCfg.Interface,
-						"old_usb_path", worker.Config.USBPath,
-						"new_usb_path", nextCfg.USBPath)
+					lifecycleReason := "rescan_qmi_path_change"
+					reconnectReason := "device_qmi_path_change"
+					if terminalReprobe {
+						lifecycleReason = "rescan_qmi_terminal_worker"
+						reconnectReason = "device_qmi_terminal_worker"
+						logger.Warn("检测到 QMI Worker 已失效且现场设备在线，按当前 attachment 强制重建",
+							"device", md.ID,
+							"reason", terminalReason,
+							"control", nextCfg.ControlDevice,
+							"interface", nextCfg.Interface,
+							"usb_path", nextCfg.USBPath)
+					} else {
+						logger.Info("检测到 QMI 设备路径变化，重建 Worker",
+							"device", md.ID,
+							"old_control", worker.Config.ControlDevice,
+							"new_control", nextCfg.ControlDevice,
+							"old_interface", worker.Config.Interface,
+							"new_interface", nextCfg.Interface,
+							"old_usb_path", worker.Config.USBPath,
+							"new_usb_path", nextCfg.USBPath)
+					}
 					p.teardownVoWiFiForReconnect(md.ID)
 					if p.lifecycle != nil {
-						p.lifecycle.BeginRecovery(md.ID, LifecyclePhaseWorkerStarting, "rescan_qmi_path_change", qmiLifecycleRecoveryTTL)
+						p.lifecycle.BeginRecovery(md.ID, LifecyclePhaseWorkerStarting, lifecycleReason, qmiLifecycleRecoveryTTL)
 					}
 					if err := p.RemoveWorker(md.ID); err != nil {
 						logger.Warn("移除旧 QMI Worker 失败", "device", md.ID, "err", err)
 						continue
 					}
 					if _, err := p.AddWorkerFromConfig(nextCfg); err != nil {
-						logger.Warn("使用新 QMI 路径重建 Worker 失败", "device", md.ID, "err", err)
+						logger.Warn("使用现场 QMI attachment 重建 Worker 失败", "device", md.ID, "reason", lifecycleReason, "err", err)
 					} else if md.VoWiFiEnabled {
-						go func(deviceID string) {
-							if err := p.enableVoWiFiWhenReady(deviceID, 5*time.Second, "device_qmi_path_change"); err != nil {
+						go func(deviceID string, reason string) {
+							if err := p.enableVoWiFiWhenReady(deviceID, 5*time.Second, reason); err != nil {
 								logger.Warn("QMI 路径变化后自动重启 VoWiFi 失败", "device", deviceID, "err", err)
 							}
-						}(md.ID)
+						}(md.ID, reconnectReason)
 					}
 					continue
 				}
