@@ -187,12 +187,49 @@ func (w *UdevWatcher) scheduleModemEvent(event modemUevent) {
 		return
 	}
 	if w.pool != nil {
+		if event.Action == "add" {
+			w.pool.noteTerminalWorkerUdevAdd(event)
+		}
 		if target, ok := w.pool.modemRebootRecoveryTargetForUevent(event); ok {
 			w.scheduleRescanForTargets([]modemRebootRecoveryWakeTarget{target}, false)
 			return
 		}
 	}
 	w.scheduleRescanForTargets(nil, true)
+}
+
+// noteTerminalWorkerUdevAdd attributes a kernel add event to exactly one QMI
+// Worker. The Worker may not have observed the preceding disconnect yet; the
+// permit is only consumed later if the debounced rescan sees terminal health.
+// The topology match prevents one modem from bypassing another modem's
+// terminal-reprobe cooldown.
+func (p *Pool) noteTerminalWorkerUdevAdd(event modemUevent) bool {
+	if p == nil || event.Action != "add" || p.transportRecovery == nil {
+		return false
+	}
+	workers := p.GetAllWorkers()
+	matchedID := ""
+	for _, worker := range workers {
+		if worker == nil || !requiresQMICore(worker.Config) {
+			continue
+		}
+		if !modemUeventMatchesRecoveryIdentity(event, modemRebootRecoveryIdentityFromConfig(worker.Config)) {
+			continue
+		}
+		if matchedID != "" && matchedID != worker.ID {
+			return false
+		}
+		matchedID = worker.ID
+	}
+	if matchedID == "" {
+		return false
+	}
+	p.transportRecovery.NoteTerminalWorkerUdevAdd(matchedID)
+	logger.Debug("udev add matched terminal QMI Worker; armed immediate live reprobe",
+		"device", matchedID,
+		"usb_path", usbTopologyKey(event.DevPath),
+		"dev_name", strings.TrimSpace(event.DevName))
+	return true
 }
 
 // scheduleRescan 防抖：延迟执行扫描
