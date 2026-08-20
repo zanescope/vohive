@@ -370,3 +370,68 @@ func TestTerminalWorkerReprobeIsImmediateThenCooledDown(t *testing.T) {
 		t.Fatalf("terminal reprobe at cooldown boundary = (%v, %s), want (true, 0)", allowed, retryAfter)
 	}
 }
+
+func TestTerminalWorkerUdevAddGrantsOneImmediateReprobe(t *testing.T) {
+	c := NewTransportRecoveryController(nil)
+	now := time.Now()
+	dev := "dev-terminal"
+
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now); !allowed {
+		t.Fatal("initial terminal reprobe was not allowed")
+	}
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now.Add(time.Second)); allowed {
+		t.Fatal("terminal reprobe unexpectedly bypassed cooldown before udev add")
+	}
+
+	c.noteTerminalWorkerUdevAddAt(dev, now.Add(2*time.Second))
+	if allowed, retryAfter := c.allowTerminalWorkerReprobeAt(dev, now.Add(3*time.Second)); !allowed || retryAfter != 0 {
+		t.Fatalf("terminal reprobe after udev add = (%v, %s), want (true, 0)", allowed, retryAfter)
+	}
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now.Add(4*time.Second)); allowed {
+		t.Fatal("single udev add granted more than one terminal reprobe")
+	}
+}
+
+func TestTerminalWorkerUdevAddPermitExpires(t *testing.T) {
+	c := NewTransportRecoveryController(nil)
+	now := time.Now()
+	dev := "dev-terminal"
+
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now); !allowed {
+		t.Fatal("initial terminal reprobe was not allowed")
+	}
+	c.noteTerminalWorkerUdevAddAt(dev, now.Add(time.Second))
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now.Add(time.Second+terminalWorkerUdevAddTTL+time.Nanosecond)); allowed {
+		t.Fatal("expired udev add permit bypassed terminal reprobe cooldown")
+	}
+}
+
+func TestTerminalWorkerUdevAddPermitFromFutureIsRejected(t *testing.T) {
+	c := NewTransportRecoveryController(nil)
+	now := time.Now()
+	dev := "dev-terminal"
+
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now); !allowed {
+		t.Fatal("initial terminal reprobe was not allowed")
+	}
+	c.noteTerminalWorkerUdevAddAt(dev, now.Add(time.Second))
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now); allowed {
+		t.Fatal("future udev add permit bypassed terminal reprobe cooldown")
+	}
+}
+
+func TestTerminalWorkerUdevAddPermitDoesNotCrossWorkerGeneration(t *testing.T) {
+	c := NewTransportRecoveryController(nil)
+	now := time.Now()
+	dev := "dev-terminal"
+
+	c.SetWorkerGeneration(dev, 1)
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now); !allowed {
+		t.Fatal("initial terminal reprobe was not allowed")
+	}
+	c.noteTerminalWorkerUdevAddAt(dev, now.Add(time.Second))
+	c.SetWorkerGeneration(dev, 2)
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now.Add(2*time.Second)); allowed {
+		t.Fatal("stale udev add permit crossed into a replacement Worker generation")
+	}
+}

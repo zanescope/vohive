@@ -80,6 +80,105 @@ func TestModemUeventDoesNotUseDeviceNameWhenOnlyOneSideHasUSBTopology(t *testing
 	}
 }
 
+func TestUdevAddArmsImmediateReprobeForMatchingTerminalQMIWorker(t *testing.T) {
+	p := NewPool(&config.Config{})
+	defer p.cancel()
+	worker := &Worker{
+		ID: "dev-a",
+		Config: config.DeviceConfig{
+			ID:            "dev-a",
+			USBPath:       "/sys/bus/usb/devices/1-4.2.4",
+			ControlDevice: "/dev/cdc-wdm12",
+			Interface:     "wwan12",
+			DeviceBackend: "qmi",
+		},
+	}
+	p.mu.Lock()
+	p.workers[worker.ID] = worker
+	p.mu.Unlock()
+
+	if allowed, _ := p.transportRecovery.AllowTerminalWorkerReprobe(worker.ID); !allowed {
+		t.Fatal("failed to seed terminal reprobe cooldown")
+	}
+	event, ok := parseModemUevent([]byte("add@/devices/pci0000:00/usb1/1-4/1-4.2/1-4.2.4/1-4.2.4:1.4/usbmisc/cdc-wdm12\x00ACTION=add\x00SUBSYSTEM=usbmisc\x00DEVNAME=/dev/cdc-wdm12\x00"))
+	if !ok {
+		t.Fatal("parseModemUevent() = false")
+	}
+
+	watcher := NewUdevWatcher(p)
+	watcher.debounce = time.Hour
+	defer watcher.Stop()
+	watcher.scheduleModemEvent(event)
+
+	// The kernel can publish the add event before the old Worker observes the
+	// disconnect. The permit must survive that ordering, but is consumed only
+	// after terminal health is recorded and a rescan requests a reprobe.
+	worker.RecordWatchdogEvent(WatchdogEvent{
+		Layer:     HealthLayerQMI,
+		State:     HealthStateFailed,
+		EventType: "transport_recovery_giveup",
+	})
+	if allowed, retryAfter := p.transportRecovery.AllowTerminalWorkerReprobe(worker.ID); !allowed || retryAfter != 0 {
+		t.Fatalf("matching udev add reprobe = (%v, %s), want (true, 0)", allowed, retryAfter)
+	}
+	if allowed, _ := p.transportRecovery.AllowTerminalWorkerReprobe(worker.ID); allowed {
+		t.Fatal("matching udev add permit was not single-use")
+	}
+}
+
+func TestUdevEventsDoNotArmWrongTerminalWorker(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "remove for matching topology",
+			raw:  "remove@/devices/pci0000:00/usb1/1-4/1-4.2/1-4.2.4/1-4.2.4:1.4/usbmisc/cdc-wdm12\x00ACTION=remove\x00SUBSYSTEM=usbmisc\x00DEVNAME=/dev/cdc-wdm12\x00",
+		},
+		{
+			name: "add for another topology",
+			raw:  "add@/devices/pci0000:00/usb1/1-4/1-4.2/1-4.2.3/1-4.2.3:1.4/usbmisc/cdc-wdm11\x00ACTION=add\x00SUBSYSTEM=usbmisc\x00DEVNAME=/dev/cdc-wdm11\x00",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := NewPool(&config.Config{})
+			defer p.cancel()
+			worker := &Worker{
+				ID: "dev-a",
+				Config: config.DeviceConfig{
+					ID:            "dev-a",
+					USBPath:       "/sys/bus/usb/devices/1-4.2.4",
+					ControlDevice: "/dev/cdc-wdm12",
+					Interface:     "wwan12",
+					DeviceBackend: "qmi",
+				},
+			}
+			worker.RecordWatchdogEvent(WatchdogEvent{
+				Layer:     HealthLayerQMI,
+				State:     HealthStateFailed,
+				EventType: "transport_recovery_giveup",
+			})
+			p.mu.Lock()
+			p.workers[worker.ID] = worker
+			p.mu.Unlock()
+
+			if allowed, _ := p.transportRecovery.AllowTerminalWorkerReprobe(worker.ID); !allowed {
+				t.Fatal("failed to seed terminal reprobe cooldown")
+			}
+			event, ok := parseModemUevent([]byte(test.raw))
+			if !ok {
+				t.Fatal("parseModemUevent() = false")
+			}
+			if noted := p.noteTerminalWorkerUdevAdd(event); noted {
+				t.Fatal("unrelated udev event armed a terminal Worker reprobe")
+			}
+			if allowed, _ := p.transportRecovery.AllowTerminalWorkerReprobe(worker.ID); allowed {
+				t.Fatal("unrelated udev event bypassed terminal Worker cooldown")
+			}
+		})
+	}
+}
+
 func TestPoolAttributesUeventToOneActiveRecovery(t *testing.T) {
 	p := NewPool(&config.Config{})
 	defer p.cancel()

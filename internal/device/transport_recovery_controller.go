@@ -10,6 +10,7 @@ const (
 	rebuildWindow                 = 30 * time.Minute
 	rebuildMaxInWindow            = 5
 	terminalWorkerReprobeCooldown = 5 * time.Minute
+	terminalWorkerUdevAddTTL      = time.Minute
 )
 
 type TransportRecoveryEventKind string
@@ -69,6 +70,7 @@ type TransportRecoveryController struct {
 	rebuildTimes      map[string][]time.Time
 	nextToken         uint64
 	terminalReprobes  map[string]time.Time
+	terminalUdevAdds  map[string]time.Time
 }
 
 func NewTransportRecoveryController(pool *Pool) *TransportRecoveryController {
@@ -78,13 +80,15 @@ func NewTransportRecoveryController(pool *Pool) *TransportRecoveryController {
 		workerGenerations: make(map[string]uint64),
 		rebuildTimes:      make(map[string][]time.Time),
 		terminalReprobes:  make(map[string]time.Time),
+		terminalUdevAdds:  make(map[string]time.Time),
 	}
 }
 
 // AllowTerminalWorkerReprobe permits the first live-hardware reprobe
-// immediately, then rate-limits further terminal-worker rebuilds. This path is
-// deliberately independent from the transport rebuild budget: a USB add event
-// proves that the hardware state changed, but a flapping modem must still not
+// immediately, then rate-limits further terminal-worker rebuilds. A recent,
+// device-scoped udev add event grants one extra attempt because it proves that
+// the kernel created a new attachment after the old Worker became terminal.
+// The grant is single-use and short-lived so unrelated or stale events cannot
 // drive an unbounded rebuild loop.
 func (c *TransportRecoveryController) AllowTerminalWorkerReprobe(deviceID string) (bool, time.Duration) {
 	return c.allowTerminalWorkerReprobeAt(strings.TrimSpace(deviceID), time.Now())
@@ -99,6 +103,14 @@ func (c *TransportRecoveryController) allowTerminalWorkerReprobeAt(deviceID stri
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if addedAt := c.terminalUdevAdds[deviceID]; !addedAt.IsZero() {
+		delete(c.terminalUdevAdds, deviceID)
+		age := now.Sub(addedAt)
+		if age >= 0 && age <= terminalWorkerUdevAddTTL {
+			c.terminalReprobes[deviceID] = now
+			return true, 0
+		}
+	}
 	if last := c.terminalReprobes[deviceID]; !last.IsZero() {
 		next := last.Add(terminalWorkerReprobeCooldown)
 		if now.Before(next) {
@@ -107,6 +119,27 @@ func (c *TransportRecoveryController) allowTerminalWorkerReprobeAt(deviceID stri
 	}
 	c.terminalReprobes[deviceID] = now
 	return true, 0
+}
+
+// NoteTerminalWorkerUdevAdd records a fresh kernel add event for one QMI Worker
+// that is terminal or may observe the preceding disconnect shortly afterward.
+// The event does not start recovery by itself; the debounced rescan still
+// verifies terminal health and a complete attachment before consuming the
+// one-shot permit in AllowTerminalWorkerReprobe.
+func (c *TransportRecoveryController) NoteTerminalWorkerUdevAdd(deviceID string) {
+	c.noteTerminalWorkerUdevAddAt(strings.TrimSpace(deviceID), time.Now())
+}
+
+func (c *TransportRecoveryController) noteTerminalWorkerUdevAddAt(deviceID string, now time.Time) {
+	if c == nil || deviceID == "" {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	c.mu.Lock()
+	c.terminalUdevAdds[deviceID] = now
+	c.mu.Unlock()
 }
 
 // Begin reserves a per-device recovery operation. For budgeted recoveries the
@@ -216,6 +249,9 @@ func (c *TransportRecoveryController) SetWorkerGeneration(deviceID string, gener
 	c.mu.Lock()
 	// Rebuild history is keyed by the stable device ID and intentionally
 	// survives Worker generations. Generation only gates stale callbacks.
+	if current := c.workerGenerations[deviceID]; current != 0 && current != generation {
+		delete(c.terminalUdevAdds, deviceID)
+	}
 	c.workerGenerations[deviceID] = generation
 	c.mu.Unlock()
 }
