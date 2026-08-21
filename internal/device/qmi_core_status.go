@@ -92,6 +92,10 @@ func (p *Pool) applyQMICoreStatus(worker *Worker, status qmicore.CoreStatus) boo
 	wasReady := hadPrevious && qmiCoreStatusReady(previous)
 	reason := qmiCoreStatusReason(status)
 	phaseChanged := !hadPrevious || previous.Generation != status.Generation || previous.Phase != status.Phase
+	readinessChanged := phaseChanged ||
+		previous.ControlReady != status.ControlReady ||
+		previous.CoreReady != status.CoreReady ||
+		previous.Terminal != status.Terminal
 	statusAt := status.UpdatedAt
 	if statusAt.IsZero() {
 		statusAt = time.Now()
@@ -104,8 +108,22 @@ func (p *Pool) applyQMICoreStatus(worker *Worker, status qmicore.CoreStatus) boo
 		return true
 	}
 
-	worker.markQMIControlUnavailable()
-	if !phaseChanged {
+	worker.markQMIControlUnavailableAt(statusAt)
+	if !readinessChanged {
+		return true
+	}
+
+	if status.Terminal {
+		worker.RecordWatchdogEvent(WatchdogEvent{
+			Layer:     HealthLayerQMI,
+			State:     HealthStateFailed,
+			EventType: "qmi_core_terminal",
+			Reason:    reason,
+			At:        statusAt,
+		})
+		if p.lifecycle != nil {
+			p.lifecycle.MarkOffline(worker.ID, "qmi_core_terminal:"+reason)
+		}
 		return true
 	}
 
@@ -138,11 +156,28 @@ func (p *Pool) applyQMICoreStatus(worker *Worker, status qmicore.CoreStatus) boo
 	case qmicore.CorePhaseTerminal, qmicore.CorePhaseStopping, qmicore.CorePhaseStopped:
 		worker.RecordWatchdogEvent(WatchdogEvent{
 			Layer:     HealthLayerQMI,
-			State:     HealthStateSuspect,
+			State:     HealthStateFailed,
 			EventType: "qmi_core_" + string(status.Phase),
 			Reason:    reason,
 			At:        statusAt,
 		})
+		if p.lifecycle != nil {
+			p.lifecycle.MarkOffline(worker.ID, "qmi_core_"+string(status.Phase)+":"+reason)
+		}
+	default:
+		recoveryUntil := time.Now().Add(qmiHealthGraceAfterReset)
+		worker.RecordWatchdogEvent(WatchdogEvent{
+			Layer:         HealthLayerQMI,
+			State:         HealthStateRecovering,
+			EventType:     "qmi_core_control_unready",
+			Reason:        reason,
+			RecoveryUntil: recoveryUntil,
+			At:            statusAt,
+		})
+		worker.markHealthRecoveryWindow(qmiHealthGraceAfterReset)
+		if p.lifecycle != nil {
+			p.lifecycle.BeginRecovery(worker.ID, LifecyclePhaseRecovering, reason, qmiLifecycleRecoveryTTL)
+		}
 	}
 	return true
 }

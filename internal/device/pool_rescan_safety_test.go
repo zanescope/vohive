@@ -172,3 +172,71 @@ func TestScheduleRescanCoalescesBurstWithoutOverlap(t *testing.T) {
 		t.Fatalf("overlapping rescans = %d, want 1", got)
 	}
 }
+
+func waitScheduledRescanIdle(t *testing.T, p *Pool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		p.rescanScheduleMu.Lock()
+		scheduled := p.rescanScheduled
+		p.rescanScheduleMu.Unlock()
+		if !scheduled {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("scheduled rescan runner did not become idle")
+}
+
+func TestScheduleRescanPanicDoesNotLatchRunner(t *testing.T) {
+	p := NewPool(&config.Config{})
+	defer p.cancel()
+
+	var calls atomic.Int32
+	completed := make(chan struct{}, 1)
+	p.rescanAndReconnectForTest = func() error {
+		if calls.Add(1) == 1 {
+			panic("rescan boom")
+		}
+		completed <- struct{}{}
+		return nil
+	}
+
+	p.scheduleRescan("panic_test")
+	waitScheduledRescanIdle(t, p)
+	p.scheduleRescan("after_panic")
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("rescan did not run after prior panic")
+	}
+}
+
+func TestScheduleRescanTimeoutDoesNotLatchRunner(t *testing.T) {
+	p := NewPool(&config.Config{})
+	defer p.cancel()
+	p.rescanTimeoutForTest = 20 * time.Millisecond
+
+	var calls atomic.Int32
+	releaseFirst := make(chan struct{})
+	completed := make(chan struct{}, 1)
+	p.rescanAndReconnectForTest = func() error {
+		if calls.Add(1) == 1 {
+			<-releaseFirst
+			return nil
+		}
+		completed <- struct{}{}
+		return nil
+	}
+
+	p.scheduleRescan("timeout_test")
+	waitScheduledRescanIdle(t, p)
+	p.scheduleRescan("after_timeout")
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		close(releaseFirst)
+		t.Fatal("rescan did not run after prior timeout")
+	}
+	close(releaseFirst)
+}

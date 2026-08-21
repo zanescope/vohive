@@ -61,16 +61,17 @@ func (p *Pool) scheduleWorkerHealthSync(worker *Worker, sem chan struct{}) {
 	if worker.QMICore != nil && !worker.qmiControlTasksReady() {
 		return
 	}
-	if !worker.tryBeginHealthSync() {
+	syncToken, acquired := worker.tryBeginHealthSync()
+	if !acquired {
 		return
 	}
 	select {
 	case sem <- struct{}{}:
 	case <-p.ctx.Done():
-		worker.endHealthSync()
+		worker.endHealthSync(syncToken)
 		return
 	default:
-		worker.endHealthSync()
+		worker.endHealthSync(syncToken)
 		logger.Debug("设备状态同步并发已满，跳过本轮", "device", worker.ID)
 		return
 	}
@@ -82,7 +83,7 @@ func (p *Pool) scheduleWorkerHealthSync(worker *Worker, sem chan struct{}) {
 		}
 		defer func() {
 			releaseSlot()
-			worker.endHealthSync()
+			worker.endHealthSync(syncToken)
 			if panicValue := recover(); panicValue != nil {
 				logger.Error("设备状态同步 panic recovered", "device", worker.ID, "err", panicValue)
 			}
@@ -92,9 +93,10 @@ func (p *Pool) scheduleWorkerHealthSync(worker *Worker, sem chan struct{}) {
 		defer cancel()
 		timeout := time.AfterFunc(healthSyncTimeout, func() {
 			releaseSlot()
+			worker.endHealthSync(syncToken)
 			if p.isCurrentWorker(worker) {
 				logger.WarnRate("health_sync_timeout:"+worker.ID, 5*time.Minute,
-					"设备状态同步超时；释放全局槽位并保留设备单飞标记", "device", worker.ID)
+					"设备状态同步超时；释放全局槽位和本次单飞 token", "device", worker.ID)
 				if worker.QMICore != nil {
 					err := fmt.Errorf("QMI health sync exceeded %s", healthSyncTimeout)
 					p.requestQMICoreRecovery(worker, "qmi_health_sync_timeout", err)

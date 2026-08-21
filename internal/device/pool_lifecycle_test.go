@@ -52,6 +52,22 @@ func TestSuppressQMIUnhealthyEvictionAfterLifecycleDeadline(t *testing.T) {
 	}
 }
 
+func TestLifecycleReadDoesNotConsumeActiveExpirySignal(t *testing.T) {
+	lifecycle := newLifecycleCoordinator()
+	now := time.Now()
+	lifecycle.BeginRecoveryAt("dev1", LifecyclePhaseRecovering, "stuck", now.Add(-time.Minute), time.Second)
+
+	if got := lifecycle.getSnapshotAt("dev1", now).Phase; got != LifecyclePhaseOffline {
+		t.Fatalf("projected phase=%s want=%s", got, LifecyclePhaseOffline)
+	}
+	if expired, ok := lifecycle.TakeExpiredRecovery("dev1", now); !ok || expired.Phase != LifecyclePhaseRecovering {
+		t.Fatalf("expiry was consumed by read: ok=%v snapshot=%+v", ok, expired)
+	}
+	if _, ok := lifecycle.TakeExpiredRecovery("dev1", now.Add(time.Second)); ok {
+		t.Fatal("expiry signal was consumed more than once")
+	}
+}
+
 type errBackendUnavailable struct{}
 
 func (errBackendUnavailable) Error() string { return "backend unavailable" }

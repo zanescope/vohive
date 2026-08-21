@@ -1,6 +1,7 @@
 package device
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -10,6 +11,14 @@ import (
 	mbimcore "github.com/zanescope/vohive/internal/mbim"
 	qmicore "github.com/zanescope/vohive/internal/qmi"
 )
+
+type panicHealthBackendStub struct {
+	*workerStatusBackendStub
+}
+
+func (s *panicHealthBackendStub) GetOperatingMode(context.Context) (backend.OperatingMode, error) {
+	panic("health backend panic")
+}
 
 func TestHealthLayerForWorkerDistinguishesMBIM(t *testing.T) {
 	tests := []struct {
@@ -103,6 +112,32 @@ func TestRunHealthTaskSafelyRecoversPanic(t *testing.T) {
 	}
 }
 
+func TestWorkerHealthPanicEscalatesToFailed(t *testing.T) {
+	p := NewPool(&config.Config{})
+	defer p.cancel()
+	w := &Worker{
+		ID: "panic-worker",
+		Config: config.DeviceConfig{
+			ID:            "panic-worker",
+			DeviceBackend: backend.BackendQMI,
+		},
+		Backend: &panicHealthBackendStub{workerStatusBackendStub: &workerStatusBackendStub{mode: backend.BackendQMI}},
+		Pool:    p,
+		stop:    make(chan struct{}),
+	}
+	if err := p.registerWorkerStarting(w); err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	reserveRecoveryForWatchdogTest(t, p, w)
+
+	if p.runWorkerHealthCheckSafely(w) {
+		t.Fatal("panic path should use the transport recovery entrypoint directly")
+	}
+	if got := w.HealthSnapshot().State; got != HealthStateFailed {
+		t.Fatalf("health=%s want=%s", got, HealthStateFailed)
+	}
+}
+
 func TestWorkerCallbackRejectsStaleGeneration(t *testing.T) {
 	p := NewPool(&config.Config{})
 	defer p.cancel()
@@ -165,10 +200,10 @@ func TestHealthSyncKeepsOneInFlightTaskPerWorker(t *testing.T) {
 	worker.retired.Store(true)
 	close(releaseProbe)
 	deadline := time.Now().Add(time.Second)
-	for worker.healthSyncInFlight.Load() && time.Now().Before(deadline) {
+	for worker.healthSyncActive.Load() != 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if worker.healthSyncInFlight.Load() {
+	if worker.healthSyncActive.Load() != 0 {
 		t.Fatal("health sync single-flight flag was not released")
 	}
 	if got := len(sem); got != 0 {

@@ -18,11 +18,19 @@ func qmiErrorIndicatesTransportDown(message string) bool {
 		return false
 	}
 	for _, fragment := range []string{
+		"bad file descriptor",
 		"broken pipe",
+		"cannot send after transport endpoint shutdown",
+		"connection reset",
 		"read failed: eof",
 		"connection closed",
+		"i/o error",
+		"input/output error",
+		"network is down",
 		"no such device",
 		"no such file or directory",
+		"transport endpoint is not connected",
+		"use of closed network connection",
 		"write failed",
 		"failed to open qmi device",
 	} {

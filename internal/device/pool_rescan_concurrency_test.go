@@ -70,3 +70,19 @@ func TestRescanAndReconnectSerializesHardwareDiscovery(t *testing.T) {
 		t.Fatalf("maximum concurrent discoveries = %d, want 1", got)
 	}
 }
+
+func TestRescanAndReconnectTimesOutWaitingForStuckScan(t *testing.T) {
+	pool := NewPool(&config.Config{})
+	t.Cleanup(pool.cancel)
+	pool.rescanTimeoutForTest = 20 * time.Millisecond
+	pool.rescanMu.Lock()
+	defer pool.rescanMu.Unlock()
+
+	started := time.Now()
+	if err := pool.RescanAndReconnect(); err == nil {
+		t.Fatal("expected rescan lease timeout")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("rescan lease timeout took too long: %s", elapsed)
+	}
+}

@@ -1,6 +1,7 @@
 package device
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ func healthLayerForWorker(worker *Worker) HealthLayer {
 func (p *Pool) runWorkerHealthCheckSafely(worker *Worker) (needRescan bool) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			err := fmt.Errorf("worker health check panic: %v", recovered)
 			logger.Error("设备健康检查 panic，已隔离到单个 Worker",
 				"device", func() string {
 					if worker == nil {
@@ -40,6 +42,17 @@ func (p *Pool) runWorkerHealthCheckSafely(worker *Worker) (needRescan bool) {
 					return worker.ID
 				}(),
 				"err", recovered)
+			if worker != nil && p != nil && p.isCurrentWorker(worker) {
+				layer := healthLayerForWorker(worker)
+				worker.RecordWatchdogEvent(WatchdogEvent{
+					Layer:     layer,
+					State:     HealthStateFailed,
+					EventType: "control_health_check_panic",
+					Reason:    "control_health_check_panic",
+					Err:       err,
+				})
+				p.handleTransportRecoveryExhausted(worker, worker.generation, layer, "control_health_check_panic", err)
+			}
 			needRescan = false
 		}
 	}()
@@ -50,9 +63,14 @@ func (p *Pool) runWorkerHealthCheck(worker *Worker) bool {
 	if !p.isCurrentWorker(worker) {
 		return false
 	}
+	now := time.Now()
+	if p.recoverExpiredWorkerLifecycle(worker, now) {
+		return false
+	}
 	layer := healthLayerForWorker(worker)
 	if layer == HealthLayerQMI && worker.QMICore != nil && !worker.qmiControlTasksReady() {
-		if terminal, reason := qmiTerminalWorkerNeedsLiveReprobe(worker); terminal {
+		if p.handleQMIControlNotReady(worker, now) {
+			_, reason := qmiTerminalWorkerNeedsLiveReprobe(worker)
 			logger.InfoRate("qmi_terminal_worker_rescan:"+worker.ID, time.Minute,
 				"QMI control is terminal while hardware may have returned; requesting rescan",
 				"device", worker.ID,
