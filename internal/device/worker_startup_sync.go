@@ -22,9 +22,7 @@ func (w *Worker) qmiControlTasksReady() bool {
 }
 
 func (w *Worker) markQMIControlUnavailable() {
-	if w != nil && w.QMICore != nil {
-		w.qmiControlReady.Store(false)
-	}
+	w.markQMIControlUnavailableAt(time.Now())
 }
 
 func nextStartupStateSyncDelay(previous time.Duration) time.Duration {

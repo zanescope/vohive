@@ -48,6 +48,10 @@ type WatchdogEvent struct {
 	Threshold           int         // 判定状态恶化的最大失败次数阈值
 	RecoveryUntil       time.Time   // 故障恢复宽限期的截止时间戳
 	At                  time.Time   // 事件发生的物理时间戳
+	// AllowFailedRecovery 只允许由权威恢复信号设置，例如同一 Worker
+	// 收到已通过序列校验的 QMI Ready 状态。普通异步健康事件不得把
+	// 已确认的 Failed 降级回 Suspect/Recovering/Healthy。
+	AllowFailedRecovery bool
 }
 
 // HealthSnapshot 存储对外展示的设备健康状态只读属性快照
@@ -97,6 +101,18 @@ func (w *Worker) RecordWatchdogEvent(event WatchdogEvent) HealthSnapshot {
 	}
 
 	w.healthMu.Lock()
+	current := w.healthSnapshot
+	if current.State == HealthStateFailed && event.State != HealthStateFailed && !event.AllowFailedRecovery {
+		w.healthMu.Unlock()
+		return current
+	}
+	// Core status carries its publisher timestamp and can arrive after a newer
+	// callback. Do not let an older snapshot overwrite a newer health decision.
+	if !current.UpdatedAt.IsZero() && event.At.Before(current.UpdatedAt) &&
+		event.State != HealthStateFailed && !event.AllowFailedRecovery {
+		w.healthMu.Unlock()
+		return current
+	}
 	switch event.State {
 	case HealthStateHealthy:
 		w.healthConsecutiveFailures = 0

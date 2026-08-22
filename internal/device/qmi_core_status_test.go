@@ -107,6 +107,60 @@ func TestQMICoreStatusIsAuthoritativeAndRejectsStaleSnapshots(t *testing.T) {
 	}
 }
 
+func TestQMICoreStatusReadyFieldDropArmsRecoveryAndTerminalLatchesFailed(t *testing.T) {
+	p, w := newQMICoreStatusHarness(t)
+	if !p.applyQMICoreStatus(w, readyQMICoreStatus(1, 1)) {
+		t.Fatal("initial ready status was rejected")
+	}
+
+	unready := readyQMICoreStatus(2, 1)
+	unready.ControlReady = false
+	unready.CoreReady = false
+	unready.Stage = "client_cleanup"
+	unready.Reason = "client_missing"
+	if !p.applyQMICoreStatus(w, unready) {
+		t.Fatal("same-phase readiness drop was rejected")
+	}
+	if w.qmiControlTasksReady() {
+		t.Fatal("same-phase readiness drop left control tasks enabled")
+	}
+	if got := w.HealthSnapshot().State; got != HealthStateRecovering {
+		t.Fatalf("health after readiness drop=%s want=%s", got, HealthStateRecovering)
+	}
+	if got := p.LifecycleSnapshot(w.ID).Phase; got != LifecyclePhaseRecovering {
+		t.Fatalf("lifecycle after readiness drop=%s want=%s", got, LifecyclePhaseRecovering)
+	}
+
+	terminal := unready
+	terminal.Sequence = 3
+	terminal.Phase = qmicore.CorePhaseTerminal
+	terminal.Terminal = true
+	terminal.UpdatedAt = time.Now()
+	if !p.applyQMICoreStatus(w, terminal) {
+		t.Fatal("terminal status was rejected")
+	}
+	if got := w.HealthSnapshot().State; got != HealthStateFailed {
+		t.Fatalf("health after terminal=%s want=%s", got, HealthStateFailed)
+	}
+
+	w.RecordWatchdogEvent(WatchdogEvent{
+		Layer:     HealthLayerQMI,
+		State:     HealthStateSuspect,
+		EventType: "late_suspect",
+		Reason:    "late_suspect",
+	})
+	if got := w.HealthSnapshot().State; got != HealthStateFailed {
+		t.Fatalf("late suspect downgraded terminal health to %s", got)
+	}
+
+	if !p.applyQMICoreStatus(w, readyQMICoreStatus(4, 2)) {
+		t.Fatal("authoritative ready status was rejected")
+	}
+	if got := w.HealthSnapshot().State; got != HealthStateHealthy {
+		t.Fatalf("authoritative ready did not clear terminal failure: %s", got)
+	}
+}
+
 func TestConcurrentQMICoreStatusesCannotApplyOldEffectsAfterNewerStatus(t *testing.T) {
 	p, w := newQMICoreStatusHarness(t)
 

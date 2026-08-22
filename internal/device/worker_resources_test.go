@@ -11,17 +11,41 @@ import (
 
 func TestWorkerHealthSyncSingleFlight(t *testing.T) {
 	worker := &Worker{}
-	if !worker.tryBeginHealthSync() {
+	first, ok := worker.tryBeginHealthSync()
+	if !ok {
 		t.Fatal("first health sync did not acquire the single-flight guard")
 	}
-	if worker.tryBeginHealthSync() {
+	if _, ok := worker.tryBeginHealthSync(); ok {
 		t.Fatal("second health sync acquired the guard while the first was active")
 	}
-	worker.endHealthSync()
-	if !worker.tryBeginHealthSync() {
+	worker.endHealthSync(first)
+	second, ok := worker.tryBeginHealthSync()
+	if !ok {
 		t.Fatal("health sync guard was not released")
 	}
-	worker.endHealthSync()
+	worker.endHealthSync(second)
+}
+
+func TestWorkerHealthSyncStaleCompletionCannotReleaseNewRun(t *testing.T) {
+	worker := &Worker{}
+	first, ok := worker.tryBeginHealthSync()
+	if !ok {
+		t.Fatal("first health sync did not acquire the guard")
+	}
+	if !worker.endHealthSync(first) {
+		t.Fatal("first health sync token was not released")
+	}
+	second, ok := worker.tryBeginHealthSync()
+	if !ok {
+		t.Fatal("second health sync did not acquire the guard")
+	}
+	if worker.endHealthSync(first) {
+		t.Fatal("stale completion released a newer health sync")
+	}
+	if _, ok := worker.tryBeginHealthSync(); ok {
+		t.Fatal("third health sync overlapped the active second run")
+	}
+	worker.endHealthSync(second)
 }
 
 func TestStopWorkerResourcesIsIdempotent(t *testing.T) {

@@ -58,15 +58,17 @@ func (p *Pool) markQMIControlRecovered(worker *Worker, reason string) {
 		return
 	}
 	worker.qmiControlReady.Store(true)
+	worker.resetQMIControlWatchdog()
 	if reason = strings.TrimSpace(reason); reason == "" {
 		reason = "qmi_control_recovered"
 	}
 	worker.RecordWatchdogEvent(WatchdogEvent{
-		Layer:     HealthLayerQMI,
-		State:     HealthStateHealthy,
-		EventType: "qmi_control_recovered",
-		Reason:    reason,
-		At:        time.Now(),
+		Layer:               HealthLayerQMI,
+		State:               HealthStateHealthy,
+		EventType:           "qmi_control_recovered",
+		Reason:              reason,
+		At:                  time.Now(),
+		AllowFailedRecovery: true,
 	})
 	worker.resetHealthFailureStreak()
 	if p.lifecycle != nil {

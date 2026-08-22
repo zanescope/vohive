@@ -129,6 +129,75 @@ func TestWorkerRecordWatchdogEventTransitions(t *testing.T) {
 	}
 }
 
+func TestWorkerFailedHealthIsLatchedUntilAuthoritativeRecovery(t *testing.T) {
+	w := &Worker{}
+	failedAt := time.Now()
+	w.RecordWatchdogEvent(WatchdogEvent{
+		Layer:     HealthLayerQMI,
+		State:     HealthStateFailed,
+		EventType: "transport_recovery_giveup",
+		Reason:    "transport_recovery_giveup",
+		At:        failedAt,
+	})
+
+	for _, state := range []HealthState{HealthStateSuspect, HealthStateRecovering, HealthStateHealthy} {
+		w.RecordWatchdogEvent(WatchdogEvent{
+			Layer:     HealthLayerQMI,
+			State:     state,
+			EventType: "late_async_event",
+			Reason:    "late_async_event",
+			At:        failedAt.Add(time.Second),
+		})
+		if got := w.HealthSnapshot().State; got != HealthStateFailed {
+			t.Fatalf("state %s downgraded latched failure to %s", state, got)
+		}
+	}
+
+	w.RecordWatchdogEvent(WatchdogEvent{
+		Layer:               HealthLayerQMI,
+		State:               HealthStateHealthy,
+		EventType:           "qmi_control_recovered",
+		Reason:              "qmi_control_recovered",
+		At:                  failedAt.Add(2 * time.Second),
+		AllowFailedRecovery: true,
+	})
+	if got := w.HealthSnapshot().State; got != HealthStateHealthy {
+		t.Fatalf("authoritative recovery left health at %s", got)
+	}
+}
+
+func TestWorkerRejectsOlderHealthEvent(t *testing.T) {
+	w := &Worker{}
+	now := time.Now()
+	w.RecordWatchdogEvent(WatchdogEvent{
+		Layer:     HealthLayerQMI,
+		State:     HealthStateRecovering,
+		EventType: "newer",
+		Reason:    "newer",
+		At:        now,
+	})
+	w.RecordWatchdogEvent(WatchdogEvent{
+		Layer:     HealthLayerQMI,
+		State:     HealthStateSuspect,
+		EventType: "older",
+		Reason:    "older",
+		At:        now.Add(-time.Second),
+	})
+	if got := w.HealthSnapshot().EventType; got != "newer" {
+		t.Fatalf("older event overwrote health snapshot: %s", got)
+	}
+	w.RecordWatchdogEvent(WatchdogEvent{
+		Layer:     HealthLayerQMI,
+		State:     HealthStateFailed,
+		EventType: "authoritative_terminal",
+		Reason:    "authoritative_terminal",
+		At:        now.Add(-2 * time.Second),
+	})
+	if got := w.HealthSnapshot().State; got != HealthStateFailed {
+		t.Fatalf("terminal failure was rejected as stale: %s", got)
+	}
+}
+
 func TestWorkerRecoveryWindowUsesUnifiedHealthSnapshot(t *testing.T) {
 	worker := &Worker{ID: "dev1"}
 

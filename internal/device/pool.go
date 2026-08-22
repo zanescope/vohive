@@ -159,8 +159,13 @@ type Worker struct {
 	healthConsecutiveFailures int
 	healthGraceUntil          time.Time
 	healthSnapshot            HealthSnapshot
-	healthSyncInFlight        atomic.Bool
+	healthSyncSequence        atomic.Uint64
+	healthSyncActive          atomic.Uint64
 	qmiControlReady           atomic.Bool
+	qmiControlWatchdogMu      sync.Mutex
+	qmiControlUnreadySince    time.Time
+	qmiControlRecoveryAt      time.Time
+	qmiControlExhausted       bool
 	qmiCoreStartupRetrying    atomic.Bool
 	qmiCoreStatusMu           sync.Mutex
 	qmiCoreStatusSeen         bool
@@ -200,6 +205,7 @@ type Pool struct {
 	missingWorkerRetryMu      sync.Mutex
 	missingWorkerRetries      map[string]missingWorkerRetryState
 	rescanAndReconnectForTest func() error
+	rescanTimeoutForTest      time.Duration
 	rescanScheduleMu          sync.Mutex
 	rescanScheduled           bool
 	rescanPending             bool
@@ -2092,7 +2098,71 @@ func (p *Pool) scheduleRescan(source string) {
 	go p.runScheduledRescans()
 }
 
+const scheduledRescanTimeout = 2 * time.Minute
+
+type scheduledRescanResult struct {
+	err        error
+	panicValue any
+}
+
+func (p *Pool) rescanTimeout() time.Duration {
+	if p != nil && p.rescanTimeoutForTest > 0 {
+		return p.rescanTimeoutForTest
+	}
+	return scheduledRescanTimeout
+}
+
+func (p *Pool) runScheduledRescanAttempt() error {
+	if p == nil {
+		return fmt.Errorf("pool is nil")
+	}
+	done := make(chan scheduledRescanResult, 1)
+	go func() {
+		result := scheduledRescanResult{}
+		defer func() {
+			result.panicValue = recover()
+			done <- result
+		}()
+		if p.rescanAndReconnectForTest != nil {
+			result.err = p.rescanAndReconnectForTest()
+		} else {
+			result.err = p.RescanAndReconnect()
+		}
+	}()
+
+	timer := time.NewTimer(p.rescanTimeout())
+	defer timer.Stop()
+	ctx := p.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("scheduled rescan exceeded %s", p.rescanTimeout())
+	case result := <-done:
+		if result.panicValue != nil {
+			return fmt.Errorf("scheduled rescan panic: %v", result.panicValue)
+		}
+		return result.err
+	}
+}
+
 func (p *Pool) runScheduledRescans() {
+	defer func() {
+		if panicValue := recover(); panicValue != nil {
+			logger.Error("scheduled rescan runner panic recovered", "err", panicValue)
+			p.rescanScheduleMu.Lock()
+			p.rescanScheduled = false
+			p.rescanPending = false
+			if p.rescanSources == nil {
+				p.rescanSources = make(map[string]struct{})
+			}
+			p.rescanSources["panic_recovery"] = struct{}{}
+			p.rescanScheduleMu.Unlock()
+		}
+	}()
 	for {
 		p.rescanScheduleMu.Lock()
 		sources := make([]string, 0, len(p.rescanSources))
@@ -2115,12 +2185,7 @@ func (p *Pool) runScheduledRescans() {
 		}
 
 		sort.Strings(sources)
-		var err error
-		if p.rescanAndReconnectForTest != nil {
-			err = p.rescanAndReconnectForTest()
-		} else {
-			err = p.RescanAndReconnect()
-		}
+		err := p.runScheduledRescanAttempt()
 		if err != nil {
 			sourceKey := strings.Join(sources, ",")
 			logger.WarnRate("scheduled_rescan_failed:"+sourceKey, time.Minute,
@@ -2231,11 +2296,44 @@ func (p *Pool) collectRescanHardwareForDevicesComplete(
 }
 
 func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
+	parent := p.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, p.rescanTimeout())
+	defer cancel()
+	return p.rescanAndReconnectContext(ctx, opts)
+}
+
+func lockRescanWithContext(ctx context.Context, mu *sync.Mutex) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if mu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (p *Pool) rescanAndReconnectContext(ctx context.Context, opts rescanReconnectOptions) error {
 	// Hardware discovery mutates Worker registrations. Serialize every caller
 	// (udev, health checks, manual rescans and recovery loops) so an older scan
 	// cannot remove a Worker that a concurrent scan has just rebuilt.
-	p.rescanMu.Lock()
+	if err := lockRescanWithContext(ctx, &p.rescanMu); err != nil {
+		return fmt.Errorf("acquire rescan lease: %w", err)
+	}
 	defer p.rescanMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	discovered, err := discoverQMIDevicesFn()
 	if err != nil && !errors.Is(err, ErrNoQMIDevices) {
@@ -2264,6 +2362,9 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	}
 
 	for _, pair := range resolved.Matched {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		md := pair.Config
 		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID, limit) {
 			logger.Warn("当前版本设备数量限制，跳过启动配置设备",
@@ -2451,6 +2552,9 @@ func (p *Pool) rescanAndReconnect(opts rescanReconnectOptions) error {
 	}
 
 	for _, md := range resolved.Offline {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if !FreeDeviceLimitAllowsConfiguredDevice(managed, md.ID, limit) {
 			continue
 		}

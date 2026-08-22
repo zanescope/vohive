@@ -10,7 +10,9 @@ const (
 	rebuildWindow                 = 30 * time.Minute
 	rebuildMaxInWindow            = 5
 	terminalWorkerReprobeCooldown = 5 * time.Minute
-	terminalWorkerUdevAddTTL      = time.Minute
+	// Keep the one-shot add proof alive longer than the lower-level core
+	// recovery horizon (90s) and VoHive's debounced lifecycle convergence.
+	terminalWorkerUdevAddTTL = qmiLifecycleRecoveryTTL + time.Minute
 )
 
 type TransportRecoveryEventKind string

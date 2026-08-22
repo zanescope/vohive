@@ -6,14 +6,22 @@ import (
 	"github.com/zanescope/vohive/pkg/logger"
 )
 
-func (w *Worker) tryBeginHealthSync() bool {
-	return w != nil && w.healthSyncInFlight.CompareAndSwap(false, true)
+func (w *Worker) tryBeginHealthSync() (uint64, bool) {
+	if w == nil {
+		return 0, false
+	}
+	token := w.healthSyncSequence.Add(1)
+	if token == 0 {
+		token = w.healthSyncSequence.Add(1)
+	}
+	if !w.healthSyncActive.CompareAndSwap(0, token) {
+		return 0, false
+	}
+	return token, true
 }
 
-func (w *Worker) endHealthSync() {
-	if w != nil {
-		w.healthSyncInFlight.Store(false)
-	}
+func (w *Worker) endHealthSync(token uint64) bool {
+	return w != nil && token != 0 && w.healthSyncActive.CompareAndSwap(token, 0)
 }
 
 func (p *Pool) startUdevWatcher() {

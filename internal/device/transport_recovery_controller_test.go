@@ -406,6 +406,20 @@ func TestTerminalWorkerUdevAddPermitExpires(t *testing.T) {
 	}
 }
 
+func TestTerminalWorkerUdevAddPermitSurvivesCoreRecoveryHorizon(t *testing.T) {
+	c := NewTransportRecoveryController(nil)
+	now := time.Now()
+	dev := "dev-terminal"
+
+	if allowed, _ := c.allowTerminalWorkerReprobeAt(dev, now); !allowed {
+		t.Fatal("initial terminal reprobe was not allowed")
+	}
+	c.noteTerminalWorkerUdevAddAt(dev, now.Add(time.Second))
+	if allowed, retryAfter := c.allowTerminalWorkerReprobeAt(dev, now.Add(2*time.Minute)); !allowed || retryAfter != 0 {
+		t.Fatalf("udev permit did not survive lower-level recovery horizon: allowed=%v retry=%s", allowed, retryAfter)
+	}
+}
+
 func TestTerminalWorkerUdevAddPermitFromFutureIsRejected(t *testing.T) {
 	c := NewTransportRecoveryController(nil)
 	now := time.Now()

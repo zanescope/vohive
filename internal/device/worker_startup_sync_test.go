@@ -81,10 +81,10 @@ func TestHealthSyncWaitsForQMIControlReadiness(t *testing.T) {
 	worker.retired.Store(true)
 	close(releaseProbe)
 	deadline := time.Now().Add(time.Second)
-	for worker.healthSyncInFlight.Load() && time.Now().Before(deadline) {
+	for worker.healthSyncActive.Load() != 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if worker.healthSyncInFlight.Load() {
+	if worker.healthSyncActive.Load() != 0 {
 		t.Fatal("health sync guard was not released")
 	}
 }

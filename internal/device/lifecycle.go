@@ -121,6 +121,31 @@ func (lc *lifecycleCoordinator) GetSnapshot(deviceID string) LifecycleSnapshot {
 	return lc.getSnapshotAt(deviceID, time.Now())
 }
 
+// TakeExpiredRecovery atomically consumes an expired recovery deadline and
+// returns the recovery snapshot that expired. Callers use this as an active
+// watchdog signal instead of relying on a later status read to passively turn
+// the lifecycle offline.
+func (lc *lifecycleCoordinator) TakeExpiredRecovery(deviceID string, now time.Time) (LifecycleSnapshot, bool) {
+	if lc == nil || deviceID == "" {
+		return LifecycleSnapshot{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	snap, ok := lc.states[deviceID]
+	if !ok || !snap.Recovering || snap.Deadline.IsZero() || now.Before(snap.Deadline) {
+		return LifecycleSnapshot{}, false
+	}
+	lc.states[deviceID] = LifecycleSnapshot{
+		Phase:     LifecyclePhaseOffline,
+		Reason:    fmt.Sprintf("recovery_deadline_expired(%s:%s)", snap.Phase, snap.Reason),
+		StartedAt: now,
+	}
+	return snap, true
+}
+
 func (lc *lifecycleCoordinator) getSnapshotAt(deviceID string, now time.Time) LifecycleSnapshot {
 	if lc == nil || deviceID == "" {
 		return LifecycleSnapshot{Phase: LifecyclePhaseOffline}
@@ -128,19 +153,21 @@ func (lc *lifecycleCoordinator) getSnapshotAt(deviceID string, now time.Time) Li
 	if now.IsZero() {
 		now = time.Now()
 	}
-	lc.mu.Lock()
+	lc.mu.RLock()
 	snap, ok := lc.states[deviceID]
-	if ok && snap.Recovering && !snap.Deadline.IsZero() && !now.Before(snap.Deadline) {
-		snap = LifecycleSnapshot{
+	lc.mu.RUnlock()
+	if !ok || snap.Phase == "" {
+		return LifecycleSnapshot{Phase: LifecyclePhaseOffline}
+	}
+	if snap.Recovering && !snap.Deadline.IsZero() && !now.Before(snap.Deadline) {
+		// Reads project an expired recovery as offline, but do not consume the
+		// underlying deadline. The active health watchdog must still be able to
+		// atomically take it and schedule recovery exactly once.
+		return LifecycleSnapshot{
 			Phase:     LifecyclePhaseOffline,
 			Reason:    fmt.Sprintf("recovery_deadline_expired(%s:%s)", snap.Phase, snap.Reason),
 			StartedAt: now,
 		}
-		lc.states[deviceID] = snap
-	}
-	lc.mu.Unlock()
-	if !ok || snap.Phase == "" {
-		return LifecycleSnapshot{Phase: LifecyclePhaseOffline}
 	}
 	return snap
 }
